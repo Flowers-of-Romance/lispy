@@ -119,8 +119,10 @@ def init_db(path: Path) -> sqlite3.Connection:
     # FTS5 (sessions)
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(title, summary)")
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_tri USING fts5(title, summary, tokenize='trigram')")
+    # UPDATE trigger は plain DELETE WHERE rowid= を使う (FTS5 専用 'delete' は entry 無いと SQL logic error)
     conn.executescript(
         """
+        DROP TRIGGER IF EXISTS sessions_fts_update;
         CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
           INSERT INTO sessions_fts(rowid, title, summary)
             VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
@@ -128,12 +130,10 @@ def init_db(path: Path) -> sqlite3.Connection:
             VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
         END;
         CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
-          INSERT INTO sessions_fts(sessions_fts, rowid, title, summary)
-            VALUES ('delete', old.rowid, COALESCE(old.title, ''), COALESCE(old.summary, ''));
+          DELETE FROM sessions_fts WHERE rowid = old.rowid;
           INSERT INTO sessions_fts(rowid, title, summary)
             VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
-          INSERT INTO sessions_fts_tri(sessions_fts_tri, rowid, title, summary)
-            VALUES ('delete', old.rowid, COALESCE(old.title, ''), COALESCE(old.summary, ''));
+          DELETE FROM sessions_fts_tri WHERE rowid = old.rowid;
           INSERT INTO sessions_fts_tri(rowid, title, summary)
             VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
         END;
@@ -141,14 +141,14 @@ def init_db(path: Path) -> sqlite3.Connection:
     )
 
     # 既存データの FTS migration (upgrade パス)
+    # turns: append-only なので新規データは trigger で入る
     if conn.execute("SELECT COUNT(*) FROM turns_fts").fetchone()[0] == 0:
         if conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] > 0:
             conn.execute("INSERT INTO turns_fts(rowid, content) SELECT id, content FROM turns")
             conn.execute("INSERT INTO turns_fts_tri(rowid, content) SELECT id, content FROM turns")
+    # sessions: UPDATE される (sleep が title/summary を入れる)、全 session を FTS に入れる
     if conn.execute("SELECT COUNT(*) FROM sessions_fts").fetchone()[0] == 0:
-        if conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE title IS NOT NULL OR summary IS NOT NULL"
-        ).fetchone()[0] > 0:
+        if conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] > 0:
             conn.execute(
                 "INSERT INTO sessions_fts(rowid, title, summary) "
                 "SELECT rowid, COALESCE(title, ''), COALESCE(summary, '') FROM sessions"
