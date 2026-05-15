@@ -50,6 +50,9 @@ _load_dotenv(_ROOT / ".env")
 DB_PATH = Path(os.environ.get("BODIES_DB", str(_ROOT / "bodies.db")))
 TURN_DIR = Path(os.environ.get("BODIES_TURN_DIR", str(_ROOT / "data" / "turns")))
 DUMP_DIR = Path(os.environ.get("BODIES_DUMP_DIR", str(_ROOT / "data" / "sessions")))
+SKILLS_DIR = Path(os.environ.get("BODIES_SKILLS_DIR", str(_ROOT / "skills")))
+SKILLS_MANUAL = SKILLS_DIR / "manual"
+SKILLS_AUTO = SKILLS_DIR / "auto"
 TZ_OFFSET_HOURS = int(os.environ.get("BODIES_TZ_OFFSET", "9"))
 MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-opus-4.7")
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
@@ -342,6 +345,79 @@ def append_to_date_md(sid: str, role: str, content: str, cwd: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
+# skills (Hermes から: task 層 only、user 層を侵さない規律)
+# ---------------------------------------------------------------------------
+
+def parse_skill_frontmatter(text: str) -> tuple[dict, str]:
+    """SKILL.md の YAML 風 frontmatter を flat に parse して (meta, body) を返す。
+
+    対応するのは flat な key: value のみ。tags: [a,b,c] は文字列のまま入る。
+    """
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}, text
+    fm = text[4:end]
+    body = text[end + 5:]
+    meta: dict = {}
+    for line in fm.splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        meta[k.strip()] = v.strip().strip('"').strip("'")
+    return meta, body
+
+
+def list_skills() -> list[dict]:
+    """skills/manual と skills/auto 配下の SKILL.md を全部走査。
+
+    Returns [{name, description, source, path, tags}, ...]
+    """
+    results = []
+    for source, root in [("manual", SKILLS_MANUAL), ("auto", SKILLS_AUTO)]:
+        if not root.exists():
+            continue
+        for skill_md in sorted(root.glob("*/SKILL.md")):
+            try:
+                meta, _ = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            results.append({
+                "name": meta.get("name") or skill_md.parent.name,
+                "description": meta.get("description", ""),
+                "source": source,
+                "path": str(skill_md),
+                "tags": meta.get("tags", ""),
+            })
+    return results
+
+
+def read_skill(name: str) -> str | None:
+    """名前から SKILL.md 本体を返す。manual を auto より優先。"""
+    for root in [SKILLS_MANUAL, SKILLS_AUTO]:
+        path = root / name / "SKILL.md"
+        if path.exists():
+            try:
+                return path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+    return None
+
+
+def skill_listing_for_prompt() -> str:
+    """chat の system prompt に積む 1 行 listing を生成。"""
+    skills = list_skills()
+    if not skills:
+        return ""
+    lines = ["", "## Available skills (read_file で本体を引ける):"]
+    for s in skills:
+        loc = "manual" if s["source"] == "manual" else "auto"
+        lines.append(f"- **{s['name']}** ({loc}): {s['description']}  →  {s['path']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # tools (chat 用、最小核)
 # ---------------------------------------------------------------------------
 
@@ -564,7 +640,8 @@ def cmd_chat(args: argparse.Namespace) -> None:
     db = init_db(DB_PATH)
     client = get_client()
     sid = open_session(db)
-    history: list[dict] = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+    system_prompt = CHAT_SYSTEM_PROMPT + skill_listing_for_prompt()
+    history: list[dict] = [{"role": "system", "content": system_prompt}]
     cwd = os.getcwd()
 
     try:
@@ -1050,6 +1127,86 @@ def cmd_domain(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# skill (CLI)
+# ---------------------------------------------------------------------------
+
+def cmd_skill(args: argparse.Namespace) -> None:
+    sub = args.skill_cmd or "list"
+
+    if sub == "list":
+        skills = list_skills()
+        if not skills:
+            print("(no skills)")
+            print(f"  add one: mkdir -p {SKILLS_MANUAL}/<name> && $EDITOR {SKILLS_MANUAL}/<name>/SKILL.md")
+            return
+        for s in skills:
+            tag = f"[{s['tags']}]" if s["tags"] else ""
+            print(f"{s['source']:6}  {s['name']:24}  {tag:20} {s['description']}")
+        return
+
+    if sub == "show":
+        body = read_skill(args.name)
+        if body is None:
+            print(f"skill not found: {args.name}", file=sys.stderr)
+            raise SystemExit(1)
+        print(body)
+        return
+
+    if sub == "new":
+        target = SKILLS_MANUAL / args.name / "SKILL.md"
+        if target.exists():
+            print(f"already exists: {target}", file=sys.stderr)
+            raise SystemExit(1)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # `--from-stdin` 明示時のみ stdin から読み込む。そうでなければテンプレ生成。
+        if args.from_stdin:
+            body = sys.stdin.read()
+        else:
+            body = f"""---
+name: {args.name}
+description: {args.description or '(describe when to use this skill)'}
+created: {local_now().isoformat(timespec='seconds')}
+source: manual
+tags: {args.tags or ''}
+---
+
+# {args.name}
+
+## When
+
+(when to use this skill)
+
+## How
+
+1. step 1
+2. step 2
+
+## Pitfalls
+
+- (common mistake to avoid)
+"""
+        target.write_text(body, encoding="utf-8")
+        print(f"created {target}")
+        return
+
+    if sub == "archive":
+        # auto skill を archive サブディレクトリに移す (manual は対象外、user が手で消すべき)
+        src = SKILLS_AUTO / args.name / "SKILL.md"
+        if not src.exists():
+            print(f"auto skill not found: {args.name}", file=sys.stderr)
+            raise SystemExit(1)
+        archive_dir = SKILLS_AUTO / ".archive" / args.name
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        src.rename(archive_dir / "SKILL.md")
+        try:
+            src.parent.rmdir()  # 空の親ディレクトリを掃除
+        except OSError:
+            pass
+        print(f"archived: {args.name}")
+        return
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
@@ -1072,6 +1229,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_dom.add_argument("session", nargs="?")
     p_dom.add_argument("domain", nargs="?")
     p_dom.add_argument("--clear", action="store_true")
+
+    p_skill = sub.add_parser("skill", help="manage skills (manual / auto)")
+    p_skill_sub = p_skill.add_subparsers(dest="skill_cmd")
+    p_skill_sub.add_parser("list", help="list all skills")
+    p_skill_show = p_skill_sub.add_parser("show", help="display a skill body")
+    p_skill_show.add_argument("name")
+    p_skill_new = p_skill_sub.add_parser("new", help="create a new manual skill")
+    p_skill_new.add_argument("name")
+    p_skill_new.add_argument("--description", default="")
+    p_skill_new.add_argument("--tags", default="")
+    p_skill_new.add_argument("--from-stdin", action="store_true", help="read body from stdin instead of template")
+    p_skill_arc = p_skill_sub.add_parser("archive", help="archive an auto skill")
+    p_skill_arc.add_argument("name")
     return p
 
 
@@ -1086,6 +1256,7 @@ def main() -> None:
         "sleep": cmd_sleep,
         "search": cmd_search,
         "domain": cmd_domain,
+        "skill": cmd_skill,
     }[cmd]
     handler(args)
 
