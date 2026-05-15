@@ -25,6 +25,27 @@ from pathlib import Path
 
 # script の親ディレクトリを base にする (hook 経由で cwd が異なっても安定)
 _ROOT = Path(__file__).resolve().parent
+
+
+def _load_dotenv(path: Path) -> None:
+    """最小限の .env loader (依存追加せず自前パース)。既存 env を上書きしない。"""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, val = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+_load_dotenv(_ROOT / ".env")
+
 DB_PATH = Path(os.environ.get("BODIES_DB", str(_ROOT / "bodies.db")))
 TURN_DIR = Path(os.environ.get("BODIES_TURN_DIR", str(_ROOT / "data" / "turns")))
 DUMP_DIR = Path(os.environ.get("BODIES_DUMP_DIR", str(_ROOT / "data" / "sessions")))
