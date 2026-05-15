@@ -978,6 +978,58 @@ SUMMARY:
 ---対話終了---"""
 
 
+SKILL_AUTOMINT_PROMPT = """以下の対話を読み、これを **再利用可能な skill (手順書)** として記録する価値があるか判定せよ。
+
+判定基準 (全て満たすと yes):
+- 5+ の tool 呼び出しがある複雑タスクである
+- 同種のタスクで再利用できる workflow が抽出可能
+- 失敗→成功の経験や、自明でないコツがある
+- 単なる質疑応答や雑談ではない
+
+bodies 規律: skill は task 層に閉じる。「あなたは誰か」は書かない、「どうやるか」だけ書く。
+
+返答フォーマット (no の場合は DECISION: no の 1 行のみ):
+DECISION: yes
+NAME: <kebab-case の skill 名、20 字以内、英数字とハイフンのみ>
+DESCRIPTION: <when to use を 1 行で、日本語可>
+TAGS: <comma-separated、3 個まで>
+BODY:
+<SKILL.md 本体、## When / ## How / ## Pitfalls の見出しを含む markdown>
+
+---対話開始---
+{transcript}
+---対話終了---"""
+
+
+CURATOR_PROMPT = """以下は bodies の auto-skill 一覧。各 skill について整理アクションを提案せよ。
+
+可能な ACTION:
+- keep:        そのまま (デフォルト)
+- pin:         重要、archive 対象から保護する
+- archive:     古い / 使われない / 重複している
+- consolidate: 別 skill と統合できる (TARGET に統合先名)
+- patch:       中身を改善 (TARGET に改善案の要約)
+
+判定の規律:
+- 同じ task 領域の skill が複数あれば consolidate を検討
+- 30 日以上使われてない (last_accessed_at は不明だが file mtime で判断) なら archive
+- description が曖昧 / 重複しているなら patch
+
+返答フォーマット (skill 1 つにつき 1 ブロック、--- で区切る):
+NAME: <skill name>
+ACTION: keep | pin | archive | consolidate | patch
+REASON: <1-2 行>
+TARGET: <consolidate / patch のみ。それ以外は省略>
+---
+
+---skills---
+{skill_listing}
+---skills end---"""
+
+
+SLEEP_MIN_TOOL_CALLS_FOR_SKILL = 5
+
+
 def transcript_of(db: sqlite3.Connection, sid: str, max_chars: int = 60000) -> str:
     turns = db.execute(
         "SELECT role, content FROM turns WHERE session_id = ? ORDER BY ts",
@@ -1009,6 +1061,87 @@ def parse_sleep_response(text: str) -> tuple[str, str]:
     return title, "\n".join(summary).strip()
 
 
+def parse_skill_automint_response(text: str) -> dict | None:
+    """SKILL_AUTOMINT_PROMPT の返答を parse。yes の場合のみ dict を返す。"""
+    decision = ""
+    meta = {"name": "", "description": "", "tags": ""}
+    body_lines: list[str] = []
+    mode = None
+    for line in text.splitlines():
+        if line.startswith("DECISION:"):
+            decision = line.split(":", 1)[1].strip().lower()
+        elif line.startswith("NAME:"):
+            meta["name"] = line.split(":", 1)[1].strip()
+        elif line.startswith("DESCRIPTION:"):
+            meta["description"] = line.split(":", 1)[1].strip()
+        elif line.startswith("TAGS:"):
+            meta["tags"] = line.split(":", 1)[1].strip()
+        elif line.startswith("BODY:"):
+            mode = "body"
+        elif mode == "body":
+            body_lines.append(line)
+    if decision != "yes" or not meta["name"]:
+        return None
+    name = re.sub(r"[^a-z0-9\-]", "", meta["name"].lower())[:30]
+    if not name:
+        return None
+    return {
+        "name": name,
+        "description": meta["description"],
+        "tags": meta["tags"],
+        "body": "\n".join(body_lines).strip(),
+    }
+
+
+def maybe_autocreate_skill(db: sqlite3.Connection, sid: str, client) -> Path | None:
+    """session の trajectory を見て skill 化候補なら skills/auto/ に書き出す。"""
+    n_tool = db.execute(
+        "SELECT COUNT(*) FROM turns WHERE session_id = ? AND role = 'tool'",
+        (sid,),
+    ).fetchone()[0]
+    if n_tool < SLEEP_MIN_TOOL_CALLS_FOR_SKILL:
+        return None
+    transcript = transcript_of(db, sid)
+    if not transcript.strip():
+        return None
+
+    try:
+        resp = client.chat.completions.create(
+            model=AUX_MODEL,
+            messages=[{"role": "user", "content": SKILL_AUTOMINT_PROMPT.format(transcript=transcript)}],
+            max_tokens=2048,
+        )
+    except Exception as e:
+        print(f"  skill mint error: {e}", file=sys.stderr)
+        return None
+    text = resp.choices[0].message.content or ""
+    parsed = parse_skill_automint_response(text)
+    if not parsed:
+        return None
+
+    target = SKILLS_AUTO / parsed["name"] / "SKILL.md"
+    if target.exists():
+        return None  # 衝突したら skip (Curator が後で見る)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # frontmatter を整える (LLM 出力に frontmatter が無い場合は付ける)
+    body = parsed["body"]
+    if not body.startswith("---\n"):
+        frontmatter = (
+            "---\n"
+            f"name: {parsed['name']}\n"
+            f"description: {parsed['description']}\n"
+            f"created: {local_now().isoformat(timespec='seconds')}\n"
+            f"source: auto\n"
+            f"source_session: {sid}\n"
+            f"tags: {parsed['tags']}\n"
+            "---\n\n"
+        )
+        body = frontmatter + body
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
 def cmd_sleep(args: argparse.Namespace) -> None:
     db = init_db(DB_PATH)
     client = get_client()
@@ -1036,6 +1169,12 @@ def cmd_sleep(args: argparse.Namespace) -> None:
         )
         db.commit()
         print(f"  → {title}", file=sys.stderr)
+
+        # skill mint (tool call が多い session のみ)
+        if not args.no_skill:
+            skill_path = maybe_autocreate_skill(db, sid, client)
+            if skill_path:
+                print(f"  + auto skill: {skill_path}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1346,58 @@ tags: {args.tags or ''}
 
 
 # ---------------------------------------------------------------------------
+# curator (auto skill の整理を aux LLM が提案、apply は user)
+# ---------------------------------------------------------------------------
+
+def cmd_curator(args: argparse.Namespace) -> None:
+    skills = [s for s in list_skills() if s["source"] == "auto"]
+    if not skills:
+        print("(no auto skills to review)")
+        return
+
+    listing_parts: list[str] = []
+    for s in skills:
+        body = read_skill(s["name"]) or ""
+        # frontmatter 除いて軽量に
+        _, content = parse_skill_frontmatter(body)
+        # mtime も拾う
+        try:
+            mtime = dt.datetime.fromtimestamp(Path(s["path"]).stat().st_mtime).isoformat(timespec="seconds")
+        except OSError:
+            mtime = "(unknown)"
+        listing_parts.append(
+            f"### {s['name']}\n"
+            f"- description: {s['description']}\n"
+            f"- tags: {s['tags']}\n"
+            f"- mtime: {mtime}\n\n"
+            f"{content[:1200].strip()}\n"
+        )
+    listing = "\n---\n".join(listing_parts)
+
+    client = get_client()
+    try:
+        resp = client.chat.completions.create(
+            model=AUX_MODEL,
+            messages=[{"role": "user", "content": CURATOR_PROMPT.format(skill_listing=listing)}],
+            max_tokens=3072,
+        )
+    except Exception as e:
+        print(f"curator error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    text = resp.choices[0].message.content or ""
+
+    print("# Curator 提案")
+    print()
+    print(text)
+    print()
+    print("---")
+    print("適用は user 主導 (skin in the game):")
+    print("  bodies skill archive NAME     # archive する")
+    print("  $EDITOR skills/auto/NAME/SKILL.md   # patch を反映")
+    print("  consolidate は手動で統合先 skill を編集 + archive")
+
+
+# ---------------------------------------------------------------------------
 # entry
 # ---------------------------------------------------------------------------
 
@@ -1218,7 +1409,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="list sessions")
     p_list.add_argument("--limit", type=int, default=30)
     sub.add_parser("dump", help="rebuild date-based md from DB")
-    sub.add_parser("sleep", help="generate title/summary for unprocessed sessions")
+    p_sleep = sub.add_parser("sleep", help="generate title/summary + auto skill (要 LLM_API_KEY)")
+    p_sleep.add_argument("--no-skill", action="store_true", help="skip auto skill mint")
+    sub.add_parser("curator", help="aux LLM が auto skill を見渡して整理提案 (apply は user)")
     p_search = sub.add_parser("search", help="FTS5 search over turns / sessions")
     p_search.add_argument("query")
     p_search.add_argument("--tri", action="store_true", help="trigram tokenizer (CJK 部分一致)")
@@ -1257,6 +1450,7 @@ def main() -> None:
         "search": cmd_search,
         "domain": cmd_domain,
         "skill": cmd_skill,
+        "curator": cmd_curator,
     }[cmd]
     handler(args)
 
