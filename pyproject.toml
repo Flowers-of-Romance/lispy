@@ -6,3 +6,16 @@ requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0",
 ]
+
+[project.scripts]
+bodies = "bodies:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["bodies.py"]
+
+[tool.hatch.build.targets.wheel.sources]
+"bodies.py" = "bodies.py"
