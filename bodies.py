@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -341,7 +342,172 @@ def append_to_date_md(sid: str, role: str, content: str, cwd: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# chat (standalone agent loop)
+# tools (chat 用、最小核)
+# ---------------------------------------------------------------------------
+
+TOOL_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List the contents of a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a text file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Max lines to read"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "cwd": {"type": "string"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search a regex pattern in files under a path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["pattern", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shell",
+            "description": "Run a shell command. Side effects allowed; user confirms before execution.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+]
+
+
+def _tool_list_dir(args: dict) -> str:
+    path = Path(args["path"]).expanduser()
+    if not path.exists():
+        return f"not found: {path}"
+    if not path.is_dir():
+        return f"not a directory: {path}"
+    entries = []
+    for e in sorted(path.iterdir()):
+        suffix = "/" if e.is_dir() else ""
+        entries.append(f"{e.name}{suffix}")
+    return "\n".join(entries[:300]) or "(empty)"
+
+
+def _tool_read_file(args: dict) -> str:
+    path = Path(args["path"]).expanduser()
+    if not path.exists():
+        return f"not found: {path}"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"read error: {e}"
+    limit = args.get("limit")
+    if limit:
+        lines = text.splitlines()[: int(limit)]
+        text = "\n".join(lines)
+    return text[:16000]
+
+
+def _tool_glob(args: dict) -> str:
+    pattern = args["pattern"]
+    base = Path(args.get("cwd") or os.getcwd()).expanduser()
+    matches = sorted(str(p) for p in base.glob(pattern))[:300]
+    return "\n".join(matches) or "(no matches)"
+
+
+def _tool_grep(args: dict) -> str:
+    pattern = args["pattern"]
+    path = Path(args["path"]).expanduser()
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return f"invalid regex: {e}"
+    if not path.exists():
+        return f"not found: {path}"
+    files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+    results: list[str] = []
+    for f in files[:1000]:
+        try:
+            for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if rx.search(line):
+                    results.append(f"{f}:{i}: {line}")
+                    if len(results) >= 100:
+                        return "\n".join(results)
+        except OSError:
+            continue
+    return "\n".join(results) or "(no matches)"
+
+
+def _tool_shell(args: dict) -> str:
+    cmd = args["command"]
+    print(f"\n  [tool] shell: {cmd}", file=sys.stderr)
+    try:
+        confirm = input("  実行する？ [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "user rejected (no input)"
+    if confirm != "y":
+        return "user rejected execution"
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "timeout (60s)"
+    out = proc.stdout or ""
+    if proc.stderr:
+        out += "\n--- stderr ---\n" + proc.stderr
+    if proc.returncode != 0:
+        out += f"\n(exit {proc.returncode})"
+    return out[:8000]
+
+
+TOOL_DISPATCH = {
+    "list_dir": _tool_list_dir,
+    "read_file": _tool_read_file,
+    "glob": _tool_glob,
+    "grep": _tool_grep,
+    "shell": _tool_shell,
+}
+
+
+# ---------------------------------------------------------------------------
+# chat (standalone agent loop + tool calling)
 # ---------------------------------------------------------------------------
 
 def cmd_chat(args: argparse.Namespace) -> None:
@@ -364,14 +530,66 @@ def cmd_chat(args: argparse.Namespace) -> None:
             append_turn(db, sid, "user", user, cwd=cwd, model=MODEL)
             append_to_date_md(sid, "user", user, cwd=cwd)
 
-            resp = client.chat.completions.create(
-                model=MODEL, messages=history, max_tokens=4096
-            )
-            out = resp.choices[0].message.content or ""
-            history.append({"role": "assistant", "content": out})
-            append_turn(db, sid, "assistant", out, cwd=cwd, model=MODEL)
-            append_to_date_md(sid, "assistant", out, cwd=cwd)
-            print(out)
+            # tool loop: tool_calls が無くなるまで往復
+            for _ in range(20):  # 安全のため最大 20 ループ
+                resp = client.chat.completions.create(
+                    model=MODEL,
+                    messages=history,
+                    tools=TOOL_SCHEMA,
+                    max_tokens=4096,
+                )
+                msg = resp.choices[0].message
+                tool_calls = msg.tool_calls or []
+                content = msg.content or ""
+
+                if not tool_calls:
+                    history.append({"role": "assistant", "content": content})
+                    append_turn(db, sid, "assistant", content, cwd=cwd, model=MODEL)
+                    append_to_date_md(sid, "assistant", content, cwd=cwd)
+                    print(content)
+                    break
+
+                # tool_calls あり: assistant message を tool_calls 付きで履歴に追加
+                history.append({
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                })
+                for tc in tool_calls:
+                    name = tc.function.name
+                    try:
+                        targs = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        targs = {}
+                    print(f"  [tool] {name}({targs})", file=sys.stderr)
+                    handler = TOOL_DISPATCH.get(name)
+                    if handler is None:
+                        result = f"unknown tool: {name}"
+                    else:
+                        try:
+                            result = handler(targs)
+                        except Exception as e:
+                            result = f"error: {e}"
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+                    # tool 実行も trajectory に残す (role=tool)
+                    append_turn(db, sid, "tool", f"{name}({targs}) → {result[:200]}", cwd=cwd, model=MODEL)
+            else:
+                # 20 周しても落ち着かない場合
+                print("[tool loop limit reached]", file=sys.stderr)
     finally:
         close_session(db, sid)
 
