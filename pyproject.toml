@@ -1,0 +1,8 @@
+[project]
+name = "bodies"
+version = "0"  # PEP 621 requires this; carries no semantic claim
+description = "agent layer — soul is absent, bodies only"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0",
+]
