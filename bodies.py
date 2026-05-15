@@ -23,11 +23,11 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
-from openai import OpenAI
-
-DB_PATH = Path(os.environ.get("BODIES_DB", "bodies.db"))
-TURN_DIR = Path(os.environ.get("BODIES_TURN_DIR", "data/turns"))
-DUMP_DIR = Path(os.environ.get("BODIES_DUMP_DIR", "data/sessions"))
+# script の親ディレクトリを base にする (hook 経由で cwd が異なっても安定)
+_ROOT = Path(__file__).resolve().parent
+DB_PATH = Path(os.environ.get("BODIES_DB", str(_ROOT / "bodies.db")))
+TURN_DIR = Path(os.environ.get("BODIES_TURN_DIR", str(_ROOT / "data" / "turns")))
+DUMP_DIR = Path(os.environ.get("BODIES_DUMP_DIR", str(_ROOT / "data" / "sessions")))
 TZ_OFFSET_HOURS = int(os.environ.get("BODIES_TZ_OFFSET", "9"))
 MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-opus-4.7")
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
@@ -68,6 +68,71 @@ def init_db(path: Path) -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, ts)")
+
+    # FTS5 (turns)
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(content)")
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts_tri USING fts5(content, tokenize='trigram')")
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS turns_fts_insert AFTER INSERT ON turns BEGIN
+          INSERT INTO turns_fts(rowid, content) VALUES (new.id, new.content);
+          INSERT INTO turns_fts_tri(rowid, content) VALUES (new.id, new.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS turns_fts_delete AFTER DELETE ON turns BEGIN
+          INSERT INTO turns_fts(turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+          INSERT INTO turns_fts_tri(turns_fts_tri, rowid, content) VALUES ('delete', old.id, old.content);
+        END;
+        CREATE TRIGGER IF NOT EXISTS turns_fts_update AFTER UPDATE ON turns BEGIN
+          INSERT INTO turns_fts(turns_fts, rowid, content) VALUES ('delete', old.id, old.content);
+          INSERT INTO turns_fts(rowid, content) VALUES (new.id, new.content);
+          INSERT INTO turns_fts_tri(turns_fts_tri, rowid, content) VALUES ('delete', old.id, old.content);
+          INSERT INTO turns_fts_tri(rowid, content) VALUES (new.id, new.content);
+        END;
+        """
+    )
+
+    # FTS5 (sessions)
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(title, summary)")
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts_tri USING fts5(title, summary, tokenize='trigram')")
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
+          INSERT INTO sessions_fts(rowid, title, summary)
+            VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
+          INSERT INTO sessions_fts_tri(rowid, title, summary)
+            VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
+        END;
+        CREATE TRIGGER IF NOT EXISTS sessions_fts_update AFTER UPDATE ON sessions BEGIN
+          INSERT INTO sessions_fts(sessions_fts, rowid, title, summary)
+            VALUES ('delete', old.rowid, COALESCE(old.title, ''), COALESCE(old.summary, ''));
+          INSERT INTO sessions_fts(rowid, title, summary)
+            VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
+          INSERT INTO sessions_fts_tri(sessions_fts_tri, rowid, title, summary)
+            VALUES ('delete', old.rowid, COALESCE(old.title, ''), COALESCE(old.summary, ''));
+          INSERT INTO sessions_fts_tri(rowid, title, summary)
+            VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
+        END;
+        """
+    )
+
+    # 既存データの FTS migration (upgrade パス)
+    if conn.execute("SELECT COUNT(*) FROM turns_fts").fetchone()[0] == 0:
+        if conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] > 0:
+            conn.execute("INSERT INTO turns_fts(rowid, content) SELECT id, content FROM turns")
+            conn.execute("INSERT INTO turns_fts_tri(rowid, content) SELECT id, content FROM turns")
+    if conn.execute("SELECT COUNT(*) FROM sessions_fts").fetchone()[0] == 0:
+        if conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE title IS NOT NULL OR summary IS NOT NULL"
+        ).fetchone()[0] > 0:
+            conn.execute(
+                "INSERT INTO sessions_fts(rowid, title, summary) "
+                "SELECT rowid, COALESCE(title, ''), COALESCE(summary, '') FROM sessions"
+            )
+            conn.execute(
+                "INSERT INTO sessions_fts_tri(rowid, title, summary) "
+                "SELECT rowid, COALESCE(title, ''), COALESCE(summary, '') FROM sessions"
+            )
+
     conn.commit()
     return conn
 
@@ -103,9 +168,10 @@ def append_turn(
     db.commit()
 
 
-def get_client() -> OpenAI:
+def get_client():
     if not API_KEY:
         raise SystemExit("set LLM_API_KEY in env (.env)")
+    from openai import OpenAI  # lazy import (record-turn では不要)
     return OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 
@@ -607,6 +673,62 @@ def cmd_sleep(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# search (FTS5 + trigram)
+# ---------------------------------------------------------------------------
+
+def cmd_search(args: argparse.Namespace) -> None:
+    db = init_db(DB_PATH)
+    q = args.query
+    limit = args.limit
+    # trigram は CJK 部分一致用、phrase quote が必要
+    turns_table = "turns_fts_tri" if args.tri else "turns_fts"
+    sessions_table = "sessions_fts_tri" if args.tri else "sessions_fts"
+    match_query = f'"{q}"' if args.tri else q
+
+    show_sessions = args.sessions or not args.turns
+    show_turns = args.turns or not args.sessions
+
+    if show_sessions:
+        rows = db.execute(
+            f"""
+            SELECT s.id, s.started_at, s.title, s.summary, s.domain,
+                   snippet({sessions_table}, -1, '«', '»', '…', 12) AS snip
+            FROM {sessions_table}
+            JOIN sessions s ON {sessions_table}.rowid = s.rowid
+            WHERE {sessions_table} MATCH ?
+            ORDER BY rank LIMIT ?
+            """,
+            (match_query, limit),
+        ).fetchall()
+        if rows:
+            print("== sessions ==")
+            for sid, ts, title, summary, domain, snip in rows:
+                when = local_from_ts(ts).strftime("%Y-%m-%d %H:%M")
+                dom = f"[{domain}]" if domain else ""
+                print(f"{when}  {sid[:16]:16}  {dom:12} {title or '(no title)'}")
+                if snip:
+                    print(f"    {snip}")
+
+    if show_turns:
+        rows = db.execute(
+            f"""
+            SELECT t.session_id, t.role, t.ts, t.cwd,
+                   snippet({turns_table}, 0, '«', '»', '…', 16) AS snip
+            FROM {turns_table}
+            JOIN turns t ON {turns_table}.rowid = t.id
+            WHERE {turns_table} MATCH ?
+            ORDER BY rank LIMIT ?
+            """,
+            (match_query, limit),
+        ).fetchall()
+        if rows:
+            print("== turns ==")
+            for sid, role, ts, cwd, snip in rows:
+                when = local_from_ts(ts).strftime("%Y-%m-%d %H:%M")
+                print(f"{when}  {sid[:16]:16}  {role:10} {snip}")
+
+
+# ---------------------------------------------------------------------------
 # domain
 # ---------------------------------------------------------------------------
 
@@ -651,6 +773,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--limit", type=int, default=30)
     sub.add_parser("dump", help="rebuild date-based md from DB")
     sub.add_parser("sleep", help="generate title/summary for unprocessed sessions")
+    p_search = sub.add_parser("search", help="FTS5 search over turns / sessions")
+    p_search.add_argument("query")
+    p_search.add_argument("--tri", action="store_true", help="trigram tokenizer (CJK 部分一致)")
+    p_search.add_argument("--turns", action="store_true", help="only turns")
+    p_search.add_argument("--sessions", action="store_true", help="only sessions")
+    p_search.add_argument("--limit", type=int, default=10)
     p_dom = sub.add_parser("domain", help="show / set domain for sessions")
     p_dom.add_argument("session", nargs="?")
     p_dom.add_argument("domain", nargs="?")
@@ -667,6 +795,7 @@ def main() -> None:
         "list": cmd_list,
         "dump": cmd_dump,
         "sleep": cmd_sleep,
+        "search": cmd_search,
         "domain": cmd_domain,
     }[cmd]
     handler(args)
