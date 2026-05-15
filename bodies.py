@@ -349,6 +349,14 @@ TOOL_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "current_time",
+            "description": "Return the current local date and time (ISO 8601).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_dir",
             "description": "List the contents of a directory.",
             "parameters": {
@@ -418,6 +426,10 @@ TOOL_SCHEMA = [
 ]
 
 
+def _tool_current_time(args: dict) -> str:
+    return local_now().isoformat(timespec="seconds")
+
+
 def _tool_list_dir(args: dict) -> str:
     path = Path(args["path"]).expanduser()
     if not path.exists():
@@ -476,15 +488,43 @@ def _tool_grep(args: dict) -> str:
     return "\n".join(results) or "(no matches)"
 
 
+SHELL_SAFE_FIRST_TOKEN = {
+    "ls", "cat", "head", "tail", "less", "more", "file", "stat",
+    "pwd", "date", "echo", "which", "whoami", "uname", "hostname",
+    "find", "tree", "wc", "diff",
+    "grep", "rg", "ag", "ack",
+    "sqlite3",  # 大半は SELECT、ただし mutation 可能性を承知の上
+}
+GIT_SAFE_SUBCOMMANDS = {"status", "log", "diff", "show", "branch", "remote", "config"}
+
+
+def _is_shell_safe(cmd: str) -> bool:
+    """allow-list 該当なら True (確認不要)。"""
+    tokens = cmd.strip().split()
+    if not tokens:
+        return False
+    first = tokens[0]
+    if first in SHELL_SAFE_FIRST_TOKEN:
+        return True
+    if first == "git" and len(tokens) >= 2 and tokens[1] in GIT_SAFE_SUBCOMMANDS:
+        # ただし git config --set / --add / --unset は除外
+        if tokens[1] == "config" and any(t.startswith(("--set", "--add", "--unset", "--replace", "--remove")) for t in tokens[2:]):
+            return False
+        return True
+    return False
+
+
 def _tool_shell(args: dict) -> str:
     cmd = args["command"]
-    print(f"\n  [tool] shell: {cmd}", file=sys.stderr)
-    try:
-        confirm = input("  実行する？ [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return "user rejected (no input)"
-    if confirm != "y":
-        return "user rejected execution"
+    safe = _is_shell_safe(cmd)
+    print(f"\n  [tool] shell{' (safe)' if safe else ''}: {cmd}", file=sys.stderr)
+    if not safe:
+        try:
+            confirm = input("  実行する？ [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "user rejected (no input)"
+        if confirm != "y":
+            return "user rejected execution"
     try:
         proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
@@ -498,12 +538,22 @@ def _tool_shell(args: dict) -> str:
 
 
 TOOL_DISPATCH = {
+    "current_time": _tool_current_time,
     "list_dir": _tool_list_dir,
     "read_file": _tool_read_file,
     "glob": _tool_glob,
     "grep": _tool_grep,
     "shell": _tool_shell,
 }
+
+
+CHAT_SYSTEM_PROMPT = """bodies chat mode.
+
+- 簡単な質問には text のみで答える。tool は必要な時だけ使う。
+- 応答は短く、要点だけ。長い列挙より一行のまとめ。
+- read-only な情報取得は list_dir / read_file / glob / grep / current_time を優先。
+- shell は副作用ある操作のみ。読み取り系 (ls / cat / sqlite3 select 等) は allow-list で自動承認、それ以外は user 確認。
+- 「今いつ？」のような時刻質問は current_time を使う (DB の session 時刻と混同しない)。"""
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +564,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
     db = init_db(DB_PATH)
     client = get_client()
     sid = open_session(db)
-    history: list[dict] = []
+    history: list[dict] = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
     cwd = os.getcwd()
 
     try:
