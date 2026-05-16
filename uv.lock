@@ -27,7 +27,7 @@ wheels = [
 [[package]]
 name = "bodies"
 version = "0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "openai" },
 ]
