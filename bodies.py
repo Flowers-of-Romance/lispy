@@ -94,6 +94,22 @@ def init_db(path: Path) -> sqlite3.Connection:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, ts)")
 
+    # meta_events: trajectory (turns) と層を分けた meta 操作の ledger。
+    # sleep / skill_archive / skill_new / automint など、地層に対する
+    # 解釈 / 操作を記録する。turns_fts には載せない (地層と札を混ぜない)。
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            kind TEXT NOT NULL,
+            session_id TEXT,
+            payload TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_events_kind ON meta_events(kind, ts)")
+
     # FTS5 (turns)
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(content)")
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts_tri USING fts5(content, tokenize='trigram')")
@@ -122,7 +138,6 @@ def init_db(path: Path) -> sqlite3.Connection:
     # UPDATE trigger は plain DELETE WHERE rowid= を使う (FTS5 専用 'delete' は entry 無いと SQL logic error)
     conn.executescript(
         """
-        DROP TRIGGER IF EXISTS sessions_fts_update;
         CREATE TRIGGER IF NOT EXISTS sessions_fts_insert AFTER INSERT ON sessions BEGIN
           INSERT INTO sessions_fts(rowid, title, summary)
             VALUES (new.rowid, COALESCE(new.title, ''), COALESCE(new.summary, ''));
@@ -139,24 +154,6 @@ def init_db(path: Path) -> sqlite3.Connection:
         END;
         """
     )
-
-    # 既存データの FTS migration (upgrade パス)
-    # turns: append-only なので新規データは trigger で入る
-    if conn.execute("SELECT COUNT(*) FROM turns_fts").fetchone()[0] == 0:
-        if conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] > 0:
-            conn.execute("INSERT INTO turns_fts(rowid, content) SELECT id, content FROM turns")
-            conn.execute("INSERT INTO turns_fts_tri(rowid, content) SELECT id, content FROM turns")
-    # sessions: UPDATE される (sleep が title/summary を入れる)、全 session を FTS に入れる
-    if conn.execute("SELECT COUNT(*) FROM sessions_fts").fetchone()[0] == 0:
-        if conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] > 0:
-            conn.execute(
-                "INSERT INTO sessions_fts(rowid, title, summary) "
-                "SELECT rowid, COALESCE(title, ''), COALESCE(summary, '') FROM sessions"
-            )
-            conn.execute(
-                "INSERT INTO sessions_fts_tri(rowid, title, summary) "
-                "SELECT rowid, COALESCE(title, ''), COALESCE(summary, '') FROM sessions"
-            )
 
     conn.commit()
     return conn
@@ -189,6 +186,15 @@ def append_turn(
     db.execute(
         "INSERT INTO turns (session_id, role, content, ts, cwd, model) VALUES (?, ?, ?, ?, ?, ?)",
         (sid, role, content, time.time(), cwd or None, model or None),
+    )
+    db.commit()
+
+
+def log_meta(db: sqlite3.Connection, kind: str, sid: str | None = None, payload: str = "") -> None:
+    """meta-event を ledger に append。turns とは別テーブル、FTS にも載らない。"""
+    db.execute(
+        "INSERT INTO meta_events (ts, kind, session_id, payload) VALUES (?, ?, ?, ?)",
+        (time.time(), kind, sid or None, payload or None),
     )
     db.commit()
 
@@ -499,6 +505,49 @@ TOOL_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": (
+                "過去 trajectory を検索 (軽量、1 段目)。"
+                "結果は session_id + 時刻 + role + title + 1 行 snippet のみ (各 hit 約 100 字)。"
+                "深掘りが要る hit は recall_session で session_id を指定して取りに行く。"
+                "今のタスクが過去に似た流れがあるか **まず広く探す** ときに使う。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "検索語。FTS5 構文を許容。"},
+                    "k": {"type": "integer", "description": "返す件数。default 5、max 20。"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "fts", "tri"],
+                        "description": "auto=fts → 空なら trigram。日本語の部分一致を直接当てたければ tri。",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_session",
+            "description": (
+                "1 session の turn を時系列で取る。recall でヒットした session の前後文脈を見たいとき。"
+                "返り値は role / 時刻 / 本文 (各 1000 字まで)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "session id (prefix 一致可)"},
+                    "limit": {"type": "integer", "description": "返す turn 数。default 20。"},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
 ]
 
 
@@ -613,6 +662,98 @@ def _tool_shell(args: dict) -> str:
     return out[:8000]
 
 
+def _tool_recall(args: dict) -> str:
+    """軽量な 2 段構えの第 1 段: session_id + title + 1 行 snippet のみ返す。
+    深掘りが要れば LLM が recall_session を呼ぶ。"""
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "(empty query)"
+    k = max(1, min(int(args.get("k") or 5), 20))
+    mode = args.get("mode") or "auto"
+
+    db = init_db(DB_PATH)
+
+    def _search(table: str, q: str) -> list:
+        return db.execute(
+            f"""
+            SELECT t.session_id, t.role, t.ts,
+                   snippet({table}, 0, '«', '»', '…', 12) AS snip,
+                   s.title
+            FROM {table}
+            JOIN turns t ON {table}.rowid = t.id
+            LEFT JOIN sessions s ON s.id = t.session_id
+            WHERE {table} MATCH ?
+            ORDER BY rank LIMIT ?
+            """,
+            (q, k),
+        ).fetchall()
+
+    rows: list = []
+    used_mode = mode
+    if mode in ("auto", "fts"):
+        try:
+            rows = _search("turns_fts", query)
+            used_mode = "fts"
+        except sqlite3.OperationalError:
+            rows = []
+    if not rows and mode in ("auto", "tri"):
+        try:
+            rows = _search("turns_fts_tri", f'"{query}"')
+            used_mode = "tri"
+        except sqlite3.OperationalError:
+            rows = []
+    if not rows:
+        return f"(no matches for: {query})"
+
+    out: list[str] = [
+        f"# recall: {len(rows)} hits (mode={used_mode})",
+        "深掘りしたい行があれば recall_session で session_id を指定。",
+        "",
+    ]
+    for i, (sid, role, ts, snip, title) in enumerate(rows, 1):
+        when = local_from_ts(ts).strftime("%Y-%m-%d %H:%M")
+        title_str = f" — {title}" if title else ""
+        out.append(f"{i}. {sid[:12]}  {when}  [{role}]{title_str}")
+        if snip:
+            out.append(f"   …{snip}…")
+    return "\n".join(out)
+
+
+def _tool_recall_session(args: dict) -> str:
+    sid_prefix = (args.get("session_id") or "").strip()
+    if not sid_prefix:
+        return "(empty session_id)"
+    limit = max(1, min(int(args.get("limit") or 20), 100))
+
+    db = init_db(DB_PATH)
+    row = db.execute(
+        "SELECT id, started_at, title, summary FROM sessions WHERE id LIKE ? LIMIT 1",
+        (sid_prefix + "%",),
+    ).fetchone()
+    if not row:
+        return f"(no session matching: {sid_prefix})"
+    sid, started_at, title, summary = row
+
+    turns = db.execute(
+        "SELECT role, ts, content FROM turns WHERE session_id = ? ORDER BY ts LIMIT ?",
+        (sid, limit),
+    ).fetchall()
+
+    when = local_from_ts(started_at).strftime("%Y-%m-%d %H:%M")
+    out = [f"# session {sid} (started {when})"]
+    if title:
+        out.append(f"title: {title}")
+    if summary:
+        out.append(f"summary: {summary}")
+    out.append("")
+    for role, ts, content in turns:
+        tt = local_from_ts(ts).strftime("%H:%M:%S")
+        body = (content or "")
+        excerpt = body[:1000] + ("…(truncated)" if len(body) > 1000 else "")
+        out.append(f"[{tt} {role}] {excerpt}\n")
+    return "\n".join(out)
+
+
 TOOL_DISPATCH = {
     "current_time": _tool_current_time,
     "list_dir": _tool_list_dir,
@@ -620,6 +761,8 @@ TOOL_DISPATCH = {
     "glob": _tool_glob,
     "grep": _tool_grep,
     "shell": _tool_shell,
+    "recall": _tool_recall,
+    "recall_session": _tool_recall_session,
 }
 
 
@@ -629,7 +772,10 @@ CHAT_SYSTEM_PROMPT = """bodies chat mode.
 - 応答は短く、要点だけ。長い列挙より一行のまとめ。
 - read-only な情報取得は list_dir / read_file / glob / grep / current_time を優先。
 - shell は副作用ある操作のみ。読み取り系 (ls / cat / sqlite3 select 等) は allow-list で自動承認、それ以外は user 確認。
-- 「今いつ？」のような時刻質問は current_time を使う (DB の session 時刻と混同しない)。"""
+- 「今いつ？」のような時刻質問は current_time を使う (DB の session 時刻と混同しない)。
+- **過去 trajectory が役立ちそうなとき** (「前にやった X」「いつもの手順」「以前のあの session」等) は recall を呼ぶ。
+  関連 turn が見つかったら recall_session で前後文脈まで取り、現在のタスクを過去パターンに照らして合成する。
+  事前に skill として固めるより、毎回 retrieve して synthesize する方が bodies の規律に合う。"""
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +810,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
                     messages=history,
                     tools=TOOL_SCHEMA,
                     max_tokens=4096,
+                    extra_body={"think": False},  # chat は CoT 不要 (sleep は default=thinking high)
                 )
                 msg = resp.choices[0].message
                 tool_calls = msg.tool_calls or []
@@ -1001,32 +1148,6 @@ BODY:
 ---対話終了---"""
 
 
-CURATOR_PROMPT = """以下は bodies の auto-skill 一覧。各 skill について整理アクションを提案せよ。
-
-可能な ACTION:
-- keep:        そのまま (デフォルト)
-- pin:         重要、archive 対象から保護する
-- archive:     古い / 使われない / 重複している
-- consolidate: 別 skill と統合できる (TARGET に統合先名)
-- patch:       中身を改善 (TARGET に改善案の要約)
-
-判定の規律:
-- 同じ task 領域の skill が複数あれば consolidate を検討
-- 30 日以上使われてない (last_accessed_at は不明だが file mtime で判断) なら archive
-- description が曖昧 / 重複しているなら patch
-
-返答フォーマット (skill 1 つにつき 1 ブロック、--- で区切る):
-NAME: <skill name>
-ACTION: keep | pin | archive | consolidate | patch
-REASON: <1-2 行>
-TARGET: <consolidate / patch のみ。それ以外は省略>
----
-
----skills---
-{skill_listing}
----skills end---"""
-
-
 SLEEP_MIN_TOOL_CALLS_FOR_SKILL = 5
 
 
@@ -1168,12 +1289,14 @@ def cmd_sleep(args: argparse.Namespace) -> None:
             (title or None, summary or None, time.time(), sid),
         )
         db.commit()
+        log_meta(db, "sleep", sid=sid, payload=title or "(no title)")
         print(f"  → {title}", file=sys.stderr)
 
         # skill mint (tool call が多い session のみ)
         if not args.no_skill:
             skill_path = maybe_autocreate_skill(db, sid, client)
             if skill_path:
+                log_meta(db, "automint", sid=sid, payload=str(skill_path))
                 print(f"  + auto skill: {skill_path}", file=sys.stderr)
 
 
@@ -1231,6 +1354,144 @@ def cmd_search(args: argparse.Namespace) -> None:
             for sid, role, ts, cwd, snip in rows:
                 when = local_from_ts(ts).strftime("%Y-%m-%d %H:%M")
                 print(f"{when}  {sid[:16]:16}  {role:10} {snip}")
+
+
+# ---------------------------------------------------------------------------
+# cross — scope query → 関連 session を集めて構造ラベル付きで並べる
+#         並べるまでが道具。気付き / 意味付けは見る側。
+# ---------------------------------------------------------------------------
+
+def _tool_name_from_turn(content: str) -> str | None:
+    """tool turn の content から tool 名を抜く。`name(args) → ...` の形式を期待。"""
+    if not content:
+        return None
+    paren = content.find("(")
+    if paren <= 0:
+        return None
+    name = content[:paren].strip()
+    if not name or not name.replace("_", "").isalnum():
+        return None
+    return name
+
+
+def _session_structure(db: sqlite3.Connection, sid: str) -> dict:
+    """session 全 turn から構造ラベルを集計する (interpret しない、count のみ)。"""
+    turns = db.execute(
+        "SELECT role, ts, content FROM turns WHERE session_id = ? ORDER BY ts",
+        (sid,),
+    ).fetchall()
+    if not turns:
+        return {"n_turns": 0}
+
+    roles: dict[str, int] = {}
+    tools: dict[str, int] = {}
+    for role, _, content in turns:
+        roles[role] = roles.get(role, 0) + 1
+        if role == "tool":
+            tn = _tool_name_from_turn(content or "")
+            if tn:
+                tools[tn] = tools.get(tn, 0) + 1
+
+    first_ts = turns[0][1]
+    last_ts = turns[-1][1]
+    duration_sec = int(last_ts - first_ts)
+
+    top_tools = sorted(tools.items(), key=lambda x: -x[1])[:3]
+
+    return {
+        "n_turns": len(turns),
+        "roles": roles,
+        "top_tools": top_tools,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "duration_sec": duration_sec,
+        "ends_with": turns[-1][0],
+    }
+
+
+def _fmt_duration(sec: int) -> str:
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    h, rem = divmod(sec, 3600)
+    return f"{h}h{rem // 60:02d}m"
+
+
+def cmd_cross(args: argparse.Namespace) -> None:
+    db = init_db(DB_PATH)
+    q = args.query
+    k = max(1, min(args.k, 20))
+    n_excerpts = max(0, min(args.turns, 20))
+
+    table = "turns_fts_tri" if args.tri else "turns_fts"
+    match_q = f'"{q}"' if args.tri else q
+
+    # ヒット数で session をランク (LLM を介さない素朴な集計)
+    try:
+        sess_rows = db.execute(
+            f"""
+            SELECT t.session_id, COUNT(*) AS hits
+            FROM {table}
+            JOIN turns t ON {table}.rowid = t.id
+            WHERE {table} MATCH ?
+            GROUP BY t.session_id
+            ORDER BY hits DESC LIMIT ?
+            """,
+            (match_q, k),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        print(f"search error: {e}", file=sys.stderr)
+        return
+
+    if not sess_rows:
+        print(f"(no sessions matching: {q})")
+        return
+
+    print(f"# cross: {len(sess_rows)} sessions matching {q!r}  (mode={'tri' if args.tri else 'fts'})")
+    print("並べるまでが道具の仕事。差を見るのは見る側。\n")
+
+    for sid, hits in sess_rows:
+        meta = db.execute(
+            "SELECT started_at, title, summary FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        if not meta:
+            continue
+        started_at, title, summary = meta
+        when = local_from_ts(started_at).strftime("%Y-%m-%d %H:%M")
+        struct = _session_structure(db, sid)
+
+        roles_str = "  ".join(f"{r}={n}" for r, n in sorted(struct["roles"].items()))
+        tools_str = ", ".join(f"{n}({c})" for n, c in struct["top_tools"]) or "(none)"
+        title_str = f" — {title}" if title else ""
+
+        print("═" * 78)
+        print(f"session {sid[:16]}  ({when}){title_str}")
+        print(f"  turns={struct['n_turns']}  {roles_str}")
+        print(f"  top_tools={tools_str}")
+        print(f"  duration={_fmt_duration(struct['duration_sec'])}  ends_with={struct['ends_with']}")
+        print(f"  hits_in_query={hits}")
+        if summary:
+            print(f"  summary: {summary.splitlines()[0][:120]}")
+
+        if n_excerpts > 0:
+            excerpts = db.execute(
+                f"""
+                SELECT t.role, t.ts,
+                       snippet({table}, 0, '«', '»', '…', 16) AS snip
+                FROM {table}
+                JOIN turns t ON {table}.rowid = t.id
+                WHERE {table} MATCH ? AND t.session_id = ?
+                ORDER BY t.ts LIMIT ?
+                """,
+                (match_q, sid, n_excerpts),
+            ).fetchall()
+            if excerpts:
+                print(f"  matching turns ({len(excerpts)}):")
+                for role, ts, snip in excerpts:
+                    tt = local_from_ts(ts).strftime("%H:%M")
+                    print(f"    {tt} [{role:9}] …{snip}…")
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -1325,6 +1586,7 @@ tags: {args.tags or ''}
 - (common mistake to avoid)
 """
         target.write_text(body, encoding="utf-8")
+        log_meta(init_db(DB_PATH), "skill_new", payload=f"{args.name} → {target}")
         print(f"created {target}")
         return
 
@@ -1341,60 +1603,67 @@ tags: {args.tags or ''}
             src.parent.rmdir()  # 空の親ディレクトリを掃除
         except OSError:
             pass
+        log_meta(init_db(DB_PATH), "skill_archive", payload=args.name)
         print(f"archived: {args.name}")
         return
 
 
 # ---------------------------------------------------------------------------
-# curator (auto skill の整理を aux LLM が提案、apply は user)
+# events — meta-event ledger の閲覧 (turns とは別の層、FTS にも載らない)
 # ---------------------------------------------------------------------------
 
-def cmd_curator(args: argparse.Namespace) -> None:
-    skills = [s for s in list_skills() if s["source"] == "auto"]
-    if not skills:
-        print("(no auto skills to review)")
-        return
-
-    listing_parts: list[str] = []
-    for s in skills:
-        body = read_skill(s["name"]) or ""
-        # frontmatter 除いて軽量に
-        _, content = parse_skill_frontmatter(body)
-        # mtime も拾う
-        try:
-            mtime = dt.datetime.fromtimestamp(Path(s["path"]).stat().st_mtime).isoformat(timespec="seconds")
-        except OSError:
-            mtime = "(unknown)"
-        listing_parts.append(
-            f"### {s['name']}\n"
-            f"- description: {s['description']}\n"
-            f"- tags: {s['tags']}\n"
-            f"- mtime: {mtime}\n\n"
-            f"{content[:1200].strip()}\n"
-        )
-    listing = "\n---\n".join(listing_parts)
-
-    client = get_client()
+def _parse_since(spec: str) -> float:
+    """7d / 24h / 30m / 60s → 「現在から N 秒前」の epoch を返す。"""
+    spec = spec.strip()
+    if not spec:
+        return 0.0
+    unit = spec[-1]
     try:
-        resp = client.chat.completions.create(
-            model=AUX_MODEL,
-            messages=[{"role": "user", "content": CURATOR_PROMPT.format(skill_listing=listing)}],
-            max_tokens=3072,
-        )
-    except Exception as e:
-        print(f"curator error: {e}", file=sys.stderr)
-        raise SystemExit(1)
-    text = resp.choices[0].message.content or ""
+        n = int(spec[:-1])
+    except ValueError:
+        try:
+            return float(spec)
+        except ValueError:
+            return 0.0
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 1)
+    return time.time() - n * mult
 
-    print("# Curator 提案")
-    print()
-    print(text)
-    print()
-    print("---")
-    print("適用は user 主導 (skin in the game):")
-    print("  bodies skill archive NAME     # archive する")
-    print("  $EDITOR skills/auto/NAME/SKILL.md   # patch を反映")
-    print("  consolidate は手動で統合先 skill を編集 + archive")
+
+def cmd_events(args: argparse.Namespace) -> None:
+    db = init_db(DB_PATH)
+    where: list[str] = []
+    params: list = []
+    if args.kind:
+        where.append("kind = ?")
+        params.append(args.kind)
+    if args.session:
+        where.append("session_id LIKE ?")
+        params.append(args.session + "%")
+    if args.since:
+        since_ts = _parse_since(args.since)
+        if since_ts:
+            where.append("ts >= ?")
+            params.append(since_ts)
+    sql = "SELECT ts, kind, session_id, payload FROM meta_events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY ts DESC LIMIT ?"
+    params.append(args.limit)
+    rows = db.execute(sql, tuple(params)).fetchall()
+    if not rows:
+        print("(no events)")
+        return
+    for ts, kind, sid, payload in rows:
+        when = local_from_ts(ts).strftime("%Y-%m-%d %H:%M:%S")
+        sid_str = f" [{sid[:12]}]" if sid else ""
+        head = (payload or "").splitlines()[0] if payload else ""
+        if args.full and payload:
+            print(f"{when}  {kind:14}{sid_str}")
+            for line in payload.splitlines():
+                print(f"    {line}")
+            print()
+        else:
+            print(f"{when}  {kind:14}{sid_str}  {head[:100]}")
 
 
 # ---------------------------------------------------------------------------
@@ -1411,13 +1680,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("dump", help="rebuild date-based md from DB")
     p_sleep = sub.add_parser("sleep", help="generate title/summary + auto skill (要 LLM_API_KEY)")
     p_sleep.add_argument("--no-skill", action="store_true", help="skip auto skill mint")
-    sub.add_parser("curator", help="aux LLM が auto skill を見渡して整理提案 (apply は user)")
     p_search = sub.add_parser("search", help="FTS5 search over turns / sessions")
     p_search.add_argument("query")
     p_search.add_argument("--tri", action="store_true", help="trigram tokenizer (CJK 部分一致)")
     p_search.add_argument("--turns", action="store_true", help="only turns")
     p_search.add_argument("--sessions", action="store_true", help="only sessions")
     p_search.add_argument("--limit", type=int, default=10)
+    p_cross = sub.add_parser("cross", help="scope query → session 横断で構造ラベル付きで並べる")
+    p_cross.add_argument("query")
+    p_cross.add_argument("--k", type=int, default=5, help="拾う session 数 (default 5)")
+    p_cross.add_argument("--turns", type=int, default=3, help="各 session で表示する matching turn 数 (default 3)")
+    p_cross.add_argument("--tri", action="store_true", help="trigram tokenizer (CJK 部分一致)")
+    p_events = sub.add_parser("events", help="meta-event ledger (sleep / skill 操作 等) を見る")
+    p_events.add_argument("--kind", help="種別で絞る (sleep / skill_new / skill_archive / automint)")
+    p_events.add_argument("--session", help="session_id prefix で絞る")
+    p_events.add_argument("--since", help="期間絞り込み (7d / 24h / 30m / 60s)")
+    p_events.add_argument("--limit", type=int, default=20)
+    p_events.add_argument("--full", action="store_true", help="payload を全文表示")
     p_dom = sub.add_parser("domain", help="show / set domain for sessions")
     p_dom.add_argument("session", nargs="?")
     p_dom.add_argument("domain", nargs="?")
@@ -1448,9 +1727,10 @@ def main() -> None:
         "dump": cmd_dump,
         "sleep": cmd_sleep,
         "search": cmd_search,
+        "cross": cmd_cross,
+        "events": cmd_events,
         "domain": cmd_domain,
         "skill": cmd_skill,
-        "curator": cmd_curator,
     }[cmd]
     handler(args)
 
