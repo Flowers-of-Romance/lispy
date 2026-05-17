@@ -1,115 +1,102 @@
-# bodies
+# ds4ds4 — 認知の考古学
 
-agent 層。soul は持たない、bodies のみ。
+trajectory を append-only で保存し、必要なときに掘り、並べる。
+解釈・意図モデル化は **しない**。骨を組み立てて人を作らない。
+
 
 ---
 
-## 規律
+## 観察された pattern
 
-### Hardware
+固定した規律ではなく、これまで alive を保てた配置の覚え書き。
+書いた瞬間 rule になる。rule で測り始めると感受性が落ちる。
+壊しても良い。ただし「なぜこの配置だったか」を見失わない範囲で。
 
-- モデルは stateless。state は client が持つ。
-- context window はワーキングメモリではなく、入力バッファ。毎ターン空になる。
-- 書く以外に認知は立ち上がらない。だが書いたものは territory ではない。
+### 層 (trajectory)
 
-### Trajectory
+- trajectory = 地層。append-only、上書きしない、失敗も残す。
+- hook (UserPromptSubmit / Stop) 経由と chat 経由の turn は同じ ledger に積む。
+- meta 操作 (sleep / skill 編集 / automint) は別テーブル `meta_events` に書く
+  — **地層と札を混ぜない**。札を地層から検索すると考古学が成立しない。
 
-- trajectory が唯一の事実。残りは事後の解釈。
-- append-only。糸は捨てない、上書きしない。
-- failed trajectory も保存する（pass/fail で別ファイル）。
-- 「書かなかったこと」は台帳化しない。不在を有に変換しない。
-- 必要な集計は trajectory から **on-demand に derive**。事前 log しない。
+### 発掘 (pull)
 
-### Intent / Goal / Presupposition
+- pull only。push (frozen snapshot を context に押し込む) しない。
+- query が来たときに掘る。事前 derive しない。
+- domain タグで層を分け cross-contamination を防ぐ。
 
-- **意図をモデル化しない**。Dennett の intentional stance は観察者の便宜。
-- **目的を事前に持たない**。stated goal は仮説、operative goal は environment にある。
-- **前提を抽出しない**。R は environment にあり、書き下せない。
-- 「ユーザーが何を望んでいるか」を推論しない。書かれた発話に応答する。
+### 並べる (interpret しない)
 
-### USER / Config
+- `recall`: 関連 turn を 1 行 snippet で並べる (ピンポイント試掘)
+- `recall_session`: 1 session を時系列で取る (トレンチ)
+- `cross`: 同じ scope の session を構造ラベル付きで横並びにする
+- どれも tool は構造を読み上げるだけ。「これが面白い」とは言わない。
+  museum の札 (鉄製、長さ 30cm) は書く、「時代を象徴する一品」とは書かない。
 
-- **USER.md を持たない**。意図モデル化は context 汚染。
-- config は静的・最小限のみ：言語、スタイル、TZ、provider 設定。
-- 「あなたは誰か」を書く場所を作らない。
+### モデル化を避ける
 
-### Memory
+- USER.md / 「あなたは誰か」を書く場所を持たない。
+- 意図 / 目的 / 前提を推論しない。書かれた発話に応答する。
 
-- **pull のみ**。push（frozen snapshot 注入）しない。
-- 必要な時に必要な分だけ catalog から引く。
-- **domain タグで分割**。global の毒消し（cross-contamination 防止）。
 
-### Skill
+### 帰結は user に降る
 
-- **task 層に閉じる**。user 層を侵さない。
-- SKILL.md は「**どうやるか**」を書く。「**あなたは誰か**」を書かない。
-- agent が複雑タスク完了後に自動生成して良い（trajectory の蒸留として）。
-- Curator は idle-triggered、auxiliary LLM。**archive のみ、削除しない**。
-- 手書き skill と auto 生成 skill は別ディレクトリで分ける。
+- skin in the game: 不可逆操作は user が commit。
+- harness は draft を作る、commit は user。
+- 外界影響 / 共有 state を変える操作は harness から発火しない (gateway / SMTP 等 built-in 不要)。
 
-### Bodies / Modes
+---
 
-- soul / persona / identity を持たない。
-- bodies = dive / surface / sleep / curator / 等の **policy 切替**。
-- 同一 memory に対して、複数 body が独立に trajectory を書く。
-- body 間で共有されるのは config と memoryだけ。
+## CLI
 
-### Validation
+```
+ds4ds4 chat                対話モード (deepseek で think:False、recall 経由で過去を pull)
+ds4ds4 record-turn         hook handler (Claude Code の UserPromptSubmit / Stop で起動)
+ds4ds4 list                session 一覧
+ds4ds4 search QUERY        FTS5 / trigram で turn / session を検索
+ds4ds4 cross QUERY         scope query → session 横断、構造ラベル付きで並べる
+ds4ds4 events              meta-event ledger (sleep / skill 操作 等)
+ds4ds4 dump                DB → 日付別 md を再生成
+ds4ds4 sleep               未要約 session に title/summary、tool 多い session は automint
+ds4ds4 domain ...          session に domain タグ
+ds4ds4 skill list/show/new/archive   skill (manual + auto) の手動発掘道具
+```
 
-- discovery is cheap, validation is the bottleneck.
-- auto-skill / auto-curator が誤った workflow を固着させるリスクを認識する。
-- 重要な操作は human-in-the-loop。沈黙の自動肯定を信用しない。
-
-### Authority
-
-- predictor として user / agent は対称（思考は LLM 代替可能）。
-- 帰結の所在は非対称：user の身体に降る。
-- skin in the game：皮膚を持つ側が、皮膚に降りかかる決定を握る。
-- 外界影響 / 不可逆 / 共有 state を変える操作は、user が commit する。
-- agent は draft を作る、commit は user。
-
-### Automation
-
-- agent は content generator（stdin/stdout）として動く。
-- scheduling と routing は OS の cron / shell に任せる。
-- 「pre-committed pattern」のみ自動化可、「LLM-decided action」は禁忌。
-- bodies 自体に gateway / SMTP / Slack 等の external sender を持たない。
-- Unix philosophy: 各 program は 1 つのことだけ、pipe で繋ぐ。
+`ds4ds4 chat` 中の tool: `current_time / list_dir / read_file / glob / grep / shell / recall / recall_session`。
 
 ---
 
 ## refuse
 
-- USER.md / MEMORY.md frozen snapshot
-- intent inference / goal tracker
-- presupposition extraction / silence_log
-- ghost のライブラリ化（agent 層の侵入物まで持ち込むことになる）
-- ghost への書き込み（過去資産を改変しない）
+- USER.md / MEMORY.md の frozen snapshot
+- intent inference / goal tracker / presupposition extraction
 - session 跨ぎの user model 自動構築
+- LLM-decided な不可逆 action (送信判断を LLM ループに任せる)
+- gateway / SMTP / messaging の built-in
 - 「あなたを知っている」マーケ narrative
-- gateway / SMTP / messaging の built-in（agent が外界に直接出力する経路）
-- LLM-decided action（送信判断を agent に任せる）
+- skill umbrella の自動 consolidation (= 過去 trace の再解釈ループ)
 
 ## affirm
 
-- trajectory append-only（pass / fail 別保存）
+- trajectory append-only (失敗も残す)
 - pull-based memory access
 - domain partitioning
-- skill auto-creation（task 層に限定）
-- Curator パターン（idle-triggered, auxiliary LLM, archive-only）
-- bodies = modes（policy 切替）
-- Zave & Jackson の R-in-environment 規律
-- 書いたものを完全に保持する（糸は捨てない）
-- content generator として stdin/stdout で動く（Unix pipe 接続）
-- pre-committed pattern による automation（user が cron 仕掛ける形）
+- meta-event は別 ledger
+- 発掘道具は薄く保つ (recall / cross / search / dump)
+- skill は手動編集の対象
+- content generator として stdin/stdout で動く (Unix pipe 接続)
+- pre-committed pattern による automation (cron は user が仕掛ける)
 
 ---
 
-## 影響源（loose reading）
+## 影響源 (loose reading)
 
-- **Zave & Jackson**: R は environment にある（spec の中ではなく phenomena として）
-- **Wittgenstein**: meaning is use
+- **archaeology**: 骨は人を語らない。配置から見る人の中に立ち上がる。
+  考古学者は「これは悲しい人だった」と書かない。「鉄欠乏が見える」と置く。
+- **Polanyi**: tacit knowledge は articulation で消える。残るのは痕跡。
+- **Christopher Alexander**: QWAN (無名の質) は規則化で死ぬ。
+  pattern は「ここで alive を保てた配置」の記述であり、強制でも禁止でもない。
+- **Zave & Jackson**: R は environment にある (spec の中ではなく phenomena として)。
+- **Wittgenstein**: meaning is use。
 
-
-正確な引用ではなく、規律を考えるための参照点。
-主流の intent modeling / user simulation / preference learning 方向とは真逆。
+正確な引用ではなく、何が alive で何が dead かを感じるための参照点。
