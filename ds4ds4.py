@@ -1,4 +1,4 @@
-"""bodies — agent layer.
+"""ds4ds4 — agent layer.
 
 subcommands:
   chat (default)  対話。trajectory を SQLite + 日付別 md に append。要 LLM_API_KEY。
@@ -24,6 +24,23 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
+import asyncio
+
+from rich.console import Console
+from rich.markdown import Markdown
+
+# どの rich Console から呼ばれても bell を黙らせる (Textual 内部の \a 排出を全部塞ぐ)
+Console.bell = lambda self: None  # type: ignore[assignment]
+
+from textual import events
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.message import Message
+from textual.widgets import RichLog, Static, TextArea
+
+console = Console()
+err_console = Console(stderr=True)
+
 # script の親ディレクトリを base にする (hook 経由で cwd が異なっても安定)
 _ROOT = Path(__file__).resolve().parent
 
@@ -47,17 +64,15 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(_ROOT / ".env")
 
-DB_PATH = Path(os.environ.get("BODIES_DB", str(_ROOT / "bodies.db")))
-TURN_DIR = Path(os.environ.get("BODIES_TURN_DIR", str(_ROOT / "data" / "turns")))
-DUMP_DIR = Path(os.environ.get("BODIES_DUMP_DIR", str(_ROOT / "data" / "sessions")))
-SKILLS_DIR = Path(os.environ.get("BODIES_SKILLS_DIR", str(_ROOT / "skills")))
-SKILLS_MANUAL = SKILLS_DIR / "manual"
-SKILLS_AUTO = SKILLS_DIR / "auto"
-TZ_OFFSET_HOURS = int(os.environ.get("BODIES_TZ_OFFSET", "9"))
+DB_PATH = Path(os.environ.get("DS4DS4_DB", str(_ROOT / "ds4ds4.db")))
+TURN_DIR = Path(os.environ.get("DS4DS4_TURN_DIR", str(_ROOT / "data" / "turns")))
+DUMP_DIR = Path(os.environ.get("DS4DS4_DUMP_DIR", str(_ROOT / "data" / "sessions")))
+TZ_OFFSET_HOURS = int(os.environ.get("DS4DS4_TZ_OFFSET", "9"))
 MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-opus-4.7")
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 API_KEY = os.environ.get("LLM_API_KEY")
-AUX_MODEL = os.environ.get("BODIES_AUX_MODEL", MODEL)
+AUX_MODEL = os.environ.get("DS4DS4_AUX_MODEL", MODEL)
+CTX_WINDOW = int(os.environ.get("DS4DS4_CTX_WINDOW", "200000"))
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +80,9 @@ AUX_MODEL = os.environ.get("BODIES_AUX_MODEL", MODEL)
 # ---------------------------------------------------------------------------
 
 def init_db(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    # check_same_thread=False: Textual worker thread から append_turn する。
+    # 同時書きは Textual 側で 1 turn ずつシリアル化されるので race は起きない。
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sessions (
@@ -95,7 +112,7 @@ def init_db(path: Path) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, ts)")
 
     # meta_events: trajectory (turns) と層を分けた meta 操作の ledger。
-    # sleep / skill_archive / skill_new / automint など、地層に対する
+    # sleep など、地層に対する
     # 解釈 / 操作を記録する。turns_fts には載せない (地層と札を混ぜない)。
     conn.execute(
         """
@@ -109,6 +126,20 @@ def init_db(path: Path) -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_meta_events_kind ON meta_events(kind, ts)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id, status)")
 
     # FTS5 (turns)
     conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(content)")
@@ -330,7 +361,7 @@ def append_to_date_md(sid: str, role: str, content: str, cwd: str = "") -> None:
         icon = "🤖 assistant"
 
     if not md_path.exists():
-        text = f'---\ntitle: "{date_str}"\ntags: [bodies]\n---\n\n'
+        text = f'---\ntitle: "{date_str}"\ntags: [ds4ds4]\n---\n\n'
         header = f"## {animal} {time_str} [{project}] session:{short_sid}\n" if project else f"## {animal} {time_str} session:{short_sid}\n"
         text += header
         if cwd:
@@ -351,76 +382,78 @@ def append_to_date_md(sid: str, role: str, content: str, cwd: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# skills (Hermes から: task 層 only、user 層を侵さない規律)
+
+# ---------------------------------------------------------------------------
+# status line
 # ---------------------------------------------------------------------------
 
-def parse_skill_frontmatter(text: str) -> tuple[dict, str]:
-    """SKILL.md の YAML 風 frontmatter を flat に parse して (meta, body) を返す。
-
-    対応するのは flat な key: value のみ。tags: [a,b,c] は文字列のまま入る。
-    """
-    if not text.startswith("---\n"):
-        return {}, text
-    end = text.find("\n---\n", 4)
-    if end == -1:
-        return {}, text
-    fm = text[4:end]
-    body = text[end + 5:]
-    meta: dict = {}
-    for line in fm.splitlines():
-        if ":" not in line:
-            continue
-        k, _, v = line.partition(":")
-        meta[k.strip()] = v.strip().strip('"').strip("'")
-    return meta, body
+def _estimate_tokens(history: list[dict]) -> int:
+    """char ÷ 3 の雑な近似。正確さは要らない、桁感が分かれば良い。"""
+    total = 0
+    for m in history:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for p in c:
+                if isinstance(p, dict):
+                    total += len(p.get("text", "") or "")
+        for tc in m.get("tool_calls", []) or []:
+            args = tc.get("function", {}).get("arguments", "")
+            total += len(args or "")
+    return total // 3
 
 
-def list_skills() -> list[dict]:
-    """skills/manual と skills/auto 配下の SKILL.md を全部走査。
-
-    Returns [{name, description, source, path, tags}, ...]
-    """
-    results = []
-    for source, root in [("manual", SKILLS_MANUAL), ("auto", SKILLS_AUTO)]:
-        if not root.exists():
-            continue
-        for skill_md in sorted(root.glob("*/SKILL.md")):
-            try:
-                meta, _ = parse_skill_frontmatter(skill_md.read_text(encoding="utf-8"))
-            except OSError:
-                continue
-            results.append({
-                "name": meta.get("name") or skill_md.parent.name,
-                "description": meta.get("description", ""),
-                "source": source,
-                "path": str(skill_md),
-                "tags": meta.get("tags", ""),
-            })
-    return results
+def _git_branch() -> str:
+    try:
+        r = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True, timeout=1,
+        )
+        return r.stdout.strip() or "-"
+    except Exception:
+        return "-"
 
 
-def read_skill(name: str) -> str | None:
-    """名前から SKILL.md 本体を返す。manual を auto より優先。"""
-    for root in [SKILLS_MANUAL, SKILLS_AUTO]:
-        path = root / name / "SKILL.md"
-        if path.exists():
-            try:
-                return path.read_text(encoding="utf-8")
-            except OSError:
-                pass
-    return None
+_MODEL_DISPLAY: str | None = None
 
 
-def skill_listing_for_prompt() -> str:
-    """chat の system prompt に積む 1 行 listing を生成。"""
-    skills = list_skills()
-    if not skills:
-        return ""
-    lines = ["", "## Available skills (read_file で本体を引ける):"]
-    for s in skills:
-        loc = "manual" if s["source"] == "manual" else "auto"
-        lines.append(f"- **{s['name']}** ({loc}): {s['description']}  →  {s['path']}")
-    return "\n".join(lines)
+def model_display_name() -> str:
+    """status に出すモデル名。/v1/models で実モデル名取れたらそれ、ダメなら LLM_MODEL。"""
+    global _MODEL_DISPLAY
+    if _MODEL_DISPLAY is not None:
+        return _MODEL_DISPLAY
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=API_KEY or "x", base_url=BASE_URL)
+        models = client.models.list()
+        if models.data:
+            _MODEL_DISPLAY = models.data[0].id
+            return _MODEL_DISPLAY
+    except Exception:
+        pass
+    _MODEL_DISPLAY = MODEL.rsplit("/", 1)[-1]
+    return _MODEL_DISPLAY
+
+
+def render_status(history: list[dict]) -> str:
+    """status line を組み立てる。DS4DS4_STATUSLINE で shell 外注可。"""
+    override = os.environ.get("DS4DS4_STATUSLINE")
+    if override:
+        try:
+            r = subprocess.run(override, shell=True, capture_output=True, text=True, timeout=2)
+            return r.stdout.rstrip()
+        except Exception:
+            pass
+
+    ctx_tokens = _estimate_tokens(history)
+    ctx_pct = min(100, int(100 * ctx_tokens / CTX_WINDOW)) if CTX_WINDOW else 0
+    cwd_short = os.getcwd().replace(str(Path.home()), "~")
+    branch = _git_branch()
+    mode = _TOOL_CTX.get("mode", "default")
+    return (
+        f"{model_display_name()}  ctx ○ {ctx_pct}%  📁 {cwd_short}  🌿 {branch}  mode: {mode}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,12 +485,17 @@ TOOL_SCHEMA = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a text file.",
+            "description": (
+                "ファイルを行番号付きで読む。"
+                "offset (1-based 行番号) と limit (読む行数) でページング可。"
+                "編集するなら表示行番号を頼りに edit_file の old_string を組み立てる。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "limit": {"type": "integer", "description": "Max lines to read"},
+                    "offset": {"type": "integer", "description": "開始行 (1-based、default 1)"},
+                    "limit": {"type": "integer", "description": "読む行数 (default 全部、max 2000)"},
                 },
                 "required": ["path"],
             },
@@ -548,6 +586,261 @@ TOOL_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult",
+            "description": (
+                "fresh context で LLM 自身にサブ質問を投げる。"
+                "main loop の history を持たない、tool も持たない、純粋な text-in/text-out。"
+                "切り出した小問題 (要約・分類・抽出・形式変換 等) を深く考えさせたいときに使う。"
+                "default は thinking 有効 (main loop より深く考える)。再帰 consult は不可。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "サブ質問の本文。文脈は全部 prompt に書く"},
+                    "max_tokens": {"type": "integer", "description": "返答の最大トークン。default 1024、max 4096"},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "ファイルの中の old_string を new_string に書き換える。exact match。"
+                "old_string が見つからない / 複数一致 (replace_all=false の時) は error。"
+                "unique にするには周辺 context を含めて拡張する。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean", "description": "default false。true なら全一致を置換"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "ファイルを書き出す (上書き)。親ディレクトリは自動作成。新規 / 全書換用。編集は edit_file を優先。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subagent",
+            "description": (
+                "fresh history + tool 付きの sub-agent を別 loop で走らせる。"
+                "consult は text only / 1 ターンだが、subagent は tool を回せる。"
+                "切り出した独立タスク (調査・複数 step の処理 等) を任せる。"
+                "戻り値は sub-agent の最終 assistant text。再帰 subagent は不可。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "sub-agent への指示。文脈は全部 task に書く"},
+                    "system": {"type": "string", "description": "system prompt 上書き (optional)"},
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_create",
+            "description": "進行中のタスクを記録する。複数 step の作業を追跡したいときに使う。",
+            "parameters": {
+                "type": "object",
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_update",
+            "description": "task の status を更新。pending / in_progress / completed。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer"},
+                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                },
+                "required": ["id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task_list",
+            "description": "current session の task 一覧 (completed は default で除外)。",
+            "parameters": {
+                "type": "object",
+                "properties": {"include_completed": {"type": "boolean"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bg_run",
+            "description": (
+                "shell command を background で起動する。返り値の bg_id で status / tail / kill。"
+                "長い build / test / log tail を投げっぱなしにする用途。"
+                "safe-list 外は user 確認。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bg_status",
+            "description": "background task の状態 (running / done + exit code) を返す。",
+            "parameters": {
+                "type": "object",
+                "properties": {"bg_id": {"type": "string"}},
+                "required": ["bg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bg_tail",
+            "description": "background task の stdout/stderr の末尾 N 行を返す (default 50, max 500)。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bg_id": {"type": "string"},
+                    "lines": {"type": "integer"},
+                },
+                "required": ["bg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bg_kill",
+            "description": "background task を terminate (3 秒後に kill)。",
+            "parameters": {
+                "type": "object",
+                "properties": {"bg_id": {"type": "string"}},
+                "required": ["bg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "URL を GET して text content を返す。html は簡易に tag 除去。"
+                "redirects 追従、size 上限 2MB、出力上限 16k 字、timeout 指定可。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "timeout": {"type": "integer", "description": "default 15s、max 60s"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "DuckDuckGo の html 版で web 検索。title + url + snippet のリストを返す。"
+                "詳しく読みたい hit があれば web_fetch で本文を取りに行く 2 段構え。"
+                "API key 不要。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "description": "件数。default 10、max 20"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mode_set",
+            "description": (
+                "permission mode を切替える。"
+                "default = unsafe shell に確認、edit/write は free。"
+                "plan = edit_file / write_file / bg_run / unsafe shell を全部 block (read-only)。"
+                "yolo = 確認なし、何でも実行。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["default", "plan", "yolo"]},
+                },
+                "required": ["mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_new",
+            "description": (
+                "タスクが完結 / 話題が切れたとき、現 session を閉じて新規 session を開く。"
+                "carry に渡した文字列だけが次の session の system message として持ち越される。"
+                "context が太ってきたら早めに切るのが規律。"
+                "過去は recall で取り戻せるので carry は最小で良い。"
+                "subagent からは呼べない。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "carry": {"type": "string", "description": "次の session に持ち越したい要約 (optional)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "session_close",
+            "description": (
+                "現 session を閉じて chat を終了する。"
+                "明確に区切りたいときに呼ぶ。subagent からは呼べない。"
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -576,11 +869,22 @@ def _tool_read_file(args: dict) -> str:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"read error: {e}"
-    limit = args.get("limit")
-    if limit:
-        lines = text.splitlines()[: int(limit)]
-        text = "\n".join(lines)
-    return text[:16000]
+    lines = text.splitlines()
+    total = len(lines)
+    offset_arg = args.get("offset")
+    offset = max(1, int(offset_arg)) if offset_arg else 1
+    limit_arg = args.get("limit")
+    limit = max(1, min(int(limit_arg), 2000)) if limit_arg else min(2000, total)
+    start = offset - 1
+    if start >= total:
+        return f"# {path} ({total} lines, offset {offset} out of range)"
+    end = min(total, start + limit)
+    selected = lines[start:end]
+    body = "\n".join(f"{i:6}\t{line}" for i, line in enumerate(selected, start=offset))
+    if len(body) > 32000:
+        body = body[:32000] + "\n…(truncated by char limit)"
+    header = f"# {path} ({total} lines, showing {offset}-{end})"
+    return f"{header}\n{body}" if body else header
 
 
 def _tool_glob(args: dict) -> str:
@@ -642,14 +946,18 @@ def _is_shell_safe(cmd: str) -> bool:
 def _tool_shell(args: dict) -> str:
     cmd = args["command"]
     safe = _is_shell_safe(cmd)
+    mode = _TOOL_CTX.get("mode", "default")
     print(f"\n  [tool] shell{' (safe)' if safe else ''}: {cmd}", file=sys.stderr)
     if not safe:
-        try:
-            confirm = input("  実行する？ [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return "user rejected (no input)"
-        if confirm != "y":
-            return "user rejected execution"
+        if mode == "plan":
+            return _plan_block("shell (unsafe command)")
+        if mode != "yolo":
+            try:
+                confirm = input("  実行する？ [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return "user rejected (no input)"
+            if confirm != "y":
+                return "user rejected execution"
     try:
         proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
@@ -754,6 +1062,401 @@ def _tool_recall_session(args: dict) -> str:
     return "\n".join(out)
 
 
+def _tool_consult(args: dict) -> str:
+    """fresh context で LLM 自身にサブ質問。tool なし、history なし、再帰不可。
+    main loop と切り離して考えさせるサブルーチン的扱い。"""
+    prompt = (args.get("prompt") or "").strip()
+    if not prompt:
+        return "(empty prompt)"
+    max_tokens = max(1, min(int(args.get("max_tokens") or 1024), 4096))
+
+    client = get_client()
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            # think は default のまま (main の chat は False、consult はサブ問題なので深く)
+        )
+    except Exception as e:
+        return f"consult error: {e}"
+    return resp.choices[0].message.content or "(no content)"
+
+
+# tool 実行コンテキスト (現在の session / cwd 等を tool handler に渡す)
+_TOOL_CTX: dict = {"sid": None, "cwd": "", "in_subagent": False, "mode": "default"}
+
+
+def _plan_block(name: str) -> str:
+    return f"plan mode: {name} is blocked. call mode_set('default' or 'yolo') to unblock."
+
+# background process registry: bg_id → {proc, out_path, err_path, cmd, started}
+_BG_PROCS: dict = {}
+
+
+def _tool_edit_file(args: dict) -> str:
+    if _TOOL_CTX.get("mode") == "plan":
+        return _plan_block("edit_file")
+    path = Path(args["path"]).expanduser()
+    old = args.get("old_string", "")
+    new = args.get("new_string", "")
+    replace_all = bool(args.get("replace_all", False))
+    if not path.exists():
+        return f"not found: {path}"
+    if old == new:
+        return "error: old_string equals new_string"
+    if not old:
+        return "error: empty old_string"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return f"read error: {e}"
+    count = text.count(old)
+    if count == 0:
+        return f"error: old_string not found in {path}"
+    if count > 1 and not replace_all:
+        return (
+            f"error: old_string matches {count} times in {path}; "
+            "expand surrounding context to make it unique, or pass replace_all=true"
+        )
+    new_text = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+    try:
+        path.write_text(new_text, encoding="utf-8")
+    except OSError as e:
+        return f"write error: {e}"
+    _print_diff(text, new_text, path)
+    plural = "s" if count > 1 else ""
+    return f"edited {path} ({count} replacement{plural})"
+
+
+def _print_diff(old_text: str, new_text: str, path: Path) -> None:
+    import difflib
+    lines = difflib.unified_diff(
+        old_text.splitlines(keepends=False),
+        new_text.splitlines(keepends=False),
+        fromfile=str(path), tofile=str(path),
+        n=2, lineterm="",
+    )
+    for line in lines:
+        if line.startswith("+++") or line.startswith("---"):
+            err_console.print(line, style="bold", highlight=False)
+        elif line.startswith("+"):
+            err_console.print(line, style="green", highlight=False)
+        elif line.startswith("-"):
+            err_console.print(line, style="red", highlight=False)
+        elif line.startswith("@@"):
+            err_console.print(line, style="cyan", highlight=False)
+        else:
+            err_console.print(line, style="dim", highlight=False)
+
+
+def _tool_write_file(args: dict) -> str:
+    if _TOOL_CTX.get("mode") == "plan":
+        return _plan_block("write_file")
+    path = Path(args["path"]).expanduser()
+    content = args.get("content", "")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except OSError as e:
+        return f"write error: {e}"
+    return f"wrote {path} ({len(content)} bytes)"
+
+
+SUBAGENT_SYSTEM_PROMPT = """ds4ds4 sub-agent mode.
+独立した focused task を任されている。fresh history + tool 持ち、ただし subagent は呼べない。
+タスクを最後まで実行し、最終的な結果を簡潔な assistant text で返せ。
+tool の使い方は main loop と同じ規律。"""
+
+
+def _tool_subagent(args: dict) -> str:
+    if _TOOL_CTX.get("in_subagent"):
+        return "error: 再帰 subagent は不可"
+    task = (args.get("task") or "").strip()
+    if not task:
+        return "(empty task)"
+    system = args.get("system") or SUBAGENT_SYSTEM_PROMPT
+
+    client = get_client()
+    sub_history = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": task},
+    ]
+    sub_tools = [t for t in TOOL_SCHEMA if t["function"]["name"] != "subagent"]
+    sub_dispatch = {k: v for k, v in TOOL_DISPATCH.items() if k != "subagent"}
+
+    prev = _TOOL_CTX.get("in_subagent", False)
+    _TOOL_CTX["in_subagent"] = True
+    try:
+        return run_tool_loop(
+            client, sub_history, sub_tools,
+            dispatch=sub_dispatch, db=None, sid=None,
+            cwd=_TOOL_CTX.get("cwd", ""), label="sub",
+        )
+    finally:
+        _TOOL_CTX["in_subagent"] = prev
+
+
+def _tool_task_create(args: dict) -> str:
+    content = (args.get("content") or "").strip()
+    if not content:
+        return "(empty content)"
+    db = init_db(DB_PATH)
+    sid = _TOOL_CTX.get("sid")
+    now = time.time()
+    cur = db.execute(
+        "INSERT INTO tasks (session_id, content, status, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?)",
+        (sid, content, now, now),
+    )
+    db.commit()
+    return f"task #{cur.lastrowid}: {content}"
+
+
+def _tool_task_update(args: dict) -> str:
+    task_id = args.get("id")
+    status = args.get("status", "")
+    if status not in ("pending", "in_progress", "completed"):
+        return f"invalid status: {status}"
+    if task_id is None:
+        return "missing id"
+    db = init_db(DB_PATH)
+    res = db.execute(
+        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+        (status, time.time(), task_id),
+    )
+    db.commit()
+    if res.rowcount == 0:
+        return f"task #{task_id} not found"
+    return f"task #{task_id} → {status}"
+
+
+def _tool_task_list(args: dict) -> str:
+    include_completed = bool(args.get("include_completed", False))
+    db = init_db(DB_PATH)
+    sid = _TOOL_CTX.get("sid")
+    if include_completed:
+        rows = db.execute(
+            "SELECT id, content, status FROM tasks WHERE session_id = ? ORDER BY id",
+            (sid,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, content, status FROM tasks WHERE session_id = ? AND status != 'completed' ORDER BY id",
+            (sid,),
+        ).fetchall()
+    if not rows:
+        return "(no tasks)"
+    marker = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+    return "\n".join(f"{marker.get(s, '[?]')} #{tid} {c}" for tid, c, s in rows)
+
+
+def _tool_bg_run(args: dict) -> str:
+    cmd = (args.get("command") or "").strip()
+    if not cmd:
+        return "(empty command)"
+    safe = _is_shell_safe(cmd)
+    mode = _TOOL_CTX.get("mode", "default")
+    print(f"\n  [bg] {cmd}{' (safe)' if safe else ''}", file=sys.stderr)
+    if not safe:
+        if mode == "plan":
+            return _plan_block("bg_run (unsafe command)")
+        if mode != "yolo":
+            try:
+                confirm = input("  background 実行する？ [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return "user rejected (no input)"
+            if confirm != "y":
+                return "user rejected execution"
+    bg_id = uuid.uuid4().hex[:8]
+    out_path = Path(f"/tmp/ds4ds4-bg-{bg_id}.out")
+    err_path = Path(f"/tmp/ds4ds4-bg-{bg_id}.err")
+    try:
+        out_f = open(out_path, "wb")
+        err_f = open(err_path, "wb")
+        proc = subprocess.Popen(cmd, shell=True, stdout=out_f, stderr=err_f)
+    except OSError as e:
+        return f"spawn error: {e}"
+    _BG_PROCS[bg_id] = {
+        "proc": proc, "out": out_path, "err": err_path,
+        "cmd": cmd, "started": time.time(),
+    }
+    return f"bg_id={bg_id} pid={proc.pid} cmd={cmd}"
+
+
+def _tool_bg_status(args: dict) -> str:
+    bg_id = args.get("bg_id", "")
+    if not bg_id and _BG_PROCS:
+        return "\n".join(
+            _format_bg_status(bid, entry) for bid, entry in _BG_PROCS.items()
+        )
+    entry = _BG_PROCS.get(bg_id)
+    if not entry:
+        return f"unknown bg_id: {bg_id}"
+    return _format_bg_status(bg_id, entry)
+
+
+def _format_bg_status(bg_id: str, entry: dict) -> str:
+    proc = entry["proc"]
+    rc = proc.poll()
+    elapsed = int(time.time() - entry["started"])
+    state = "running" if rc is None else f"done exit={rc}"
+    return f"{bg_id} {state} ({elapsed}s) cmd={entry['cmd']}"
+
+
+def _tool_bg_tail(args: dict) -> str:
+    bg_id = args.get("bg_id", "")
+    n = max(1, min(int(args.get("lines") or 50), 500))
+    entry = _BG_PROCS.get(bg_id)
+    if not entry:
+        return f"unknown bg_id: {bg_id}"
+    parts: list[str] = []
+    for label, path in [("stdout", entry["out"]), ("stderr", entry["err"])]:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+        except OSError:
+            lines = []
+        if lines:
+            parts.append(f"--- {label} (last {len(lines)}) ---\n" + "\n".join(lines))
+    status = _format_bg_status(bg_id, entry)
+    body = "\n".join(parts) or "(no output yet)"
+    return f"{status}\n{body}"
+
+
+def _tool_web_fetch(args: dict) -> str:
+    url = (args.get("url") or "").strip()
+    if not url:
+        return "(empty url)"
+    if not url.startswith(("http://", "https://")):
+        return f"invalid url: {url} (need http:// or https://)"
+    timeout = max(1, min(int(args.get("timeout") or 15), 60))
+
+    import httpx
+    try:
+        resp = httpx.get(
+            url, timeout=timeout, follow_redirects=True,
+            headers={"User-Agent": "ds4ds4/0.1"},
+        )
+    except httpx.HTTPError as e:
+        return f"fetch error: {e}"
+
+    ctype = resp.headers.get("content-type", "")
+    text = resp.text
+    raw_len = len(text)
+
+    if "html" in ctype.lower():
+        text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        import html as _html
+        text = _html.unescape(text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text).strip()
+
+    header = f"[{resp.status_code}] {url} ({ctype})\n"
+    if len(text) > 16000:
+        text = text[:16000] + f"\n…(truncated, {raw_len} total chars)"
+    return header + text
+
+
+def _tool_session_new(args: dict) -> str:
+    if _TOOL_CTX.get("in_subagent"):
+        return "error: subagent からは session_new を呼べない"
+    carry = (args.get("carry") or "").strip()
+    _TOOL_CTX["pending_action"] = ("new", carry)
+    return f"session rotation queued (carry: {len(carry)} chars)。このターン完了後に新 session に移行。"
+
+
+def _tool_session_close(args: dict) -> str:
+    if _TOOL_CTX.get("in_subagent"):
+        return "error: subagent からは session_close を呼べない"
+    _TOOL_CTX["pending_action"] = ("close", "")
+    return "chat close queued。このターン完了後に終了。"
+
+
+def _tool_web_search(args: dict) -> str:
+    q = (args.get("query") or "").strip()
+    if not q:
+        return "(empty query)"
+    n = max(1, min(int(args.get("limit") or 10), 20))
+
+    import httpx
+    try:
+        resp = httpx.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": q},
+            timeout=15,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) ds4ds4/0.1",
+                "Accept": "text/html",
+            },
+        )
+    except httpx.HTTPError as e:
+        return f"search error: {e}"
+
+    html_text = resp.text
+    item_re = re.compile(
+        r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.+?)</a>',
+        re.DOTALL,
+    )
+    snippet_re = re.compile(
+        r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.+?)</a>',
+        re.DOTALL,
+    )
+    titles_urls = item_re.findall(html_text)
+    snippets = snippet_re.findall(html_text)
+
+    import html as _html_mod
+    from urllib.parse import unquote, parse_qs, urlparse
+
+    out = []
+    for i, (url, title_html) in enumerate(titles_urls[:n]):
+        if "uddg=" in url:
+            try:
+                qs = parse_qs(urlparse(url).query)
+                if "uddg" in qs:
+                    url = unquote(qs["uddg"][0])
+            except Exception:
+                pass
+        if url.startswith("//"):
+            url = "https:" + url
+        title = _html_mod.unescape(re.sub(r"<[^>]+>", "", title_html)).strip()
+        snippet = ""
+        if i < len(snippets):
+            snippet = _html_mod.unescape(re.sub(r"<[^>]+>", "", snippets[i])).strip()
+        out.append(f"{i + 1}. {title}\n   {url}\n   {snippet}")
+
+    if not out:
+        return f"(no results for: {q})"
+    return f"# web_search: {q} ({len(out)} hits)\n\n" + "\n\n".join(out)
+
+
+def _tool_mode_set(args: dict) -> str:
+    mode = (args.get("mode") or "").strip().lower()
+    if mode not in ("default", "plan", "yolo"):
+        return f"invalid mode: {mode}. valid: default, plan, yolo"
+    prev = _TOOL_CTX.get("mode", "default")
+    _TOOL_CTX["mode"] = mode
+    return f"mode: {prev} → {mode}"
+
+
+def _tool_bg_kill(args: dict) -> str:
+    bg_id = args.get("bg_id", "")
+    entry = _BG_PROCS.get(bg_id)
+    if not entry:
+        return f"unknown bg_id: {bg_id}"
+    proc = entry["proc"]
+    if proc.poll() is not None:
+        return f"{bg_id} already done exit={proc.returncode}"
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+    return f"{bg_id} killed exit={proc.returncode}"
+
+
 TOOL_DISPATCH = {
     "current_time": _tool_current_time,
     "list_dir": _tool_list_dir,
@@ -763,10 +1466,126 @@ TOOL_DISPATCH = {
     "shell": _tool_shell,
     "recall": _tool_recall,
     "recall_session": _tool_recall_session,
+    "consult": _tool_consult,
+    "edit_file": _tool_edit_file,
+    "write_file": _tool_write_file,
+    "subagent": _tool_subagent,
+    "task_create": _tool_task_create,
+    "task_update": _tool_task_update,
+    "task_list": _tool_task_list,
+    "bg_run": _tool_bg_run,
+    "bg_status": _tool_bg_status,
+    "bg_tail": _tool_bg_tail,
+    "bg_kill": _tool_bg_kill,
+    "web_fetch": _tool_web_fetch,
+    "web_search": _tool_web_search,
+    "mode_set": _tool_mode_set,
+    "session_new": _tool_session_new,
+    "session_close": _tool_session_close,
 }
 
 
-CHAT_SYSTEM_PROMPT = """bodies chat mode.
+def run_tool_loop(
+    client, history: list[dict], tools: list,
+    *, dispatch: dict | None = None,
+    db=None, sid: str | None = None, cwd: str = "",
+    max_iters: int = 20,
+    on_chunk=None, on_tool_call=None, on_tool_result=None,
+    on_assistant_done=None,
+) -> str:
+    """streaming で tool-calling loop を駆動。最終 assistant text を返す。
+
+    callbacks (全部 optional):
+      on_chunk(piece: str)        — text chunk が来るたび
+      on_tool_call(name, args)    — tool dispatch 直前
+      on_tool_result(name, result) — tool 実行後
+      on_assistant_done(text)     — 1 assistant turn (tool_calls なし) 完了時
+    callback 無しなら silent (subagent 用)。
+    """
+    if dispatch is None:
+        dispatch = TOOL_DISPATCH
+    for _ in range(max_iters):
+        stream = client.chat.completions.create(
+            model=MODEL,
+            messages=history,
+            tools=tools,
+            max_tokens=4096,
+            extra_body={"think": False},
+            stream=True,
+        )
+
+        content_parts: list[str] = []
+        tool_calls_acc: dict[int, dict] = {}
+
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if getattr(delta, "content", None):
+                content_parts.append(delta.content)
+                if on_chunk:
+                    on_chunk(delta.content)
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                idx = tc.index
+                entry = tool_calls_acc.setdefault(idx, {
+                    "id": "", "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if tc.id:
+                    entry["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn:
+                    if fn.name:
+                        entry["function"]["name"] += fn.name
+                    if fn.arguments:
+                        entry["function"]["arguments"] += fn.arguments
+
+        content = "".join(content_parts)
+        tool_calls = [tool_calls_acc[k] for k in sorted(tool_calls_acc)]
+
+        if not tool_calls:
+            history.append({"role": "assistant", "content": content})
+            if db and sid:
+                append_turn(db, sid, "assistant", content, cwd=cwd, model=MODEL)
+                append_to_date_md(sid, "assistant", content, cwd=cwd)
+            if on_assistant_done:
+                on_assistant_done(content)
+            return content
+
+        history.append({
+            "role": "assistant",
+            "content": content or None,
+            "tool_calls": tool_calls,
+        })
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            try:
+                targs = json.loads(tc["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                targs = {}
+            if on_tool_call:
+                on_tool_call(name, targs)
+            handler = dispatch.get(name)
+            if handler is None:
+                result = f"unknown tool: {name}"
+            else:
+                try:
+                    result = handler(targs)
+                except Exception as e:
+                    result = f"error: {e}"
+            if on_tool_result:
+                on_tool_result(name, result)
+            history.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+            if db and sid:
+                append_turn(db, sid, "tool", f"{name}({targs}) → {result[:200]}", cwd=cwd, model=MODEL)
+    return "[tool loop limit reached]"
+
+
+CHAT_SYSTEM_PROMPT = """ds4ds4 chat mode.
 
 - 簡単な質問には text のみで答える。tool は必要な時だけ使う。
 - 応答は短く、要点だけ。長い列挙より一行のまとめ。
@@ -775,97 +1594,221 @@ CHAT_SYSTEM_PROMPT = """bodies chat mode.
 - 「今いつ？」のような時刻質問は current_time を使う (DB の session 時刻と混同しない)。
 - **過去 trajectory が役立ちそうなとき** (「前にやった X」「いつもの手順」「以前のあの session」等) は recall を呼ぶ。
   関連 turn が見つかったら recall_session で前後文脈まで取り、現在のタスクを過去パターンに照らして合成する。
-  事前に skill として固めるより、毎回 retrieve して synthesize する方が bodies の規律に合う。"""
+  毎回 retrieve して synthesize する方が ds4ds4 の規律に合う。
+- **切り出した小問題** (要約・分類・抽出・形式変換 等) を main loop と切り離して考えさせたいときは consult を呼ぶ。
+  fresh context で text-in/text-out、main の history は混じらない。再帰 consult は不可 (consult 中の LLM には tool が無い)。"""
 
 
 # ---------------------------------------------------------------------------
 # chat (standalone agent loop + tool calling)
 # ---------------------------------------------------------------------------
 
+class ChatInput(TextArea):
+    """multi-line 対応 input。Enter で送信、Alt+Enter / Shift+Enter で改行。"""
+
+    BINDINGS: list = []  # default の Enter=改行 等を全部解除
+
+    def bell(self) -> None:
+        pass  # widget レベルの bell も黙らせる
+
+    def on_mount(self) -> None:
+        self.cursor_blink = False  # カーソル点滅を止める
+
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    async def _on_key(self, event: events.Key) -> None:
+        # Enter / 改行系を完全に内製で捌く。super に渡さないので TextArea 内部の
+        # 「改行挿入 → 副作用 bell」経路が一切走らない。
+        if event.key in ("alt+enter", "shift+enter", "ctrl+j"):
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            return
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            text = self.text
+            self.load_text("")
+            self.post_message(self.Submitted(text))
+            return
+        await super()._on_key(event)
+
+
+class BodiesChatApp(App):
+    """Claude Code 風の TUI。Input は下固定、上は会話ログ、最下は status。"""
+
+    CSS = """
+    Screen { background: $surface; }
+    RichLog#log {
+        background: $surface;
+        padding: 0 1;
+    }
+    ChatInput#prompt {
+        dock: bottom;
+        border: round gray;
+        margin: 0 1;
+        height: auto;
+        min-height: 3;
+        max-height: 12;
+        background: $surface;
+        scrollbar-size: 0 0;
+    }
+    Static#status {
+        dock: bottom;
+        color: $text-muted;
+        padding: 0 2;
+        height: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+d", "quit", "exit", priority=True),
+    ]
+
+    def bell(self) -> None:
+        pass  # 黙らせる: Textual のデフォルト bell を無効化
+
+    def __init__(self, client, db, sid: str, system_prompt: str, cwd: str):
+        super().__init__()
+        self.animation_level = "none"
+        # rich Console レベルでも bell を黙らせる (\a 文字を抑止)
+        try:
+            self.console.bell = lambda: None  # type: ignore[assignment]
+        except Exception:
+            pass
+        self.client = client
+        self.db = db
+        self.sid = sid
+        self.system_prompt = system_prompt
+        self.cwd = cwd
+        self.history: list[dict] = [{"role": "system", "content": system_prompt}]
+        self._stream_buffer: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        yield RichLog(id="log", wrap=True, markup=True, highlight=False)
+        yield Static("", id="status")
+        yield ChatInput(id="prompt")
+
+    def on_mount(self) -> None:
+        self._refresh_status()
+        # status の自動更新は一旦切る (bell 容疑のため)。turn ごとに _refresh_status は手動で呼ぶ
+        self.query_one("#prompt", ChatInput).focus()
+
+    def _refresh_status(self) -> None:
+        self.query_one("#status", Static).update(render_status(self.history))
+
+    def _log(self, renderable) -> None:
+        """RichLog に書く (会話ログの統一出口)。"""
+        self.query_one("#log", RichLog).write(renderable)
+
+    async def on_chat_input_submitted(self, event: "ChatInput.Submitted") -> None:
+        text = event.value.strip()
+        if not text:
+            return
+
+        self._log(f"\n[dim]❯[/dim] {text}\n")
+
+        self.history.append({"role": "user", "content": text})
+        append_turn(self.db, self.sid, "user", text, cwd=self.cwd, model=MODEL)
+        append_to_date_md(self.sid, "user", text, cwd=self.cwd)
+
+        self.run_worker(self._run_turn, thread=True, exclusive=False)
+
+    def _run_turn(self) -> None:
+        def on_chunk(piece: str) -> None:
+            self.call_from_thread(self._append_stream, piece)
+
+        def on_tool_call(name: str, args: dict) -> None:
+            self.call_from_thread(self._show_tool_call, name, args)
+
+        def on_assistant_done(content: str) -> None:
+            self.call_from_thread(self._flush_stream)
+
+        run_tool_loop(
+            self.client, self.history, TOOL_SCHEMA,
+            db=self.db, sid=self.sid, cwd=self.cwd,
+            on_chunk=on_chunk,
+            on_tool_call=on_tool_call,
+            on_assistant_done=on_assistant_done,
+        )
+        self.call_from_thread(self._after_turn)
+
+    def _append_stream(self, piece: str) -> None:
+        # 途中表示なし、buffer に貯めるだけ。\a (bell) は剥ぐ。
+        self._stream_buffer.append(piece.replace("\x07", ""))
+
+    def _show_tool_call(self, name: str, args: dict) -> None:
+        args_str = json.dumps(args, ensure_ascii=False)[:200]
+        self._log(f"[dim]  · {name}({args_str})[/dim]")
+
+    def _flush_stream(self) -> None:
+        text = "".join(self._stream_buffer)
+        self._stream_buffer.clear()
+        if text:
+            self._log(Markdown(text, code_theme="ansi_dark"))
+
+    def _after_turn(self) -> None:
+        action = _TOOL_CTX.pop("pending_action", None)
+        self._refresh_status()
+        if not action:
+            return
+        kind, carry = action
+        closed_sid = self.sid
+        close_session(self.db, closed_sid)
+
+        # closed session を非同期で sleep
+        self.run_worker(
+            lambda: self._sleep_one(closed_sid),
+            thread=True, exclusive=False, name=f"sleep-{closed_sid[:8]}",
+        )
+
+        if kind == "close":
+            self._log(f"[dim]· session {closed_sid[:12]} closed[/dim]")
+            self.exit()
+            return
+        self.sid = open_session(self.db)
+        _TOOL_CTX["sid"] = self.sid
+        self.history.clear()
+        self.history.append({"role": "system", "content": self.system_prompt})
+        if carry:
+            self.history.append({
+                "role": "system",
+                "content": f"[carry from prior session]\n{carry}",
+            })
+        self._log(f"[dim]· new session {self.sid[:12]}[/dim]")
+
+    def _sleep_one(self, sid: str) -> None:
+        """worker thread で sleep_one を走らせ、結果を log に通知。"""
+        try:
+            title = sleep_one(self.db, sid, self.client)
+        except Exception as e:
+            self.call_from_thread(self._log, f"[dim red]· sleep[{sid[:8]}] error: {e}[/dim red]")
+            return
+        if title:
+            self.call_from_thread(self._log, f"[dim]· sleep[{sid[:8]}]: {title}[/dim]")
+
+
 def cmd_chat(args: argparse.Namespace) -> None:
     db = init_db(DB_PATH)
     client = get_client()
     sid = open_session(db)
-    system_prompt = CHAT_SYSTEM_PROMPT + skill_listing_for_prompt()
-    history: list[dict] = [{"role": "system", "content": system_prompt}]
+    system_prompt = CHAT_SYSTEM_PROMPT
     cwd = os.getcwd()
+    _TOOL_CTX["sid"] = sid
+    _TOOL_CTX["cwd"] = cwd
+    _TOOL_CTX["in_subagent"] = False
+    _TOOL_CTX["mode"] = getattr(args, "mode", "default")
 
+    app = BodiesChatApp(client, db, sid, system_prompt, cwd)
     try:
-        while True:
-            try:
-                user = input("> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if not user:
-                continue
-            history.append({"role": "user", "content": user})
-            append_turn(db, sid, "user", user, cwd=cwd, model=MODEL)
-            append_to_date_md(sid, "user", user, cwd=cwd)
-
-            # tool loop: tool_calls が無くなるまで往復
-            for _ in range(20):  # 安全のため最大 20 ループ
-                resp = client.chat.completions.create(
-                    model=MODEL,
-                    messages=history,
-                    tools=TOOL_SCHEMA,
-                    max_tokens=4096,
-                    extra_body={"think": False},  # chat は CoT 不要 (sleep は default=thinking high)
-                )
-                msg = resp.choices[0].message
-                tool_calls = msg.tool_calls or []
-                content = msg.content or ""
-
-                if not tool_calls:
-                    history.append({"role": "assistant", "content": content})
-                    append_turn(db, sid, "assistant", content, cwd=cwd, model=MODEL)
-                    append_to_date_md(sid, "assistant", content, cwd=cwd)
-                    print(content)
-                    break
-
-                # tool_calls あり: assistant message を tool_calls 付きで履歴に追加
-                history.append({
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                })
-                for tc in tool_calls:
-                    name = tc.function.name
-                    try:
-                        targs = json.loads(tc.function.arguments or "{}")
-                    except json.JSONDecodeError:
-                        targs = {}
-                    print(f"  [tool] {name}({targs})", file=sys.stderr)
-                    handler = TOOL_DISPATCH.get(name)
-                    if handler is None:
-                        result = f"unknown tool: {name}"
-                    else:
-                        try:
-                            result = handler(targs)
-                        except Exception as e:
-                            result = f"error: {e}"
-                    history.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    })
-                    # tool 実行も trajectory に残す (role=tool)
-                    append_turn(db, sid, "tool", f"{name}({targs}) → {result[:200]}", cwd=cwd, model=MODEL)
-            else:
-                # 20 周しても落ち着かない場合
-                print("[tool loop limit reached]", file=sys.stderr)
+        # full screen mode: iTerm2 で inline mode の layout 不具合 (入力が中段に出る + 応答消失)
+        # を回避。chat 中は terminal 占有、Ctrl+D で抜けると元に戻る。
+        app.run(mouse=False)
     finally:
-        close_session(db, sid)
+        close_session(db, app.sid)
 
 
 # ---------------------------------------------------------------------------
@@ -920,27 +1863,6 @@ def extract_tool_results(message: dict) -> dict[str, str]:
     return out
 
 
-def format_tool_for_md(name: str, input_dict: dict, result: str) -> str:
-    MAX = 500
-    truncated = (result or "").strip()[:MAX]
-    if result and len(result) > MAX:
-        truncated += "\n… (truncated)"
-    if name == "Bash":
-        cmd = input_dict.get("command", "").replace("\n", " ").strip()
-        if len(cmd) > 80:
-            cmd = cmd[:77] + "..."
-        return f"- Bash `{cmd}`\n```\n{truncated}\n```\n"
-    if name == "Read":
-        return f"- Read `{input_dict.get('file_path', '')}`\n"
-    if name == "Edit":
-        return f"- Edit `{input_dict.get('file_path', '')}`\n"
-    if name == "Write":
-        return f"- Write `{input_dict.get('file_path', '')}`\n"
-    if name in ("Glob", "Grep"):
-        return f"- {name} `{input_dict.get('pattern', '')}`\n"
-    return f"- {name}\n"
-
-
 def handle_user_prompt(hook: dict) -> None:
     prompt = hook.get("prompt", "")
     if not prompt.strip():
@@ -966,6 +1888,9 @@ def handle_agent_response(hook: dict) -> None:
 
 
 def handle_stop(hook: dict) -> None:
+    """transcript を読んで、まだ DB に入ってない entry を全部 append。
+    L2: assistant text に加え、tool_use / tool_result も turn として取り込む。
+    model 名は assistant entry の message.model から拾う (spoof 検出可)。"""
     transcript_path = hook.get("transcript_path", "")
     if not transcript_path or not Path(transcript_path).exists():
         return
@@ -988,33 +1913,57 @@ def handle_stop(hook: dict) -> None:
     db = init_db(DB_PATH)
     ensure_session(db, sid)
 
-    # SQLite: 最後の assistant テキストのみ
-    for msg in reversed(messages):
-        text = extract_assistant_text(msg)
-        if text and text.strip():
-            append_turn(db, sid, "assistant", text, cwd=cwd)
-            append_to_date_md(sid, "assistant", text, cwd=cwd)
-            break
+    # dedup: DB に既に入ってるこの session の最後の turn ts より新しい entry のみ取り込む
+    last_ts_row = db.execute(
+        "SELECT MAX(ts) FROM turns WHERE session_id = ?", (sid,)
+    ).fetchone()
+    last_ts = float(last_ts_row[0] or 0.0)
 
-    # md: tool call を callout で追記
+    # tool_result map (id → text) は全 message から先に集める (順序不問の参照用)
     result_map: dict[str, str] = {}
     for msg in messages:
         result_map.update(extract_tool_results(msg))
-    parts: list[str] = []
-    for msg in messages:
-        for name, inp, tid in extract_tool_calls(msg):
-            parts.append(format_tool_for_md(name, inp, result_map.get(tid, "")))
-    if not parts:
-        return
 
-    now = local_now()
-    md_path = TURN_DIR / f"{now.strftime('%Y-%m-%d')}.md"
-    if md_path.exists():
-        lines_out = ["> [!info]- 🔧 Tool calls"]
-        for p in parts:
-            for line in p.rstrip("\n").split("\n"):
-                lines_out.append(f"> {line}")
-        locked_append(md_path, "\n" + "\n".join(lines_out) + "\n")
+    appended = 0
+    last_assistant_text: str | None = None
+    for msg in messages:
+        ts_str = msg.get("timestamp")
+        if not ts_str:
+            continue
+        try:
+            entry_ts = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if entry_ts <= last_ts + 1e-6:
+            continue
+
+        etype = msg.get("type")
+        m = msg.get("message", {}) if isinstance(msg.get("message"), dict) else {}
+
+        if etype == "assistant":
+            model = m.get("model") or ""
+            text = extract_assistant_text(msg)
+            if text and text.strip():
+                append_turn(db, sid, "assistant", text, cwd=cwd, model=model)
+                appended += 1
+                last_assistant_text = text
+            for name, inp, tid in extract_tool_calls(msg):
+                try:
+                    inp_str = json.dumps(inp, ensure_ascii=False, separators=(",", ":"))
+                except Exception:
+                    inp_str = str(inp)
+                if len(inp_str) > 300:
+                    inp_str = inp_str[:300] + "…"
+                result = result_map.get(tid, "")
+                if len(result) > 500:
+                    result = result[:500] + "…"
+                content = f"{name}({inp_str}) → {result}" if result else f"{name}({inp_str})"
+                append_turn(db, sid, "tool", content, cwd=cwd, model=model)
+                appended += 1
+
+    # date-based md は最後の assistant text のみ追記 (従来挙動を維持、tool は md には書かない)
+    if last_assistant_text:
+        append_to_date_md(sid, "assistant", last_assistant_text, cwd=cwd)
 
 
 def cmd_record_turn(args: argparse.Namespace) -> None:
@@ -1034,7 +1983,7 @@ def cmd_record_turn(args: argparse.Namespace) -> None:
         elif event in ("AfterAgent", "AgentComplete"):
             handle_agent_response(hook)
     except Exception as e:
-        print(f"bodies record-turn error: {e}", file=sys.stderr)
+        print(f"ds4ds4 record-turn error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1081,7 +2030,7 @@ def cmd_dump(args: argparse.Namespace) -> None:
 
     for date_str, items in sorted(by_date.items()):
         md_path = TURN_DIR / f"{date_str}.md"
-        text = f'---\ntitle: "{date_str}"\ntags: [bodies]\n---\n'
+        text = f'---\ntitle: "{date_str}"\ntags: [ds4ds4]\n---\n'
         current_sid = None
         for sid, role, content, when, cwd in items:
             short_sid = sid[:8]
@@ -1125,30 +2074,6 @@ SUMMARY:
 ---対話終了---"""
 
 
-SKILL_AUTOMINT_PROMPT = """以下の対話を読み、これを **再利用可能な skill (手順書)** として記録する価値があるか判定せよ。
-
-判定基準 (全て満たすと yes):
-- 5+ の tool 呼び出しがある複雑タスクである
-- 同種のタスクで再利用できる workflow が抽出可能
-- 失敗→成功の経験や、自明でないコツがある
-- 単なる質疑応答や雑談ではない
-
-bodies 規律: skill は task 層に閉じる。「あなたは誰か」は書かない、「どうやるか」だけ書く。
-
-返答フォーマット (no の場合は DECISION: no の 1 行のみ):
-DECISION: yes
-NAME: <kebab-case の skill 名、20 字以内、英数字とハイフンのみ>
-DESCRIPTION: <when to use を 1 行で、日本語可>
-TAGS: <comma-separated、3 個まで>
-BODY:
-<SKILL.md 本体、## When / ## How / ## Pitfalls の見出しを含む markdown>
-
----対話開始---
-{transcript}
----対話終了---"""
-
-
-SLEEP_MIN_TOOL_CALLS_FOR_SKILL = 5
 
 
 def transcript_of(db: sqlite3.Connection, sid: str, max_chars: int = 60000) -> str:
@@ -1182,85 +2107,30 @@ def parse_sleep_response(text: str) -> tuple[str, str]:
     return title, "\n".join(summary).strip()
 
 
-def parse_skill_automint_response(text: str) -> dict | None:
-    """SKILL_AUTOMINT_PROMPT の返答を parse。yes の場合のみ dict を返す。"""
-    decision = ""
-    meta = {"name": "", "description": "", "tags": ""}
-    body_lines: list[str] = []
-    mode = None
-    for line in text.splitlines():
-        if line.startswith("DECISION:"):
-            decision = line.split(":", 1)[1].strip().lower()
-        elif line.startswith("NAME:"):
-            meta["name"] = line.split(":", 1)[1].strip()
-        elif line.startswith("DESCRIPTION:"):
-            meta["description"] = line.split(":", 1)[1].strip()
-        elif line.startswith("TAGS:"):
-            meta["tags"] = line.split(":", 1)[1].strip()
-        elif line.startswith("BODY:"):
-            mode = "body"
-        elif mode == "body":
-            body_lines.append(line)
-    if decision != "yes" or not meta["name"]:
-        return None
-    name = re.sub(r"[^a-z0-9\-]", "", meta["name"].lower())[:30]
-    if not name:
-        return None
-    return {
-        "name": name,
-        "description": meta["description"],
-        "tags": meta["tags"],
-        "body": "\n".join(body_lines).strip(),
-    }
-
-
-def maybe_autocreate_skill(db: sqlite3.Connection, sid: str, client) -> Path | None:
-    """session の trajectory を見て skill 化候補なら skills/auto/ に書き出す。"""
-    n_tool = db.execute(
-        "SELECT COUNT(*) FROM turns WHERE session_id = ? AND role = 'tool'",
-        (sid,),
-    ).fetchone()[0]
-    if n_tool < SLEEP_MIN_TOOL_CALLS_FOR_SKILL:
+def sleep_one(
+    db: sqlite3.Connection, sid: str, client,
+) -> str | None:
+    """1 session に title + summary を生成する。title 済みなら skip。"""
+    row = db.execute("SELECT title FROM sessions WHERE id = ?", (sid,)).fetchone()
+    if row and row[0]:
         return None
     transcript = transcript_of(db, sid)
     if not transcript.strip():
         return None
-
-    try:
-        resp = client.chat.completions.create(
-            model=AUX_MODEL,
-            messages=[{"role": "user", "content": SKILL_AUTOMINT_PROMPT.format(transcript=transcript)}],
-            max_tokens=2048,
-        )
-    except Exception as e:
-        print(f"  skill mint error: {e}", file=sys.stderr)
-        return None
+    resp = client.chat.completions.create(
+        model=AUX_MODEL,
+        messages=[{"role": "user", "content": SLEEP_PROMPT.format(transcript=transcript)}],
+        max_tokens=1024,
+    )
     text = resp.choices[0].message.content or ""
-    parsed = parse_skill_automint_response(text)
-    if not parsed:
-        return None
-
-    target = SKILLS_AUTO / parsed["name"] / "SKILL.md"
-    if target.exists():
-        return None  # 衝突したら skip (Curator が後で見る)
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    # frontmatter を整える (LLM 出力に frontmatter が無い場合は付ける)
-    body = parsed["body"]
-    if not body.startswith("---\n"):
-        frontmatter = (
-            "---\n"
-            f"name: {parsed['name']}\n"
-            f"description: {parsed['description']}\n"
-            f"created: {local_now().isoformat(timespec='seconds')}\n"
-            f"source: auto\n"
-            f"source_session: {sid}\n"
-            f"tags: {parsed['tags']}\n"
-            "---\n\n"
-        )
-        body = frontmatter + body
-    target.write_text(body, encoding="utf-8")
-    return target
+    title, summary = parse_sleep_response(text)
+    db.execute(
+        "UPDATE sessions SET title = ?, summary = ?, derived_at = ? WHERE id = ?",
+        (title or None, summary or None, time.time(), sid),
+    )
+    db.commit()
+    log_meta(db, "sleep", sid=sid, payload=title or "(no title)")
+    return title
 
 
 def cmd_sleep(args: argparse.Namespace) -> None:
@@ -1273,31 +2143,13 @@ def cmd_sleep(args: argparse.Namespace) -> None:
         print("no sessions to summarize")
         return
     for (sid,) in rows:
-        transcript = transcript_of(db, sid)
-        if not transcript.strip():
-            continue
         print(f"sleeping over {sid} ...", file=sys.stderr)
-        resp = client.chat.completions.create(
-            model=AUX_MODEL,
-            messages=[{"role": "user", "content": SLEEP_PROMPT.format(transcript=transcript)}],
-            max_tokens=1024,
-        )
-        text = resp.choices[0].message.content or ""
-        title, summary = parse_sleep_response(text)
-        db.execute(
-            "UPDATE sessions SET title = ?, summary = ?, derived_at = ? WHERE id = ?",
-            (title or None, summary or None, time.time(), sid),
-        )
-        db.commit()
-        log_meta(db, "sleep", sid=sid, payload=title or "(no title)")
-        print(f"  → {title}", file=sys.stderr)
-
-        # skill mint (tool call が多い session のみ)
-        if not args.no_skill:
-            skill_path = maybe_autocreate_skill(db, sid, client)
-            if skill_path:
-                log_meta(db, "automint", sid=sid, payload=str(skill_path))
-                print(f"  + auto skill: {skill_path}", file=sys.stderr)
+        try:
+            title = sleep_one(db, sid, client)
+            if title:
+                print(f"  → {title}", file=sys.stderr)
+        except Exception as e:
+            print(f"  error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1527,88 +2379,6 @@ def cmd_domain(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# skill (CLI)
-# ---------------------------------------------------------------------------
-
-def cmd_skill(args: argparse.Namespace) -> None:
-    sub = args.skill_cmd or "list"
-
-    if sub == "list":
-        skills = list_skills()
-        if not skills:
-            print("(no skills)")
-            print(f"  add one: mkdir -p {SKILLS_MANUAL}/<name> && $EDITOR {SKILLS_MANUAL}/<name>/SKILL.md")
-            return
-        for s in skills:
-            tag = f"[{s['tags']}]" if s["tags"] else ""
-            print(f"{s['source']:6}  {s['name']:24}  {tag:20} {s['description']}")
-        return
-
-    if sub == "show":
-        body = read_skill(args.name)
-        if body is None:
-            print(f"skill not found: {args.name}", file=sys.stderr)
-            raise SystemExit(1)
-        print(body)
-        return
-
-    if sub == "new":
-        target = SKILLS_MANUAL / args.name / "SKILL.md"
-        if target.exists():
-            print(f"already exists: {target}", file=sys.stderr)
-            raise SystemExit(1)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # `--from-stdin` 明示時のみ stdin から読み込む。そうでなければテンプレ生成。
-        if args.from_stdin:
-            body = sys.stdin.read()
-        else:
-            body = f"""---
-name: {args.name}
-description: {args.description or '(describe when to use this skill)'}
-created: {local_now().isoformat(timespec='seconds')}
-source: manual
-tags: {args.tags or ''}
----
-
-# {args.name}
-
-## When
-
-(when to use this skill)
-
-## How
-
-1. step 1
-2. step 2
-
-## Pitfalls
-
-- (common mistake to avoid)
-"""
-        target.write_text(body, encoding="utf-8")
-        log_meta(init_db(DB_PATH), "skill_new", payload=f"{args.name} → {target}")
-        print(f"created {target}")
-        return
-
-    if sub == "archive":
-        # auto skill を archive サブディレクトリに移す (manual は対象外、user が手で消すべき)
-        src = SKILLS_AUTO / args.name / "SKILL.md"
-        if not src.exists():
-            print(f"auto skill not found: {args.name}", file=sys.stderr)
-            raise SystemExit(1)
-        archive_dir = SKILLS_AUTO / ".archive" / args.name
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        src.rename(archive_dir / "SKILL.md")
-        try:
-            src.parent.rmdir()  # 空の親ディレクトリを掃除
-        except OSError:
-            pass
-        log_meta(init_db(DB_PATH), "skill_archive", payload=args.name)
-        print(f"archived: {args.name}")
-        return
-
-
-# ---------------------------------------------------------------------------
 # events — meta-event ledger の閲覧 (turns とは別の層、FTS にも載らない)
 # ---------------------------------------------------------------------------
 
@@ -1671,15 +2441,16 @@ def cmd_events(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="bodies", description="agent layer")
+    p = argparse.ArgumentParser(prog="ds4ds4", description="agent layer")
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("chat", help="interactive chat (default)")
+    p_chat = sub.add_parser("chat", help="interactive chat (default)")
+    p_chat.add_argument("--mode", choices=["default", "plan", "yolo"], default="default",
+                        help="permission mode (default=current, plan=read-only, yolo=no confirm)")
     sub.add_parser("record-turn", help="hook handler (stdin: hook JSON)")
     p_list = sub.add_parser("list", help="list sessions")
     p_list.add_argument("--limit", type=int, default=30)
     sub.add_parser("dump", help="rebuild date-based md from DB")
-    p_sleep = sub.add_parser("sleep", help="generate title/summary + auto skill (要 LLM_API_KEY)")
-    p_sleep.add_argument("--no-skill", action="store_true", help="skip auto skill mint")
+    p_sleep = sub.add_parser("sleep", help="generate title/summary (要 LLM_API_KEY)")
     p_search = sub.add_parser("search", help="FTS5 search over turns / sessions")
     p_search.add_argument("query")
     p_search.add_argument("--tri", action="store_true", help="trigram tokenizer (CJK 部分一致)")
@@ -1691,8 +2462,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cross.add_argument("--k", type=int, default=5, help="拾う session 数 (default 5)")
     p_cross.add_argument("--turns", type=int, default=3, help="各 session で表示する matching turn 数 (default 3)")
     p_cross.add_argument("--tri", action="store_true", help="trigram tokenizer (CJK 部分一致)")
-    p_events = sub.add_parser("events", help="meta-event ledger (sleep / skill 操作 等) を見る")
-    p_events.add_argument("--kind", help="種別で絞る (sleep / skill_new / skill_archive / automint)")
+    p_events = sub.add_parser("events", help="meta-event ledger を見る")
+    p_events.add_argument("--kind", help="種別で絞る (sleep)")
     p_events.add_argument("--session", help="session_id prefix で絞る")
     p_events.add_argument("--since", help="期間絞り込み (7d / 24h / 30m / 60s)")
     p_events.add_argument("--limit", type=int, default=20)
@@ -1702,18 +2473,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_dom.add_argument("domain", nargs="?")
     p_dom.add_argument("--clear", action="store_true")
 
-    p_skill = sub.add_parser("skill", help="manage skills (manual / auto)")
-    p_skill_sub = p_skill.add_subparsers(dest="skill_cmd")
-    p_skill_sub.add_parser("list", help="list all skills")
-    p_skill_show = p_skill_sub.add_parser("show", help="display a skill body")
-    p_skill_show.add_argument("name")
-    p_skill_new = p_skill_sub.add_parser("new", help="create a new manual skill")
-    p_skill_new.add_argument("name")
-    p_skill_new.add_argument("--description", default="")
-    p_skill_new.add_argument("--tags", default="")
-    p_skill_new.add_argument("--from-stdin", action="store_true", help="read body from stdin instead of template")
-    p_skill_arc = p_skill_sub.add_parser("archive", help="archive an auto skill")
-    p_skill_arc.add_argument("name")
     return p
 
 
@@ -1730,7 +2489,6 @@ def main() -> None:
         "cross": cmd_cross,
         "events": cmd_events,
         "domain": cmd_domain,
-        "skill": cmd_skill,
     }[cmd]
     handler(args)
 
