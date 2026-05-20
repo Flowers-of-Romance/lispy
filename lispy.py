@@ -85,6 +85,8 @@ class Turn:
     tool_calls: list[dict] = field(default_factory=list)
     # role=="tool" のときだけセット。OpenAI 形式の tool_call_id。
     tool_call_id: str = ""
+    # llm-call に 'logprobs #t を渡したときだけ詰まる。 各要素は {"token": str, "logprob": float}。
+    logprobs: list[dict] = field(default_factory=list)
 
     def to_message(self) -> dict:
         msg: dict = {"role": self.role, "content": self.content or ""}
@@ -355,6 +357,9 @@ SYSTEM_PROMPT = """lispy mode.
   (recur a b ...)  — nearest lambda を tail call (stack 消費しない)
   (lambda (a &rest xs) ...)  — 残余引数 (defmacro 同様)
   (list? x) (symbol? x) (number? x) (lambda? x) (pair? x) (eq? a b)
+  (fork-env env 'system "..." 'name "...")  — env を first-class に copy + override
+  (llm-call env 'temperature 1.5 'logprobs #t 'max-tokens 4096)  — sampling/観測オプション
+  (turn-logprobs t)  (turn-entropy t)  — 出力の確信度を Lisp 値で扱う
   (name arg ...)  (apply f arglist)  (compose f g)
   (quote expr)  (eval expr)  (if c t e)  (let ((x v)) body)
   (+ - * / = < >)  (list car cdr cons null?)
@@ -1341,21 +1346,46 @@ def _prim_lookup_factory(env: Env) -> Callable[..., Any]:
     return _lookup
 
 
-def _prim_llm_call(env_arg: Any) -> Turn:
-    """(llm-call env) — env.to_messages() を LLM に投げ、assistant Turn を返す。
+def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
+    """(llm-call env [k v ...]) — env.to_messages() を LLM に投げ、 assistant Turn を返す。
 
-    agent loop を S 式で書くための基盤。template 展開 / auto-eval / 履歴 append は **しない**。
+    option は plist 形式で渡す (defmacro / fork-env と同じ慣習):
+      'temperature 1.5     — sampling 温度
+      'max-tokens 4096     — token 上限 (default 2048)
+      'logprobs #t         — 各 token の logprob を Turn.logprobs に詰める
+      'top-logprobs 5      — 各 token に対して上位 N 候補も取る (要 'logprobs #t)
+      'think #t            — DeepSeek の thinking モード (default off)
+
+    agent loop を S 式で書くための基盤。 template 展開 / auto-eval / 履歴 append は **しない**。
     呼び出し側で `(append-turn env response)` を打つ責任がある (= loop の規則が S 式に出る)。
     """
     if not isinstance(env_arg, Env):
         raise ValueError(f"llm-call: expected env, got {type(env_arg).__name__}")
+    if len(opts) % 2 != 0:
+        raise ValueError("llm-call: options must be paired (key value ...)")
+    opts_dict: dict[str, Any] = {}
+    for i in range(0, len(opts), 2):
+        k = opts[i].name if isinstance(opts[i], Symbol) else str(opts[i])
+        opts_dict[k] = opts[i + 1]
+
+    kwargs: dict[str, Any] = {}
+    if "temperature" in opts_dict:
+        kwargs["temperature"] = float(opts_dict["temperature"])
+    if _truthy(opts_dict.get("logprobs", False)):
+        kwargs["logprobs"] = True
+        if "top-logprobs" in opts_dict:
+            kwargs["top_logprobs"] = int(opts_dict["top-logprobs"])
+    max_tok = int(opts_dict.get("max-tokens", 2048))
+    extra = {"think": bool(_truthy(opts_dict.get("think", False)))}
+
     client = host.get_client()
     resp = client.chat.completions.create(
         model=host.MODEL,
         messages=env_arg.to_messages(),
         tools=env_arg.tool_schema or None,
-        max_tokens=2048,
-        extra_body={"think": False},
+        max_tokens=max_tok,
+        extra_body=extra,
+        **kwargs,
     )
     msg = resp.choices[0].message
     content = msg.content or ""
@@ -1368,7 +1398,20 @@ def _prim_llm_call(env_arg: Any) -> Turn:
         }
         for tc in tool_calls_raw
     ]
-    return Turn(role="assistant", content=content, tool_calls=tool_calls)
+    # logprobs を抽出 (API が返した場合のみ)。 SDK の dataclass を素朴な dict に降ろす。
+    logprobs_out: list[dict] = []
+    lp = getattr(resp.choices[0], "logprobs", None)
+    if lp is not None:
+        content_lp = getattr(lp, "content", None) or []
+        for item in content_lp:
+            logprobs_out.append({
+                "token": getattr(item, "token", "") or "",
+                "logprob": float(getattr(item, "logprob", 0.0)),
+            })
+    return Turn(
+        role="assistant", content=content,
+        tool_calls=tool_calls, logprobs=logprobs_out,
+    )
 
 
 def _prim_append_turn(env_arg: Any, turn: Any) -> Any:
@@ -1730,9 +1773,21 @@ PRIMITIVES: dict[str, Callable[..., Any]] = {
     "make-tool-turn":   lambda content, tcid: Turn(role="tool", content=str(content), tool_call_id=str(tcid)),
     "turn-role":        lambda t: t.role if isinstance(t, Turn) else "",
     "turn-content":     lambda t: t.content if isinstance(t, Turn) else "",
+    # tool-calls は agent-step / init.lispy の素朴な用語。 turn-tool-calls は accessor 命名規則の対称形。
+    # 中身は同じだが、 turn-tool-calls が「正」 (turn-role / turn-content / turn-id と並ぶ accessor)、
+    # tool-calls はその alias として残す (古い code を壊さない)。
     "turn-tool-calls":  lambda t: list(t.tool_calls) if isinstance(t, Turn) else [],
-    "tool-calls":       lambda t: list(t.tool_calls) if isinstance(t, Turn) else [],  # user's draft 名
+    "tool-calls":       lambda t: list(t.tool_calls) if isinstance(t, Turn) else [],
     "turn-id":          lambda t: t.id if isinstance(t, Turn) else "",
+    # logprobs 観測 — llm-call に 'logprobs #t を渡したときだけ意味を持つ。
+    # turn-logprobs:   list of (token logprob) ペア (2-elem list の list)
+    # turn-entropy:    平均 -logprob (= cross-entropy in nats)。 logprobs 空なら 0.0。
+    "turn-logprobs":    lambda t: [[d.get("token", ""), float(d.get("logprob", 0.0))]
+                                    for d in (t.logprobs if isinstance(t, Turn) else [])],
+    "turn-entropy":     lambda t: (
+        sum(-float(d.get("logprob", 0.0)) for d in t.logprobs) / max(len(t.logprobs), 1)
+        if isinstance(t, Turn) and t.logprobs else 0.0
+    ),
     "has-tool-calls?":  lambda t: bool(t.tool_calls) if isinstance(t, Turn) else False,
     # tool_call (OpenAI 形式 dict) の accessor — args は JSON 文字列で返す
     "tool-call-id":     lambda tc: tc.get("id", "") if isinstance(tc, dict) else "",
@@ -1927,6 +1982,49 @@ def _form_eval_turn(env: Env, turn_id: str) -> Value:
     )
 
 
+def _prim_fork_env(env_arg: Any, *opts: Any) -> "Env":
+    """(fork-env env [k v ...]) — env を deep-ish copy。 turns / archive / quoted / bindings は
+    独立 (元に変更が漏れない)、 tools / tool_schema / db_conn / record_sid は共有 (副作用集約のため)。
+
+    optional k/v は override。 例:
+      (fork-env (env))                                    ;; clone current
+      (fork-env (env) 'system "you are a critic")         ;; system override
+      (fork-env (env) 'system "..." 'name "alt")          ;; multiple
+
+    返り値は新しい Env オブジェクト。 spawn は (eval-with) や (llm-call) と組み合わせて構成可。
+    """
+    if not isinstance(env_arg, Env):
+        raise ValueError(f"fork-env: 1st arg must be env (got {type(env_arg).__name__})")
+    # k v ペアを dict に
+    overrides: dict[str, Any] = {}
+    if len(opts) % 2 != 0:
+        raise ValueError("fork-env: options must be paired (key value ...)")
+    for i in range(0, len(opts), 2):
+        k = opts[i]
+        if isinstance(k, Symbol):
+            k = k.name
+        overrides[str(k)] = opts[i + 1]
+    # 既定: 元 env の独立 copy。 tools/tool_schema は共有 (重い + 通常共通)、
+    # db_conn / record_sid も共有 (記録は 1 箇所に集約する設計)。
+    new_env = Env(
+        system=str(overrides.get("system", env_arg.system)),
+        turns=list(env_arg.turns),
+        tools=env_arg.tools,
+        tool_schema=env_arg.tool_schema,
+        archive={k: list(v) for k, v in env_arg.archive.items()},
+        quoted=dict(env_arg.quoted),
+        bindings=dict(env_arg.bindings),
+        name=str(overrides.get("name", f"{env_arg.name}/fork")),
+        depth=env_arg.depth + 1,
+        db_conn=env_arg.db_conn,
+        record_sid=env_arg.record_sid,
+        lambda_call_depth=0,
+        input_mode=env_arg.input_mode,
+        macros=dict(env_arg.macros),
+    )
+    return new_env
+
+
 def _form_spawn(env: Env, task: str) -> Value:
     """新しい child env を作って task を評価させる。subagent 相当だが env が独立。
 
@@ -2049,6 +2147,8 @@ def _install_meta_primitives(env: Env) -> None:
     # 元の (env) info 文字列は `(env-info)` に rename。
     env.bindings["env-info"] = env.bindings.pop("env", lambda: "(env removed)")
     env.bindings["env"] = env
+    # env を Lisp 値として fork する primitive。 spawn より素朴な、 first-class env 操作。
+    env.bindings["fork-env"] = _prim_fork_env
     # host の DB / file / web tool 群を Lisp primitive として直接公開
     env.bindings.update(_host_bridge_factory(env))
     # edit.py (副作用系: write-file / edit-file / shell / append-file) を optional import。
@@ -2062,32 +2162,16 @@ def _install_meta_primitives(env: Env) -> None:
     except ImportError:
         pass
 
-    # --- Lisp 派生定義 ---
-    # compose: 古典的な関数合成。FP の universal idiom として、これだけは pre-define。
-    evaluate(read_sexp("(define compose (lambda (f g) (lambda (x) (g (f x)))))"), env)
-    # --- agent loop の本体を S 式の binding として置く ---
-    # この agent-step が lispy の核。
-    # 走行中に (define agent-step (lambda (env input) ...)) で書き換え可能。
-    # REPL の平文入力は eval_ から (agent-step env input) で呼ばれる。
-    evaluate(read_sexp(
-        "(define agent-step"
-        " (lambda (env input)"
-        "  (let ((env2 (append-turn env (make-turn \"user\" input))))"
-        "   (let ((response (llm-call env2)))"
-        "    (let ((env3 (append-turn env2 response)))"
-        "     (if (has-tool-calls? response)"
-        "         (agent-step"
-        "           (fold (lambda (e tc)"
-        "                   (append-turn e"
-        "                     (make-turn \"tool\""
-        "                       (dispatch-tool (tool-call-name tc)"
-        "                                      (tool-call-args tc))"
-        "                       (tool-call-id tc))))"
-        "                 env3"
-        "                 (tool-calls response))"
-        "           \"\")"
-        "         response))))))"
-    ), env)
+    # --- Lisp seed を init.lispy から load ---
+    # compose と agent-step は「言語の核」 なので Python に文字列で埋めず、 init.lispy に置く。
+    # 「核は S 式」 という宣言と実装を一致させる狙い。 走行中の (define agent-step ...) で上書き可能。
+    init_path = _HERE / "init.lispy"
+    if init_path.exists():
+        try:
+            for form in read_all_sexp(init_path.read_text(encoding="utf-8")):
+                evaluate(form, env)
+        except Exception as e:
+            print(f"  (warning: init.lispy load failed: {e})", file=sys.stderr)
 
 
 def _open_recording(env: Env) -> None:
@@ -2186,8 +2270,11 @@ def repl() -> None:
     print("Errors:     (try expr (catch (e) handler))  (error \"msg\")  (error? v) (error-message e)")
     print("Mutable:    (set! name expr)   (box v) (unbox b) (set-box! b v) (box? v)")
     print("TCO:        (recur a b ...)  — nearest lambda を tail call、 stack 消費しない")
-    print("Env meta:   (env) (turns) (turn \"last-assistant\") (archive) (lambdas) (quoted)")
+    print("Env meta:   env (turns) (turn \"last-assistant\") (archive) (lambdas) (quoted)")
     print("            (renew \"carry\")  (quote-turn expr)  (eval-turn id)  (spawn \"task\")")
+    print("            (fork-env env 'system \"...\")  — env を first-class に copy + override")
+    print("LLM opts:   (llm-call env 'temperature 1.5 'logprobs #t 'max-tokens 4096)")
+    print("            (turn-logprobs t) (turn-entropy t)  — 観測の Lisp 値化")
     print("Higher:     (set-mode <lambda>)  (clear-mode)  — 平文入力を λ 経由に")
     print("            (eval-turn-pure id)  — env を汚さず再評価 (probe 用素材)")
     print("REPL meta:  !env !archive !quoted !lambdas !turns !reset")
