@@ -56,9 +56,11 @@ DB_PATH = Path(os.environ.get("LISPY_DB", str(_ROOT / "host.db")))
 TURN_DIR = Path(os.environ.get("LISPY_TURN_DIR", str(_ROOT / "data" / "turns")))
 DUMP_DIR = Path(os.environ.get("LISPY_DUMP_DIR", str(_ROOT / "data" / "sessions")))
 TZ_OFFSET_HOURS = int(os.environ.get("LISPY_TZ_OFFSET", "9"))
-MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-opus-4.7")
-BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-API_KEY = os.environ.get("LLM_API_KEY")
+## LLM 設定は .env に書く (.env.example を copy)。
+## host.py は default 値を持たない: provider 選択は code でなく config の責務。
+MODEL    = os.environ.get("LLM_MODEL", "")
+BASE_URL = os.environ.get("LLM_BASE_URL", "")
+API_KEY  = os.environ.get("LLM_API_KEY", "")
 CTX_WINDOW = int(os.environ.get("LISPY_CTX_WINDOW", "200000"))
 
 
@@ -218,8 +220,16 @@ def log_meta(db: sqlite3.Connection, kind: str, sid: str | None = None, payload:
 
 
 def get_client():
-    if not API_KEY:
-        raise SystemExit("set LLM_API_KEY in env (.env)")
+    missing = [k for k, v in (
+        ("LLM_API_KEY", API_KEY),
+        ("LLM_BASE_URL", BASE_URL),
+        ("LLM_MODEL", MODEL),
+    ) if not v]
+    if missing:
+        raise SystemExit(
+            f"{', '.join(missing)} not set. "
+            f"copy .env.example to .env and fill in the values."
+        )
     from openai import OpenAI  # lazy import
     return OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
