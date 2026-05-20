@@ -1,24 +1,25 @@
 [project]
-name = "ds4ds4"
+name = "lispy"
 version = "0"  # PEP 621 requires this; carries no semantic claim
-description = "agent layer — soul is absent, ds4ds4 only"
+description = "live-redefinable agent evaluator (lispy core + host support)"
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0",
-    "prompt-toolkit>=3.0.52",
-    "rich>=15.0.0",
-    "textual>=8.2.6",
+    "httpx>=0.27",
 ]
 
 [project.scripts]
-ds4ds4 = "ds4ds4:main"
+lispy = "lispy:main"
+host = "host:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["ds4ds4.py"]
+only-include = ["host.py", "lispy.py", "edit.py"]
 
 [tool.hatch.build.targets.wheel.sources]
-"ds4ds4.py" = "ds4ds4.py"
+"host.py" = "host.py"
+"lispy.py" = "lispy.py"
+"edit.py" = "edit.py"

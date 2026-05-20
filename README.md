@@ -1,102 +1,782 @@
-# ds4ds4 — 認知の考古学
+# lispy
 
-trajectory を append-only で保存し、必要なときに掘り、並べる。
-解釈・意図モデル化は **しない**。骨を組み立てて人を作らない。
+**走らせながら評価規則を書き換えられる agent 評価器**。
 
+設計と実装と評価が同じ層で起きる場所。plan / implement / evaluate の分離がない、
 
----
+**agent loop が S 式の binding** 
 
-## 観察された pattern
-
-固定した規律ではなく、これまで alive を保てた配置の覚え書き。
-書いた瞬間 rule になる。rule で測り始めると感受性が落ちる。
-壊しても良い。ただし「なぜこの配置だったか」を見失わない範囲で。
-
-### 層 (trajectory)
-
-- trajectory = 地層。append-only、上書きしない、失敗も残す。
-- hook (UserPromptSubmit / Stop) 経由と chat 経由の turn は同じ ledger に積む。
-- meta 操作 (sleep / skill 編集 / automint) は別テーブル `meta_events` に書く
-  — **地層と札を混ぜない**。札を地層から検索すると考古学が成立しない。
-
-### 発掘 (pull)
-
-- pull only。push (frozen snapshot を context に押し込む) しない。
-- query が来たときに掘る。事前 derive しない。
-- domain タグで層を分け cross-contamination を防ぐ。
-
-### 並べる (interpret しない)
-
-- `recall`: 関連 turn を 1 行 snippet で並べる (ピンポイント試掘)
-- `recall_session`: 1 session を時系列で取る (トレンチ)
-- `cross`: 同じ scope の session を構造ラベル付きで横並びにする
-- どれも tool は構造を読み上げるだけ。「これが面白い」とは言わない。
-  museum の札 (鉄製、長さ 30cm) は書く、「時代を象徴する一品」とは書かない。
-
-### モデル化を避ける
-
-- USER.md / 「あなたは誰か」を書く場所を持たない。
-- 意図 / 目的 / 前提を推論しない。書かれた発話に応答する。
-
-
-### 帰結は user に降る
-
-- skin in the game: 不可逆操作は user が commit。
-- harness は draft を作る、commit は user。
-- 外界影響 / 共有 state を変える操作は harness から発火しない (gateway / SMTP 等 built-in 不要)。
-
----
-
-## CLI
-
-```
-ds4ds4 chat                対話モード (deepseek で think:False、recall 経由で過去を pull)
-ds4ds4 record-turn         hook handler (Claude Code の UserPromptSubmit / Stop で起動)
-ds4ds4 list                session 一覧
-ds4ds4 search QUERY        FTS5 / trigram で turn / session を検索
-ds4ds4 cross QUERY         scope query → session 横断、構造ラベル付きで並べる
-ds4ds4 events              meta-event ledger (sleep / skill 操作 等)
-ds4ds4 dump                DB → 日付別 md を再生成
-ds4ds4 sleep               未要約 session に title/summary、tool 多い session は automint
-ds4ds4 domain ...          session に domain タグ
-ds4ds4 skill list/show/new/archive   skill (manual + auto) の手動発掘道具
+```lisp
+(define agent-step
+  (lambda (env input)
+    (let ((env2 (append-turn env (make-turn "user" input))))
+      (let ((response (llm-call env2)))
+        (let ((env3 (append-turn env2 response)))
+          (if (has-tool-calls? response)
+              (agent-step
+                (fold (lambda (e tc)
+                        (append-turn e
+                          (make-turn "tool"
+                            (dispatch-tool (tool-call-name tc) (tool-call-args tc))
+                            (tool-call-id tc))))
+                      env3
+                      (tool-calls response))
+                "")
+              response))))))
 ```
 
-`ds4ds4 chat` 中の tool: `current_time / list_dir / read_file / glob / grep / shell / recall / recall_session`。
+これは Python の関数ではなく lispy の binding の 1 つ。REPL で走らせ、結果を見て、
+`(define agent-step ...)` で書き換え、再度走らせる。**すべて同じ REPL 内で。**
+再起動なし、ファイル編集なし。
 
----
+Python に残るのは「LLM を 1 回呼ぶ」「tool を 1 つ走らせる」「turn を作る/追加する」
+という単発の primitive だけ。 agent loop の規則そのものは S 式の binding として
+inspect / quote / redefine 可能。
 
-## refuse
+## 構成
 
-- USER.md / MEMORY.md の frozen snapshot
-- intent inference / goal tracker / presupposition extraction
-- session 跨ぎの user model 自動構築
-- LLM-decided な不可逆 action (送信判断を LLM ループに任せる)
-- gateway / SMTP / messaging の built-in
-- 「あなたを知っている」マーケ narrative
-- skill umbrella の自動 consolidation (= 過去 trace の再解釈ループ)
+```
+lispy/
+├── lispy.py        # 評価器本体 (live-redefinable agent evaluator)
+├── host.py         # host environment (DB, tool 群, LLM client, CLI)
+├── host.db         # SQLite (sessions, turns, FTS5, meta_events, tasks)
+├── extras.lispy    # 派生 idiom 集 (lens / wrap / debate / probe ...)  (load で取り込む)
+├── data/
+│   └── turns/      # 日付別 md (DB から再生成可能)
+└── pyproject.toml
+```
 
-## affirm
+## 前提
 
-- trajectory append-only (失敗も残す)
-- pull-based memory access
-- domain partitioning
-- meta-event は別 ledger
-- 発掘道具は薄く保つ (recall / cross / search / dump)
-- skill は手動編集の対象
-- content generator として stdin/stdout で動く (Unix pipe 接続)
-- pre-committed pattern による automation (cron は user が仕掛ける)
+- DeepSeek を OpenAI 互換 API として localhost に立てておく (例: `ds4-server --port 8000`)
+- Python 3.11+
+- `uv` がインストール済み
 
----
+## セットアップ
 
-## 影響源 (loose reading)
+```bash
+cd ~/lispy
+uv sync                          # project venv を作成
+uv tool install --editable .     # host / lispy CLI を ~/.local/bin に
+```
 
-- **archaeology**: 骨は人を語らない。配置から見る人の中に立ち上がる。
-  考古学者は「これは悲しい人だった」と書かない。「鉄欠乏が見える」と置く。
-- **Polanyi**: tacit knowledge は articulation で消える。残るのは痕跡。
-- **Christopher Alexander**: QWAN (無名の質) は規則化で死ぬ。
-  pattern は「ここで alive を保てた配置」の記述であり、強制でも禁止でもない。
-- **Zave & Jackson**: R は environment にある (spec の中ではなく phenomena として)。
-- **Wittgenstein**: meaning is use。
+## CLI: `host`
 
-正確な引用ではなく、何が alive で何が dead かを感じるための参照点。
+DeepSeek 対話は `lispy` に集約しているので、`host` 自体は DB / 記録の操作専用ユーティリティ。
+
+```bash
+host list                  # session 一覧
+host search "query"        # FTS5 (ASCII / 単語境界)
+host search "query" --tri  # trigram (CJK 部分一致、3 字以上)
+host search "query" --turns | --sessions
+host dump                  # DB → 日付別 md 再生成
+host domain                # domain (tag) 一覧
+host events                # meta-event ledger
+host cross "scope"         # session 横断で構造ラベル付き
+```
+
+環境変数:
+- `LISPY_DB` — DB path (default: `./host.db`)
+- `LISPY_TURN_DIR` — md 出力先
+
+## lispy: `Lisp 風 evaluator`
+
+`lispy` は Scheme 風の式評価器に LLM 呼び出しを混ぜたもの。同じ syntax で「計算」と「言語処理」が並ぶ。
+
+### 起動
+
+```bash
+lispy                  # REPL (Ctrl+D で終了)
+lispy demo             # 最小 demo (renew + eval-turn)
+lispy demo-lambda      # λ 抽象のデモ
+lispy demo-compose
+lispy demo-compare     # Lisp 決定性 vs LLM 揺らぎ
+```
+
+REPL のプロンプトは `main>`。複数行 S 式は `(` で始まって閉じ括弧が揃うまで `...` プロンプトで待つ:
+
+```
+main> (define agent-step
+...     (lambda (env input)
+...       ...body...))
+```
+
+### 試してみる
+
+REPL に入ったらまずこれを順に試すと、 lispy が「走らせながら評価規則を書き換えられる」感覚が掴める(かも)。
+
+> **注意**: Recipe (3) と (4) は `agent-step` (= 評価器の loop 規則そのもの) を書き換える。
+> 書き換え後は **「以前は動いてた pattern が動かなくなる」**。 各 Recipe 単独で試すか、 順にやって挙動の変化を観察する、 どちらでも OK。
+>
+> **default に戻したい時** は REPL を抜けて再起動するか、 下記を paste:
+>
+> ```lisp
+> (define agent-step (lambda (env input) (let ((env2 (append-turn env (make-turn "user" input)))) (let ((response (llm-call env2))) (let ((env3 (append-turn env2 response))) (if (has-tool-calls? response) (agent-step (fold (lambda (e tc) (append-turn e (make-turn "tool" (dispatch-tool (tool-call-name tc) (tool-call-args tc)) (tool-call-id tc)))) env3 (tool-calls response)) "") response))))))
+> ```
+
+#### (1) 基本動作の確認
+
+```
+main> 富士山の標高は?
+富士山の標高は 3,776 m です。
+;; (agent-step env "富士山の標高は?") が S 式として走った結果
+
+main> (lookup "agent-step")
+<Lambda agent-step(env, input) [lisp]>
+
+main> (lambda-body (lookup "agent-step"))
+((let ((env2 (append-turn env (make-turn user input)))) ...))
+;; ↑ agent loop の規則そのものが S 式として見える
+```
+
+#### (2) host の DB / file system を Lisp から触る
+
+```
+main> (current-time)
+2026-05-20T17:35:00
+
+main> (string-length (read-file "README.md"))
+23443
+
+main> (recall "lisp")
+;; → 過去 session で "lisp" にヒットした turn の list (FTS5)
+
+main> (glob "*.py")
+/path/to/lispy.py
+/path/to/host.py
+```
+
+#### (3) 走行中 redefine
+
+agent-step を「LLM 呼び出し前に input を表示する」版に書き換える。
+
+**1 行版 (paste 用、 推奨)**:
+
+```
+main> (define agent-step (lambda (env input) (begin (print "[呼び出し直前] input:" input) (append-turn env (make-turn "user" input)) (let ((response (llm-call env))) (begin (append-turn env response) response)))))
+
+main> 北海道について 1 行で
+[呼び出し直前] input: 北海道について 1 行で
+北海道は日本最北の島で、 広大な自然と冷涼な気候、 札幌・函館などの都市、 海の幸が有名です。
+```
+
+REPL を再起動せずに agent loop の規則が変わる。 print の副作用 (`[呼び出し直前]`) と本来の
+LLM 応答が両方出る。
+
+**整形版 (読みやすいが paste は terminal の挙動に依存)**:
+
+```lisp
+(define agent-step
+  (lambda (env input)
+    (begin
+      (print "[呼び出し直前] input:" input)
+      (append-turn env (make-turn "user" input))
+      (let ((response (llm-call env)))
+        (begin
+          (append-turn env response)
+          response)))))
+```
+
+`begin` は式を順に評価し、 最後の値を返す。 副作用 (print, append-turn) を並べて、
+最後に応答を返すパターン。 同等のことは `(let ((_ ...)) ...)` のネストでも書けるが、
+`begin` の方が読みやすい。
+
+注: この簡略版は tool 呼び出しの処理を省いてる。 `(has-tool-calls? response)` 分岐を入れた
+完全版は init で pre-defined されているものを参照。
+
+#### (4) agent-step を LLM に見せて自己修正させる
+
+```
+main> (prompt (string-append
+...     "次は agent-step の現行定義: "
+...     (to-sexp (lambda-body (lookup "agent-step")))
+...     "  これを、tool 呼び出し前に critique を挟む版に書き換えて。"
+...     "S 式 1 つだけで返す。説明禁止。"))
+;; → LLM が修正版の S 式を text で返す
+```
+
+ポイント:
+- `(lambda-body ...)` は内部 tree (Python の list + Symbol オブジェクト) を返す
+- `(to-sexp tree)` で Lisp 表記の文字列に変換 (`"user"` 等の文字列は quote 付き = read-sexp 可能)
+- `(string-join " " ...)` だと Python の repr が出てしまって LLM が読めない
+
+返ってきた S 式を `(eval (read-sexp ...))` で取り込めば、 評価器が自分の規則を LLM 由来で
+更新する。 metacircular の極端な姿。 `to-sexp` は `read-sexp` の逆方向で、 セットで round-trip を成立させる。
+
+#### (5) 失敗を見てみる
+
+**前提**: default の agent-step が必要。 Recipe (3) や (4) で書き換えた場合は、 セクション冒頭の
+リセット paste を先に流すか REPL を再起動してから。
+
+紙のドラフト agent-step は recursion 時に `(agent-step ... "")` で空入力を渡す。 実際に踏む
+と turns に空 user が混じる
+
+```
+main> current_time tool を呼んで時刻を 1 行で
+;; tool 経路を通って正しい応答が返る
+
+main> !turns
+[xxx] user: current_time tool を…
+[xxx] assistant: (tool_calls)
+[xxx] tool: 2026-05-20T17:36:00
+[xxx] user:                      ← 空 user turn
+[xxx] assistant: 現在時刻は…
+```
+
+これが気に入らなければ agent-step を書き換えて、 input が空なら append-turn をスキップする
+ロジックを足せる。
+
+### S 式の書き方
+
+```lisp
+42                ; 数値 atom (int / float)
+"hello"           ; 文字列 atom
+foo               ; symbol (env から lookup)
+(+ 1 2)           ; list = 関数適用
+(quote (+ 1 2))   ; quote = リスト構造として持つ (評価しない)
+```
+
+### 入力の処理経路
+
+REPL に入力した行は:
+- `(` で始まる → **S 式として直接評価** (model を介さない)
+- それ以外 → 平文として **DeepSeek に投げる**
+- `!` で始まる → REPL のメタコマンド (`!env` `!archive` 等、後述)
+
+### Lisp core (raw 値で計算)
+
+#### 算術 / 比較 / 論理
+```lisp
+(+ 1 2 3)         ; → 6
+(- 10 3 2)        ; → 5
+(* 2 3 4)         ; → 24
+(/ 12 3)          ; → 4.0
+(= 5 5)           ; → #t
+(< 3 7)           ; → #t
+(> 7 3)           ; → #t
+(and (> 5 3) (< 2 4))  ; → #t
+(or #f #f #t)     ; → #t
+(not (= 1 2))     ; → #t
+```
+
+Boolean は Scheme 流の `#t` / `#f` (alias: `#true` / `#false`) を式中に書ける。
+`#f` と空 list `(list)` と `nil` が falsy、それ以外はぜんぶ truthy。
+
+#### 制御 / 束縛
+```lisp
+(if (> x 0) "positive" "negative")
+(define x 42)                          ; env.bindings に登録
+(define inc (lambda (x) (+ x 1)))      ; 関数を define
+(let ((a 3) (b 4)) (+ (* a a) (* b b)))  ; 局所束縛 → 25
+```
+
+#### list 操作
+```lisp
+(list 1 2 3)              ; → (1 2 3)
+(car (list 1 2 3))        ; → 1
+(cdr (list 1 2 3))        ; → (2 3)
+(cons 0 (list 1 2 3))     ; → (0 1 2 3)
+(null? (list))            ; → #t
+```
+
+#### 文字列述語 / 操作
+```lisp
+(string? "foo")                       ; → #t
+(string-contains? "hello world" "wo") ; → #t
+(string-prefix? "hello" "he")         ; → #t
+(string-suffix? "hello" "lo")         ; → #t
+(string-length "hello")               ; → 5
+(string-upcase "hello")               ; → HELLO
+(string-downcase "Hello")             ; → hello
+(string-trim "  hi  ")                ; → hi
+(string-append "foo" "/" "bar")       ; → foo/bar
+(substring "hello" 1 4)               ; → ell
+```
+(REPL は文字列値を quote 無しで表示する)
+LLM 出力で `if` を切るときに使う。例:
+```lisp
+(define rate (lambda (x) "{x} を 'high' / 'mid' / 'low' のうち 1 単語で"))
+(if (string-contains? (rate "Lisp") "high") "important" "ok")
+```
+
+#### read-sexp と eval — text ↔ tree ↔ value の 3 段変換
+
+`read-sexp` は **テキストを Lisp の tree に parse** する。`eval` は **tree を評価して値にする**。
+合わせると **文字列として持っている S 式を実行できる**:
+
+```lisp
+(read-sexp "(+ 1 2)")           ; → (+ 1 2)   リスト構造 (まだ走ってない)
+(eval (read-sexp "(+ 1 2)"))    ; → 3         tree を評価
+```
+
+step by step:
+
+```lisp
+main> (define text "(* 6 7)")    ; 文字列として持つ
+main> text                       ; → (* 6 7)  (REPL は string を quote 無しで出す)
+main> (string? text)             ; → #t       これは text
+main> (define tree (read-sexp text))
+main> tree                       ; → (* 6 7)  見た目は同じだが Lisp の list (内部は [Sym(*) 6 7])
+main> (string? tree)             ; → #f       こちらは text ではなく tree
+main> (eval tree)                ; → 42       tree を評価して値に
+```
+
+| | string | tree | value |
+|---|---|---|---|
+| 形 | `"(* 6 7)"` | `(* 6 7)` | `42` |
+| Python 型 | `str` | `list` (中身 Symbol / number) | `int` |
+| 順方向 | — `read-sexp` → | — `eval` → | |
+| 逆方向 | ← `to-sexp` — | (なし — 値そのままで保持) | |
+
+逆方向は `to-sexp`:
+
+```lisp
+(to-sexp (quote (+ 1 2)))            ; → "(+ 1 2)"   tree を Lisp text に
+(eval (read-sexp (to-sexp expr)))    ; → 元の値      round-trip
+```
+
+`to-sexp` は文字列を quote 付きで出すので、 LLM に渡して再度 `read-sexp` で受け取っても
+壊れない。 一方、 REPL 表示で使われる `_to_lisp_string` は文字列を quote 無しで出す
+(ユーザー向け表示) ので、 round-trip には `to-sexp` の方を使う。
+
+#### `(eval (read-sexp ...))` の使い所
+
+主に **LLM の text 出力をコードとして走らせる** とき
+
+```lisp
+main> (prompt "1+2+3 を求める Lisp S 式を 1 つだけ、説明禁止")
+"(+ 1 2 3)"
+;; ↑ string が返ってくる
+
+main> (eval (read-sexp "(+ 1 2 3)"))
+6
+;; ↑ string を tree にして評価
+```
+
+(3) で「LLM 生成コードを Lisp が評価する」metacircular パターンを使ったが、その実体はこれ。
+他にも `(quote-turn ...)` で保存しておいた S 式テキストを実行するときなどに使う。
+
+#### `eval` だけの使い方
+
+`eval` は引数の **tree** を評価する。tree は `(quote ...)` で手動で作ることもできる
+
+```lisp
+(eval (quote (+ 1 2)))                          ; → 3
+(eval (cons (quote *) (list 2 3 4)))            ; → 24
+;; ↑ cons / list で operator + を * に置き換えた新 tree を作って eval
+```
+
+つまり tree は (a) `read-sexp` で text からパースする、(b) `quote` でリテラル指定する、
+(c) `cons` / `list` / `car` / `cdr` で構造的に組み立てる、の 3 通り。どれも `eval` に
+渡せば走る。
+
+#### prompt (低レベル LLM 呼び出し)
+```lisp
+(prompt "1+2 は?")          ; → 3
+```
+- `(lambda ...)` の template 展開、system 切り替え、auto-eval を **使わない** 素の 1 ショット呼び出し
+- `(lambda gen (q) "...{q}...")` は body system が「S 式を出すな」と命じるため、コード生成には不向き
+- 「LLM 生成コードを自分で評価する」metacircular 用途は `prompt` を使う
+
+```lisp
+(define gen-code (lambda (q)
+  (strip-code-fences (prompt (string-append
+    "次を 1 つの Lisp S 式だけで書け。"
+    "使える operator: + - * / list car cdr cons. "
+    "括弧で始まる 1 式のみ、説明禁止。問: " q)))))
+
+(eval (read-sexp (gen-code "1 から 10 までの和")))
+; → LLM が (+ 1 2 3 4 5 6 7 8 9 10) を生成 → Lisp が評価 → 55
+```
+
+`strip-code-fences` は markdown の ```` ```lang ... ``` ```` を剥がすヘルパー。LLM がコードブロックを付けてきたときに正規化するために使う。
+
+#### quote (評価せず tree のまま持つ)
+```lisp
+(quote (+ 1 2))           ; → (+ 1 2)  リストとして残る (eval されない)
+(quote foo)               ; → foo      シンボルとして残る
+```
+
+`(quote expr)` は **expr を評価せず、そのままの tree を返す** 特殊形式。`'expr` の略記法は
+今は無いので必ず `(quote ...)` と書く。code = data の片側 (data として保持) を支える。
+
+評価側の `eval` と組み合わせると **tree を分解して書き換えて再評価** ができる
+
+```lisp
+(eval (cons (quote *) (cdr (quote (+ 2 3 4)))))   ; → 24
+;; (+ 2 3 4) から先頭 + を取り除き、代わりに * を cons → (* 2 3 4) → 評価
+```
+
+これが「LLM 評価器ではできないこと」 — text は構造を持たないので、 LLM に「演算子を + から
+* に書き換えて再評価」と頼むのは曖昧。Lisp なら式を分解して再合成して再評価できる。
+
+### Lambda — 2 種類
+
+#### Lisp lambda (body は式)
+```lisp
+(lambda (x) (+ x 1))                   ; 匿名 Lisp lambda
+(define inc (lambda (x) (+ x 1)))      ; 名前付け
+(inc 41)                                ; → 42
+(define square (lambda (x) (* x x)))
+(square 7)                              ; → 49
+```
+
+#### LLM lambda (body は文字列テンプレ)
+```lisp
+(lambda critique (x) "次を 1 行で批判: {x}")    ; 名前付き、env.bindings に登録
+(critique "Lisp は古い")                         ; → DeepSeek の応答
+```
+- body 内の `{param_name}` が Python の `.format()` で展開される
+- `{self}` は λ 自身の名前 (再帰用)
+- 引数を文字列化してテンプレに埋め、結果プロンプトを DeepSeek に投げる
+- LLM 実行中は `BODY_SYSTEM` (= 「自然言語で答え、S 式を吐かない」) を system prompt に差し替える
+
+#### 名前付き vs 匿名
+```lisp
+(lambda name (p) body)    ; 第 1 引数が symbol → 名前付き、env.bindings[name] に登録
+(lambda (p) body)         ; 第 1 引数が list → 匿名、Lambda 値を返す
+```
+
+### compose (派生定義済み)
+
+```lisp
+; 内部で初期化時に実行されてる:
+; (define compose (lambda (f g) (lambda (x) (g (f x)))))
+
+(define double (lambda (x) (* x 2)))
+(define inc (lambda (x) (+ x 1)))
+((compose double inc) 5)               ; → (inc (double 5)) = 11
+```
+
+### 関数適用
+
+#### Juxtaposition (普通の Lisp 形式)
+```lisp
+(f x)                ; f を x に適用
+(f x y z)            ; 複数引数
+(f (g x))            ; ネスト
+```
+
+#### apply (引数 list を展開)
+```lisp
+(apply + (list 1 2 3 4))      ; → 10
+(apply f a b c)               ; → f(a, b, c) と同等
+(apply f a b (list c d))      ; → f(a, b, c, d)  最後の list だけ展開
+```
+
+### 環境操作 (LLM 評価器メタ)
+
+#### renew
+```lisp
+(renew "覚書")                ; 現 env.turns を archive 退避、新 env へ
+(renew)                        ; carry 無し
+```
+- env.turns を archive に保存 (archive_id 自動生成)
+- env.turns を空にして、carry を system message として 1 件だけ追加
+- env.bindings (λ や define) はそのまま残る
+
+#### quote-turn
+```lisp
+(quote-turn (+ 2 3 4))           ; S 式を **評価せず** 保管 → 新 turn id を返す
+(quote-turn "三平方の定理を一行で")  ; 平文プロンプトを保管
+(quote-turn (define x 100))      ; 副作用付きの式も保管できる
+```
+- arg は評価されない (Lisp の `quote` 流儀)。str / symbol / list を text 化して env.quoted に登録
+- 戻り値の payload に新 id が入る。(quoted) で一覧確認
+
+#### eval-turn
+```lisp
+(eval-turn TURN_ID)            ; 過去の turn を今の env で再評価
+```
+- archive または quoted の turn を id で引いて評価し直す
+- content が S 式形なら Lisp として直接評価、平文なら LLM に再投入
+- system prompt や bindings を変えてから呼ぶと「同じ問いを別の評価器で走らせる」になる
+
+#### spawn (subagent 風)
+```lisp
+(spawn "tell me about X")     ; child env を作って task を任せる、結果を返す
+```
+- 親 env の system, tools, schema を継承した独立 env を作る
+- depth 制限 3
+
+### 状態確認
+
+```lisp
+(env)                       ; name / depth / turns 数 / archive 数 / bindings 数 etc.
+(turns)                     ; 直近 5 turn (プレビュー)
+(turns 10)                  ; 直近 10 turn
+(turn)                      ; 末尾 turn の content (文字列)
+(turn "last")               ; 同上
+(turn "last-user")          ; 直近 user turn の content
+(turn "last-assistant")     ; 直近 assistant turn の content
+(turn N)                    ; env.turns[N] (負の index も可: -1=末尾、-2=その 1 つ前…)
+(turn <id>)                 ; id 指定で取得 (env.turns / archive / quoted を検索)
+(turn "user" N)             ; user turn 列の N 番目 ((-1)=直近 user、-2=その前 …)
+(turn "assistant" N)        ; assistant turn 列の N 番目
+(archive)                   ; archive 一覧 (id, turn 数)
+(lambdas)                   ; 登録済み λ 一覧 (params, kind, body プレビュー)
+(quoted)                    ; (quote-turn ...) で保管された turn 一覧
+```
+
+`(turn ...)` は content **そのもの** を返すので、LLM λ にそのまま流せる。会話中の任意の発言を後から評価できる
+```lisp
+(lambda critique (x) "次を一行で批判: {x}")
+(critique (turn "last-assistant"))      ; 直前の応答を自己批判
+(critique (turn "assistant" -2))        ; 1 つ前の応答を批判
+(critique (turn "user" 0))              ; 最初の user 質問を批判
+(critique (turn 5))                     ; index 5 の turn を批判
+```
+
+REPL の meta コマンド (S 式じゃなく `!` prefix) でも同じ
+```
+!env  !archive  !lambdas  !turns  !quoted  !reset
+```
+
+### 平文と S 式の混在
+
+```
+main> 富士山の標高は？             ; 平文 → DeepSeek に投げる
+富士山の標高は 3776 m です。
+
+main> (+ 1 2)                      ; S 式 → 直接評価
+3
+
+main> (define greet (lambda (x) "Hello, {x}!"))
+main> (greet "world")              ; LLM lambda 経由でモデルへ
+Hello, world!
+```
+
+### 使い方の典型 (Cookbook)
+
+各 recipe は REPL (`main> `) でそのまま実行できる。前提として `lispy` で REPL を起動済み。
+
+#### Recipe 1: 任意の発言を pick して評価する
+
+会話を続けたあと、特定の応答を後から批判・要約・採点したい
+
+```
+main> 富士山の標高を 1 行で
+富士山の標高は 3,776 m です。
+
+main> 札幌の人口を 1 行で
+札幌市の人口は約 195 万人です…
+
+main> 那覇の気候を 1 行で
+那覇は亜熱帯気候に属し、…
+
+main> (lambda critique (x) "次を 1 行で批判: {x}")
+
+main> (critique (turn "assistant" -2))   ; 1 つ前の assistant 応答 (= 札幌) を批判
+札幌市の人口は約 195 万人という数字は 2023 年時点では正しいですが…
+```
+
+`(turn ...)` の指定の仕方:
+- `(turn)` または `(turn "last")` — 末尾
+- `(turn "last-user")` / `(turn "last-assistant")` — 直近の role
+- `(turn N)` — index (負の値は末尾から)
+- `(turn "user" N)` / `(turn "assistant" N)` — role 列の N 番目
+- `(turn <id>)` — id 指定 (`!turns` で見える 8 文字 hex)
+
+#### Recipe 2: 評価軸を λ として保存・合成する
+
+```
+main> (lambda summarize (x) "次を一文で要約: {x}")
+main> (lambda en        (x) "次を英訳: {x}")
+main> (define en-summary (compose summarize en))   ; summarize ∘ en
+
+main> (en-summary (turn "last-assistant"))
+…英訳した上で要約された結果…
+```
+
+`compose` は init 時に Lisp で派生定義済み:
+`(define compose (lambda (f g) (lambda (x) (g (f x)))))`
+
+#### Recipe 3: Lisp 条件 + LLM 分岐 (ハイブリッド)
+
+```
+main> (lambda praise (n) "{n} 点を 1 行で褒めて")
+main> (lambda scold  (n) "{n} 点を 1 行で叱って")
+main> (define grade (lambda (n) (if (> n 60) (praise n) (scold n))))
+
+main> (grade 92)     ; → 褒めの 1 行
+main> (grade 28)     ; → 叱りの 1 行
+```
+
+決定性が要る所は Lisp、文章生成は LLM、を 1 つの式で混ぜる。
+
+#### Recipe 4: LLM 出力で if 分岐 (`string-contains?`)
+
+```
+main> (lambda judge (x) "{x} は computer science のトピックか? yes か no で 1 単語")
+main> (define cs? (lambda (topic)
+        (string-contains? (string-downcase (judge topic)) "yes")))
+
+main> (if (cs? "Lisp の歴史") "CS" "non-CS")    ; → CS
+main> (if (cs? "寿司の握り方") "CS" "non-CS")   ; → non-CS
+```
+
+#### Recipe 5: LLM がコード生成、Lisp が評価 (metacircular)
+
+```
+main> (define gen-code (lambda (q)
+        (strip-code-fences (prompt (string-append
+          "次を 1 つの Lisp S 式だけで書け。"
+          "使える operator: + - * / list car cdr cons。"
+          "括弧で始まる 1 式のみ、説明禁止。問: " q)))))
+
+main> (eval (read-sexp (gen-code "1 から 10 までの和")))    ; → 55
+main> (eval (read-sexp (gen-code "6 と 7 の積")))            ; → 42
+```
+
+なぜ `(lambda ...)` ではなく `prompt` を使うかは「落とし穴」を参照。
+
+#### Recipe 6: 文脈の保存と切り替え
+
+```
+main> 富士山について
+…
+main> 北海道について
+…
+main> (renew "山と地域の話")            ; 現 env.turns を archive、新環境へ
+:renew → archived as af3b5823 (carry: 8 chars)
+
+main> !archive
+  af3b5823: 4 turns
+    [df2ace60] user: 富士山について
+    [...] assistant: …
+    …
+
+main> (eval-turn df2ace60)               ; archive の任意 turn を今の env で再評価
+```
+
+`env.bindings` (λ や define) は `renew` でも残る。文脈だけを切る。
+
+#### Recipe 7: bookmark — 再利用したい問いや式を保管する
+
+```
+main> (define recurring (quote-turn (rate (turn "last-assistant"))))
+;; ↑ "直近応答を rate に流す" という評価器を保存
+;; recurring に turn id 文字列が束縛される
+
+main> 何か新しい話題について発話
+…新しい応答…
+
+main> (eval-turn recurring)
+;; ↑ 保存しておいた評価器を今の最新応答に対して走らせる
+```
+
+`(quote-turn arg)` は arg を**評価せず**保存。`(eval-turn id)` で取り出し時に評価する。「あとで決まった処理を回したいので呼び出しを保管しておく」用途。
+
+#### Recipe 8: 即席評価 — λ を定義したくないとき
+
+```lisp
+;; (a) 匿名 λ で 1 回だけ
+((lambda (x) "次を 1 行で批判: {x}") (turn "last-assistant"))
+
+;; (b) prompt で生 LLM 呼び出し
+(prompt (string-append "次を 1 行で批判:\n" (turn "last-assistant")))
+```
+
+#### Recipe 9: 派生 idiom を `.lispy` ファイルとして load する
+
+lispy は agent-step と compose 以外、 init で pre-define **しない**。 派生 idiom は
+`.lispy` ファイル (S 式が並んだテキスト) として書いて、 `(load "path.lispy")` で取り込む:
+
+```
+main> (load "extras.lispy")
+(loaded 7 forms from /Users/jm/lispy/extras.lispy)
+
+main> (lens (list dbl inc) 5)
+(10 6)
+```
+
+repo に同梱の `extras.lispy` には以下が入っている:
+
+```lisp
+;; extras.lispy 抜粋
+(define lens (lambda (fns x) (map (lambda (f) (f x)) fns)))
+(define wrap (lambda (name decorator)
+  (lambda (x) ((lookup name) (decorator x)))))
+(define probe (lambda (id k)
+  (if (<= k 0) (list)
+      (cons (eval-turn-pure id) (probe id (- k 1))))))
+(define debate (lambda (a b topic n)
+  (if (<= n 0) (list)
+      (let ((said (a topic))) (cons said (debate b a said (- n 1)))))))
+(define transform-past (lambda (f) (map f (archive-turns))))
+(define from-pack (lambda (pack key) ...))
+(define condense (lambda (f init xs) (fold f init xs)))
+```
+
+`load` は `_tokenize_sexp` がコメント (`;` 行末まで) を読み飛ばす + `read_all_sexp` で
+複数 S 式列をパースする仕組み。 自分で書いた `.lispy` ファイルを置いて load すれば
+個人ライブラリができる。
+
+「素材だけ与えて、 ライブラリは外置き」 が lispy の方針。 ファイル編集して `(load ...)` 再実行で
+load し直せるので、 ライブラリ自体も live-redefinable。
+
+#### Recipe 10: モードシフト REPL (set-mode) — 平文入力を λ 経由に
+
+```
+main> (lambda socratic (x) "次の問いをソクラテス風に問い返す。質問形式で 1 行: {x}")
+main> (set-mode socratic)
+(input_mode set: socratic)
+
+main> 富士山の標高は？
+そもそも「高さ」とは何を基準に測るべきか？
+
+main> Lisp は何のためにあるのか？
+そもそも言語は何のためにあるべきか？
+
+main> (clear-mode)
+(input_mode cleared)
+
+main> 富士山の標高は？    ; 元に戻った
+富士山の標高は 3,776 m です。
+```
+
+- `(set-mode <lambda>)` で `env.input_mode` を設定。以降の平文入力は `(<lambda> <input>)` 相当として処理される
+- S 式 (`(...)` で始まる) はモードに関係なく直接評価される
+- `(clear-mode)` または `(set-mode)` で解除
+
+### 落とし穴
+
+実際に試して引っかかりやすい点:
+
+- **λ は session を跨いで残らない** — REPL を再起動したら `(lambda critique ...)` から打ち直し。`!lambdas` / `(lambdas)` で確認できる
+- **`(critique ...)` `(rate ...)` などは README の例の名前** — 実環境では未定義。未束縛の symbol を関数呼び出しすると次のエラーで落ちる:
+  ```
+  main> (critique (turn "last-assistant"))
+  eval error: not callable: Sym(critique)
+  ```
+  Lisp の伝統で「未束縛 symbol は symbol そのものとして返る」ため、`(critique ...)` の `critique` が `Symbol("critique")` のままになり、`_apply_callable` が「呼べない」と弾く (`lispy.py:914`)。`!lambdas` で `(none defined)` または目的の名前が無ければこの状態。先に `(lambda critique (x) "...")` を打って登録する
+- **REPL の `[xxxxxxxx]` 8 文字 hex id は session ごとに別** — 他人 (や README) の id をそのまま打っても `not found`。自分の env の `!turns` / `!archive` / `(quoted)` で確認する
+- **LLM lambda 実行中は system prompt が `BODY_SYSTEM` に切り替わる** — 「`(` で始まる行を書くな」「コードブロック禁止」等が強制される。コード生成 / 構造化出力には `prompt` を使うこと
+- **LLM 応答が `(` で始まると auto-eval される** — meta form (`(renew ...)` 等) を LLM に駆動させるための仕組みだが、コード生成では困る。`prompt` ならこの auto-eval をスキップして生 text を返す
+- **`Lambda` 再帰深度上限 5 (LLM) / 32 (Lisp)** — `(compose ...)` の入れ子や `(debate a b "topic" n)` で引っかかったらこれを疑う (`lispy.py:163, 186`)。debate は LLM lambda call が交互に入るため、n=3 までが安全圏
+- **`(archive)` `(quoted)` は空が初期状態** — それぞれ `(renew ...)` / `(quote-turn ...)` で初めて埋まる
+- **`(define x (quote-turn ...))` の REPL 表示は id だけ** — `:quote-turn → stored as ...` の status 行は出ない (define が Value から payload を unwrap するため)。`(quote-turn ...)` 単独で打てば status は出る
+
+### Lisp 系譜での位置
+
+Scheme R5RS の語彙を一部だけ拾った教育用評価器。
+- `#t/#f`、Lisp-1、`define`/`let`、Scheme 標準の `apply`
+- ただし TCO 無し、continuation 無し、hygienic macro 無し、`quasiquote` 無し
+- LLM lambda の `"body with {x}"` 形式は Scheme 標準ではない (我々独自のテンプレ記法)
+
+### 内部構造 (lispy.py のキー定数)
+
+| シンボル | 意味 |
+|---|---|
+| `Env` | 評価環境。turns / archive / bindings / system / tools 等を持つ |
+| `Lambda` | `kind="llm"` or `"lisp"`、closure と captured bindings を持つ |
+| `evaluate(tree, env)` | 中核評価関数、raw Python 値を返す |
+| `eval_sexp(tree, env)` | 表層 wrapper、Value を返す (REPL 表示用) |
+| `_SEXP_DISPATCH` | renew / eval-turn / spawn / lambda の評価器メタ form を分岐 |
+| `_SPECIAL_FORM_NOEVAL` | quote / if / define / let (引数を評価しない) |
+| `PRIMITIVES` | + - * / car cdr cons list etc. |
+| `BODY_SYSTEM` | LLM lambda 実行時の差し替え system prompt |
+
+## ライセンス
+
+`LICENSE` 参照。
