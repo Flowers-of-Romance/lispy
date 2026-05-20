@@ -1,0 +1,175 @@
+;; extras.lispy — lispy core から外した派生 idiom 集
+;;
+;; 使い方:
+;;   main> (load "extras.lispy")
+;;   (loaded 7 forms from /Users/.../extras.lispy)
+;;
+;; これらは pre-defined ではない (lispy の核は agent-step + compose のみ)。
+;; 必要なときだけ load する。
+
+;; map: tail-recursive (recur + accumulator + 末尾 reverse)。
+;; 素朴な (cons (f (car ..)) (map f (cdr ..))) だと非末尾で stack を 食う ので、
+;; lispy の 100 段制限を簡単に超えてしまう。 ここは iterative にしておく。
+(define map
+  (lambda (f lst)
+    (let ((iter (lambda (l acc)
+                  (if (null? l)
+                      (reverse acc)
+                      (recur (cdr l) (cons (f (car l)) acc))))))
+      (iter lst (list)))))
+
+;; 多視点レンズ: 1 値に N 個の λ を適用、 結果を list で返す
+(define lens
+  (lambda (fns x) (map (lambda (f) (f x)) fns)))
+
+;; decorator (late binding): name で参照する λ に decorator を被せる
+;; (wrap "critic" harshen) → (lambda (x) ((lookup "critic") (harshen x)))
+(define wrap
+  (lambda (name decorator)
+    (lambda (x) ((lookup name) (decorator x)))))
+
+;; archive の各 turn を関数で写像
+(define transform-past
+  (lambda (f) (map f (archive-turns))))
+
+;; 同じ問いを k 回 LLM に投げる (eval-turn-pure で env を汚さない)
+;; 自己再帰なので _sf_define の patch が必要 (既に入ってる)
+(define probe
+  (lambda (id k)
+    (if (<= k 0)
+        (list)
+        (cons (eval-turn-pure id) (probe id (- k 1))))))
+
+;; 弁証法: 2 つの λ を ping-pong (LLM 再帰深度上限 5 のため n=3 推奨)
+(define debate
+  (lambda (a b topic n)
+    (if (<= n 0)
+        (list)
+        (let ((said (a topic)))
+          (cons said (debate b a said (- n 1)))))))
+
+;; persona pack — assoc list から key で dispatch
+;; (from-pack '(("hi" greeter) ("bye" farewell)) "hi") → greeter
+(define from-pack
+  (lambda (pack key)
+    (if (null? pack)
+        (list)
+        (if (= (car (car pack)) key)
+            (car (cdr (car pack)))
+            (from-pack (cdr pack) key)))))
+
+;; condense — fold の alias (要約・統合用)
+(define condense
+  (lambda (f init xs) (fold f init xs)))
+
+
+;; ===========================================================================
+;; 基本 list 操作 — pure lambda、 core が薄い ぶんここで揃える
+;; ===========================================================================
+
+;; 要素数を数える。 tail-recursive (recur + acc)。
+(define length
+  (lambda (lst)
+    (let ((iter (lambda (l n)
+                  (if (null? l) n (recur (cdr l) (+ n 1))))))
+      (iter lst 0))))
+
+;; 順序を反転。 tail-recursive (acc に cons し続けるだけで自然に逆順になる)。
+(define reverse
+  (lambda (lst)
+    (let ((iter (lambda (l acc)
+                  (if (null? l) acc (recur (cdr l) (cons (car l) acc))))))
+      (iter lst (list)))))
+
+;; 2 つの list を連結。 a を reverse して逆順に b へ cons する (2 パスで tail)。
+(define append
+  (lambda (a b)
+    (let ((iter (lambda (l acc)
+                  (if (null? l) acc (recur (cdr l) (cons (car l) acc))))))
+      (iter (reverse a) b))))
+
+;; pred を満たす要素だけ残す。 tail-recursive (acc に cons → 最後に reverse)。
+(define filter
+  (lambda (pred lst)
+    (let ((iter (lambda (l acc)
+                  (if (null? l) (reverse acc)
+                      (if (pred (car l))
+                          (recur (cdr l) (cons (car l) acc))
+                          (recur (cdr l) acc))))))
+      (iter lst (list)))))
+
+;; alist (`(k v)` ペアの list) から key に対応する pair を返す。 無ければ #f。
+;; e.g. (assoc 'b (list (list 'a 1) (list 'b 2))) → (b 2)
+(define assoc
+  (lambda (key alist)
+    (if (null? alist) #f
+        (if (= key (car (car alist)))
+            (car alist)
+            (recur key (cdr alist))))))
+
+;; lst の中に x があれば、 そこから先の sub-list を返す。 無ければ #f。
+(define member
+  (lambda (x lst)
+    (if (null? lst) #f
+        (if (= x (car lst))
+            lst
+            (recur x (cdr lst))))))
+
+
+;; ===========================================================================
+;; 制御フロー macro — defmacro で構文糖
+;; ===========================================================================
+
+;; cond の末尾節用。 `else` を truthy 定数として扱う。
+(define else #t)
+
+;; (when cond body...) — cond が真なら body を順に評価、 最後の値を返す。
+(defmacro when (c &rest body)
+  `(if ,c (begin ,@body) nil))
+
+;; (unless cond body...) — when の対。
+(defmacro unless (c &rest body)
+  `(if ,c nil (begin ,@body)))
+
+;; (cond (pred body...) (pred body...) ... (else body...))
+;; 各節を順に試し、 最初の真の pred の body を評価。 どれも当たらなければ nil。
+;; 再帰展開は eval 時に行う (clauses を順に分解しながら if に変換)。
+(defmacro cond (&rest clauses)
+  (if (null? clauses)
+      nil
+      `(if ,(car (car clauses))
+           (begin ,@(cdr (car clauses)))
+           (cond ,@(cdr clauses)))))
+
+
+;; ===========================================================================
+;; combinator — try / box が要るやつ
+;; ===========================================================================
+
+;; memoize: 関数 f を 1 引数の cache 付きに wrap。
+;; cache は alist。 大きく成りすぎる用途には不向き (assoc が O(n))。
+(define memoize
+  (lambda (f)
+    (let ((cache (box (list))))
+      (lambda (x)
+        (let ((hit (assoc x (unbox cache))))
+          (if hit
+              (car (cdr hit))                                    ;; cached value
+              (let ((v (f x)))
+                (begin
+                  (set-box! cache (cons (list x v) (unbox cache)))
+                  v))))))))
+
+;; (with-retry n expr) — expr を最大 n 回 retry。 失敗ごとに 1 回試す。
+;; 全部失敗すると最後の error を propagate。 n=0 なら expr を裸で評価。
+(defmacro with-retry (n expr)
+  (if (= n 0) expr
+      `(try ,expr (catch (e) (with-retry ,(- n 1) ,expr)))))
+
+;; (with-fallback expr fallback) — expr が error なら fallback を評価して返す。
+(defmacro with-fallback (expr fallback)
+  `(try ,expr (catch (e) ,fallback)))
+
+;; (with-default expr default) — error なら default 定数を返す (副作用なし)。
+(defmacro with-default (expr default)
+  `(try ,expr (catch (e) ,default)))
