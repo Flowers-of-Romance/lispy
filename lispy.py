@@ -204,8 +204,15 @@ class Lambda:
             self.closure.system = prev_system
 
     def _apply_lisp(self, args: list) -> Any:
-        if len(args) != len(self.params):
-            raise ValueError(f"arity mismatch: need {len(self.params)}, got {len(args)}")
+        fixed = len(self.params)
+        if self.rest_param:
+            if len(args) < fixed:
+                raise ValueError(
+                    f"arity mismatch: {self.name} needs at least {fixed}, got {len(args)}"
+                )
+        else:
+            if len(args) != fixed:
+                raise ValueError(f"arity mismatch: need {fixed}, got {len(args)}")
         if self.closure.lambda_call_depth >= 100:
             raise RecursionError("lisp lambda call depth limit (100) — use (recur ...) for tail calls")
         saved_bindings = self.closure.bindings
@@ -217,19 +224,26 @@ class Lambda:
             # captured が後勝ちなので、closure で捕まえた変数は call 時 global に shadow されない。
             current_args = args
             while True:
-                self.closure.bindings = {
-                    **saved_bindings, **self.captured,
-                    **dict(zip(self.params, current_args)),
-                }
+                bound = dict(zip(self.params, current_args[:fixed]))
+                if self.rest_param:
+                    bound[self.rest_param] = list(current_args[fixed:])
+                self.closure.bindings = {**saved_bindings, **self.captured, **bound}
                 result: Any = None
                 for form in self.body:
                     result = evaluate(form, self.closure)
                 if isinstance(result, _Recur):
-                    if len(result.args) != len(self.params):
-                        raise ValueError(
-                            f"recur: arity mismatch (lambda {self.name} needs {len(self.params)}, "
-                            f"got {len(result.args)})"
-                        )
+                    if self.rest_param:
+                        if len(result.args) < fixed:
+                            raise ValueError(
+                                f"recur: arity mismatch (lambda {self.name} needs at least "
+                                f"{fixed}, got {len(result.args)})"
+                            )
+                    else:
+                        if len(result.args) != fixed:
+                            raise ValueError(
+                                f"recur: arity mismatch (lambda {self.name} needs {fixed}, "
+                                f"got {len(result.args)})"
+                            )
                     current_args = result.args
                     continue
                 return result
@@ -339,6 +353,8 @@ SYSTEM_PROMPT = """lispy mode.
   (try expr (catch (e) handler))  (error "msg")  (error? v)  (error-message e)
   (set! name expr)  (box v) (unbox b) (set-box! b v) (box? v)
   (recur a b ...)  — nearest lambda を tail call (stack 消費しない)
+  (lambda (a &rest xs) ...)  — 残余引数 (defmacro 同様)
+  (list? x) (symbol? x) (number? x) (lambda? x) (pair? x) (eq? a b)
   (name arg ...)  (apply f arglist)  (compose f g)
   (quote expr)  (eval expr)  (if c t e)  (let ((x v)) body)
   (+ - * / = < >)  (list car cdr cons null?)
@@ -700,10 +716,22 @@ def sexp_lambda(env: Env, args: list) -> Value:
         return Value(text="lambda: bad shape; expected name? + params-list + body")
 
     params: list[str] = []
-    for p in params_node:
+    rest_param = ""
+    i = 0
+    while i < len(params_node):
+        p = params_node[i]
         if not isinstance(p, Symbol):
             return Value(text="lambda: params must be symbols")
+        if p.name == "&rest":
+            if i + 1 >= len(params_node) or i + 2 != len(params_node):
+                return Value(text="lambda: &rest must be followed by exactly one symbol at the end")
+            tail = params_node[i + 1]
+            if not isinstance(tail, Symbol):
+                return Value(text="lambda: &rest name must be a symbol")
+            rest_param = tail.name
+            break
         params.append(p.name)
+        i += 1
 
     if not body_nodes:
         return Value(text=f"lambda {name}: empty body")
@@ -721,6 +749,7 @@ def sexp_lambda(env: Env, args: list) -> Value:
     lam = Lambda(
         name=name, params=params, body=body,
         closure=env, captured=captured, kind=kind,
+        rest_param=rest_param,
     )
 
     if named:
@@ -938,6 +967,32 @@ def _sf_recur(env: Env, args: list) -> Any:
     return _Recur(evaluated)
 
 
+def _sf_and(env: Env, args: list) -> Any:
+    """(and e1 e2 ...) — 左から評価、 最初の falsy を返し短絡。 全部 truthy なら最後の値。
+    引数無しは #t。"""
+    if not args:
+        return True
+    last: Any = True
+    for a in args:
+        last = _unwrap_value(evaluate(a, env))
+        if not _truthy(last):
+            return last
+    return last
+
+
+def _sf_or(env: Env, args: list) -> Any:
+    """(or e1 e2 ...) — 左から評価、 最初の truthy を返し短絡。 全部 falsy なら最後の値。
+    引数無しは #f。"""
+    if not args:
+        return False
+    last: Any = False
+    for a in args:
+        last = _unwrap_value(evaluate(a, env))
+        if _truthy(last):
+            return last
+    return last
+
+
 def _sf_set_bang(env: Env, args: list) -> Any:
     """(set! name expr) — 既存 binding を新しい値で更新。 未定義の場合はエラー。
 
@@ -1114,6 +1169,8 @@ _SPECIAL_FORM_NOEVAL = {
     "try": _sf_try,
     "set!": _sf_set_bang,
     "recur": _sf_recur,
+    "and": _sf_and,
+    "or": _sf_or,
 }
 
 
@@ -1606,13 +1663,19 @@ PRIMITIVES: dict[str, Callable[..., Any]] = {
     "-": _prim_sub,
     "*": lambda *args: reduce(operator.mul, args, 1),
     "/": _prim_div,
+    # 整数除算と剰余。 / は float に縮退するので別物として用意。
+    "quotient":  lambda a, b: int(a) // int(b),
+    "remainder": lambda a, b: int(a) % int(b),
+    "mod":       lambda a, b: int(a) % int(b),     # remainder の alias
+    "abs":       lambda a: abs(a),
+    "min":       lambda *args: min(args),
+    "max":       lambda *args: max(args),
     "=": lambda a, b: a == b,
     "<": lambda a, b: a < b,
     ">": lambda a, b: a > b,
     "<=": lambda a, b: a <= b,
     ">=": lambda a, b: a >= b,
-    "and": lambda *args: all(_truthy(a) for a in args),
-    "or": lambda *args: any(_truthy(a) for a in args),
+    # and / or は special form (短絡評価) として _SPECIAL_FORM_NOEVAL 側で定義済
     "not": lambda a: not _truthy(a),
     "list": lambda *args: list(args),
     "car": _prim_car,
@@ -1677,6 +1740,15 @@ PRIMITIVES: dict[str, Callable[..., Any]] = {
     "tool-call-args":   lambda tc: tc.get("function", {}).get("arguments", "{}") if isinstance(tc, dict) else "{}",
     # message (OpenAI 形式 dict) constructor — llm-call に渡す素材
     "make-message":     lambda role, content: {"role": str(role), "content": str(content)},
+    # 型述語 — match macro / 一般的な dispatch で使う。 string? は string 群と一緒に。
+    "list?":     lambda x: isinstance(x, list),
+    "symbol?":   lambda x: isinstance(x, Symbol),
+    "number?":   lambda x: isinstance(x, (int, float)) and not isinstance(x, bool),
+    "integer?":  lambda x: isinstance(x, int) and not isinstance(x, bool),
+    "boolean?":  lambda x: isinstance(x, bool),
+    "lambda?":   lambda x: isinstance(x, Lambda),
+    "pair?":     lambda x: isinstance(x, list) and len(x) > 0,
+    "eq?":       lambda a, b: a is b or a == b,
     # 文字列述語 / 操作 — LLM 出力で if を切る、normalize する、つなぐ等
     "string?":            lambda x: isinstance(x, str),
     "string-contains?":   lambda s, sub: sub in s,
@@ -2103,11 +2175,13 @@ def repl() -> None:
             print("⚠️  YOLO mode — 副作用 tool の y/N 確認は skip されます。 (set-yolo #f) で戻す")
     except ImportError:
         pass
-    print("Lisp core:  + - * / = < > and or not  if  define  let  quote  eval  apply")
-    print("            list  car  cdr  cons  null?  fold  compose (derived)")
+    print("Lisp core:  + - * / mod quotient abs min max = < > and or not  if  define  let")
+    print("            quote  eval  apply  list  car  cdr  cons  null?  fold  compose")
+    print("            string?  list?  symbol?  number?  integer?  boolean?  lambda?  pair?  eq?")
     print("            string-contains? string-prefix? string-append substring …")
     print("            read-sexp  prompt  strip-code-fences")
-    print("LLM lambda: (lambda name (p) \"body\")   apply: (f x)")
+    print("LLM lambda: (lambda name (p) \"body\")        apply: (f x)")
+    print("Varargs:    (lambda (a &rest xs) ...)  — 残余を xs (list) に bind")
     print("Macros:     (defmacro name (p) body)   `x ,x ,@x  (macroexpand-1 'form) (gensym)")
     print("Errors:     (try expr (catch (e) handler))  (error \"msg\")  (error? v) (error-message e)")
     print("Mutable:    (set! name expr)   (box v) (unbox b) (set-box! b v) (box? v)")

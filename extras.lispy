@@ -173,3 +173,207 @@
 ;; (with-default expr default) — error なら default 定数を返す (副作用なし)。
 (defmacro with-default (expr default)
   `(try ,expr (catch (e) ,default)))
+
+
+;; ===========================================================================
+;; numeric / predicate
+;; ===========================================================================
+
+(define inc (lambda (x) (+ x 1)))
+(define dec (lambda (x) (- x 1)))
+
+(define even? (lambda (n) (= (mod n 2) 0)))
+(define odd?  (lambda (n) (not (= (mod n 2) 0))))
+
+(define zero?     (lambda (n) (= n 0)))
+(define positive? (lambda (n) (> n 0)))
+(define negative? (lambda (n) (< n 0)))
+
+;; (range start end) → (start ... end-1)
+(define range
+  (lambda (start end)
+    (let ((iter (lambda (i acc)
+                  (if (>= i end) (reverse acc)
+                      (recur (+ i 1) (cons i acc))))))
+      (iter start (list)))))
+
+;; (iota n) → (0 1 ... n-1)
+(define iota (lambda (n) (range 0 n)))
+
+
+;; ===========================================================================
+;; list 追加 op (tail-recursive)
+;; ===========================================================================
+
+;; (take n lst) — 先頭 n 要素
+(define take
+  (lambda (n lst)
+    (let ((iter (lambda (i l acc)
+                  (if (or (<= i 0) (null? l)) (reverse acc)
+                      (recur (- i 1) (cdr l) (cons (car l) acc))))))
+      (iter n lst (list)))))
+
+;; (drop n lst) — 先頭 n 要素を捨てる
+(define drop
+  (lambda (n lst)
+    (if (or (<= n 0) (null? lst)) lst
+        (recur (- n 1) (cdr lst)))))
+
+;; (nth n lst) — 0-indexed の n 番目要素 (out-of-range は #f)
+(define nth
+  (lambda (n lst)
+    (if (null? lst) #f
+        (if (= n 0) (car lst)
+            (recur (- n 1) (cdr lst))))))
+
+;; (last lst) — 最後の要素 (空 list は #f)
+(define last
+  (lambda (lst)
+    (if (null? lst) #f
+        (if (null? (cdr lst)) (car lst)
+            (recur (cdr lst))))))
+
+;; (every? pred lst) — 全部 pred が真なら #t
+(define every?
+  (lambda (pred lst)
+    (if (null? lst) #t
+        (if (pred (car lst)) (recur pred (cdr lst))
+            #f))))
+
+;; (any? pred lst) — 1 つでも pred が真なら #t
+(define any?
+  (lambda (pred lst)
+    (if (null? lst) #f
+        (if (pred (car lst)) #t
+            (recur pred (cdr lst))))))
+
+;; (zip a b) — 2 つの list を pair に。 短い方に合わせる。
+(define zip
+  (lambda (a b)
+    (let ((iter (lambda (xs ys acc)
+                  (if (or (null? xs) (null? ys)) (reverse acc)
+                      (recur (cdr xs) (cdr ys)
+                             (cons (list (car xs) (car ys)) acc))))))
+      (iter a b (list)))))
+
+;; (flatten lst) — 1 段だけ平坦化。 nested list なら適用しなおして 2 回呼ぶ。
+(define flatten
+  (lambda (lst)
+    (if (null? lst) (list)
+        (append (car lst) (flatten (cdr lst))))))
+
+
+;; ===========================================================================
+;; combinator
+;; ===========================================================================
+
+(define identity (lambda (x) x))
+(define const    (lambda (x) (lambda (_) x)))         ;; ignore 入力で常に x
+(define flip     (lambda (f) (lambda (a b) (f b a))))
+
+;; (pipe x f g h) — x を左から順に関数適用。 ((compose f g h) x) と逆向き。
+;; UNIX pipeline 的な書き味。 例: (pipe 5 inc inc inc) → 8
+(define pipe
+  (lambda (x &rest fns)
+    (fold (lambda (acc f) (f acc)) x fns)))
+
+
+;; ===========================================================================
+;; sequential let — body 内で前の binding を参照できる
+;; ===========================================================================
+
+;; (let* ((a 1) (b (+ a 1))) ...) — let の bindings 部で逐次評価
+;; lispy の let は並列束縛なので、 a を使って b を計算するには let* が要る。
+;; 展開: 1 つずつネストした let に変換 (1 binding なら 1 let、 n 個なら n 重)。
+(defmacro let* (bindings &rest body)
+  (if (null? bindings)
+      `(begin ,@body)
+      `(let (,(car bindings))
+         (let* ,(cdr bindings) ,@body))))
+
+
+;; ===========================================================================
+;; 軽量 pattern match
+;; ===========================================================================
+;;
+;; (match expr
+;;   (pattern body...)
+;;   (pattern body...)
+;;   ...)
+;;
+;; pattern:
+;;   _            wildcard (どんな値にも match)
+;;   <symbol>     任意の値に match して symbol に bind (body で参照可)
+;;   <number>     数値リテラル一致
+;;   <string>     文字列リテラル一致
+;;   #t / #f      bool リテラル一致
+;;   (quote x)    symbol/list literal 一致 (例: 'ok → (quote ok))
+;;   (list ...)   list pattern (長さ一致 + 各要素を再帰 match)
+;;
+;; どれも match しなければ nil。 マクロ展開は eval 時、 body はネストした if + let* に。
+;; hygienic ではない: pattern 内 symbol で binding 名を奪う事故に注意。
+;;
+;; 使用例:
+;;   (match resp
+;;     ((list 'ok v)    (process v))
+;;     ((list 'err msg) (handle msg))
+;;     (_               (default)))
+
+(defmacro match (expr &rest clauses)
+  (let ((g (gensym "v")))
+    `(let ((,g ,expr))
+       ,(_match-expand g clauses))))
+
+(define _match-expand
+  (lambda (v clauses)
+    (if (null? clauses)
+        nil
+        (let* ((c     (car clauses))
+               (pat   (car c))
+               (body  (cdr c))
+               (rest  (cdr clauses))
+               (pred  (_match-pred v pat))
+               (binds (_match-binds v pat))
+               (then  (if (null? binds)
+                          `(begin ,@body)
+                          `(let* ,binds (begin ,@body)))))
+          `(if ,pred ,then ,(_match-expand v rest))))))
+
+;; pattern → 「v にこの pattern が match するか」 を判定する式を返す
+(define _match-pred
+  (lambda (v pat)
+    (if (= pat '_) #t                                    ;; wildcard
+        (if (symbol? pat) #t                             ;; var bind → 常に match
+            (if (and (list? pat) (= (car pat) 'quote))
+                `(= ,v ',(car (cdr pat)))                ;; (quote x) literal
+                (if (and (list? pat) (= (car pat) 'list))
+                    (_match-list-pred v (cdr pat))
+                    `(= ,v ,pat)))))))                   ;; number/string/bool
+
+(define _match-list-pred
+  (lambda (v elems)
+    (let ((n (length elems)))
+      (fold (lambda (acc pair)
+              (let ((i  (car pair))
+                    (ep (car (cdr pair))))
+                `(and ,acc ,(_match-pred `(nth ,i ,v) ep))))
+            `(and (list? ,v) (= (length ,v) ,n))
+            (zip (iota n) elems)))))
+
+;; pattern → 露出する binding の (name expr) ペア list
+(define _match-binds
+  (lambda (v pat)
+    (if (= pat '_) (list)
+        (if (symbol? pat) (list (list pat v))
+            (if (and (list? pat) (= (car pat) 'list))
+                (_match-list-binds v (cdr pat))
+                (list))))))
+
+(define _match-list-binds
+  (lambda (v elems)
+    (fold (lambda (acc pair)
+            (let ((i  (car pair))
+                  (ep (car (cdr pair))))
+              (append acc (_match-binds `(nth ,i ,v) ep))))
+          (list)
+          (zip (iota (length elems)) elems))))
