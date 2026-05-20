@@ -38,9 +38,11 @@ inspect / quote / redefine 可能。
 ```
 lispy/
 ├── lispy.py        # 評価器本体 (live-redefinable agent evaluator)
-├── host.py         # host environment (DB, tool 群, LLM client, CLI)
+├── host.py         # host environment (DB, read 系 tool 群, LLM client, CLI)
+├── edit.py         # 副作用 tool (shell / write-file / edit-file / append-file)
+├── init.lispy      # 起動時 auto-load: agent-step / compose (言語の seed)
+├── extras.lispy    # 派生 idiom 集 (list ops, control macros, combinators, match...)  (load で取り込む)
 ├── host.db         # SQLite (sessions, turns, FTS5, meta_events, tasks)
-├── extras.lispy    # 派生 idiom 集 (lens / wrap / debate / probe ...)  (load で取り込む)
 ├── data/
 │   └── turns/      # 日付別 md (DB から再生成可能)
 └── pyproject.toml
@@ -48,7 +50,7 @@ lispy/
 
 ## 前提
 
-- DeepSeek を OpenAI 互換 API として localhost に立てておく (例: `ds4-server --port 8000`)
+- OpenAI 互換 API endpoint (OpenRouter / OpenAI / Anthropic OAI-compat / Ollama / 自前ホストの DeepSeek 等 何でも)
 - Python 3.11+
 - `uv` がインストール済み
 
@@ -58,11 +60,17 @@ lispy/
 cd ~/lispy
 uv sync                          # project venv を作成
 uv tool install --editable .     # host / lispy CLI を ~/.local/bin に
+cp .env.example .env             # provider を選んで API key / model / base url を編集
 ```
+
+`.env` には **LLM_API_KEY / LLM_BASE_URL / LLM_MODEL** の 3 つを必ず書く (default は持たない設計)。
+未設定で LLM を呼ぶと起動時ではなく **初回 LLM 呼び出し時** に明示エラーで止まる。
+`host list` / `search` / `dump` 等の DB CLI と、 lispy の **pure Lisp 評価** は .env 無しでも動く。
 
 ## CLI: `host`
 
-DeepSeek 対話は `lispy` に集約しているので、`host` 自体は DB / 記録の操作専用ユーティリティ。
+LLM 対話は `lispy` に集約しているので、 `host` 自体は DB / 記録の操作専用ユーティリティ。
+LLM を使わない subcommand (list / search / dump / cross / events / domain) は **.env 無しでも動く**。
 
 ```bash
 host list                  # session 一覧
@@ -73,6 +81,7 @@ host dump                  # DB → 日付別 md 再生成
 host domain                # domain (tag) 一覧
 host events                # meta-event ledger
 host cross "scope"         # session 横断で構造ラベル付き
+host label <sid>           # LLM に title/keyphrases/tags を提案させて DB に書く (.env 必須)
 ```
 
 環境変数:
@@ -108,11 +117,9 @@ REPL に入ったらまずこれを順に試すと、 lispy が「走らせな�
 > **注意**: Recipe (3) と (4) は `agent-step` (= 評価器の loop 規則そのもの) を書き換える。
 > 書き換え後は **「以前は動いてた pattern が動かなくなる」**。 各 Recipe 単独で試すか、 順にやって挙動の変化を観察する、 どちらでも OK。
 >
-> **default に戻したい時** は REPL を抜けて再起動するか、 下記を paste:
->
-> ```lisp
-> (define agent-step (lambda (env input) (let ((env2 (append-turn env (make-turn "user" input)))) (let ((response (llm-call env2))) (let ((env3 (append-turn env2 response))) (if (has-tool-calls? response) (agent-step (fold (lambda (e tc) (append-turn e (make-turn "tool" (dispatch-tool (tool-call-name tc) (tool-call-args tc)) (tool-call-id tc)))) env3 (tool-calls response)) "") response))))))
-> ```
+> **default に戻したい時** は REPL を抜けて再起動するか、 `(load "init.lispy")` で再 load する。
+> `init.lispy` は起動時に自動 load される seed ファイルで、 `agent-step` と `compose` の元定義が
+> 入っている (Python 側に hard-code せず、 「核は S 式」 を実装と一致させる狙い)。
 
 #### (1) 基本動作の確認
 
@@ -240,7 +247,7 @@ foo               ; symbol (env から lookup)
 
 REPL に入力した行は:
 - `(` で始まる → **S 式として直接評価** (model を介さない)
-- それ以外 → 平文として **DeepSeek に投げる**
+- それ以外 → 平文として **LLM に投げる** (.env で指定した OpenAI 互換 endpoint)
 - `!` で始まる → REPL のメタコマンド (`!env` `!archive` 等、後述)
 
 ### Lisp core (raw 値で計算)
@@ -424,11 +431,11 @@ main> (eval (read-sexp "(+ 1 2 3)"))
 #### LLM lambda (body は文字列テンプレ)
 ```lisp
 (lambda critique (x) "次を 1 行で批判: {x}")    ; 名前付き、env.bindings に登録
-(critique "Lisp は古い")                         ; → DeepSeek の応答
+(critique "Lisp は古い")                         ; → LLM の応答
 ```
 - body 内の `{param_name}` が Python の `.format()` で展開される
 - `{self}` は λ 自身の名前 (再帰用)
-- 引数を文字列化してテンプレに埋め、結果プロンプトを DeepSeek に投げる
+- 引数を文字列化してテンプレに埋め、結果プロンプトを LLM に投げる
 - LLM 実行中は `BODY_SYSTEM` (= 「自然言語で答え、S 式を吐かない」) を system prompt に差し替える
 
 #### 名前付き vs 匿名
@@ -502,7 +509,8 @@ main> (eval (read-sexp "(+ 1 2 3)"))
 ### 状態確認
 
 ```lisp
-(env)                       ; name / depth / turns 数 / archive 数 / bindings 数 etc.
+env                         ; 現 env オブジェクトそのもの (fork-env / llm-call に渡せる)
+(env-info)                  ; name / depth / turns 数 / archive 数 / bindings 数 etc.
 (turns)                     ; 直近 5 turn (プレビュー)
 (turns 10)                  ; 直近 10 turn
 (turn)                      ; 末尾 turn の content (文字列)
@@ -535,7 +543,7 @@ REPL の meta コマンド (S 式じゃなく `!` prefix) でも同じ
 ### 平文と S 式の混在
 
 ```
-main> 富士山の標高は？             ; 平文 → DeepSeek に投げる
+main> 富士山の標高は？             ; 平文 → LLM に投げる
 富士山の標高は 3776 m です。
 
 main> (+ 1 2)                      ; S 式 → 直接評価
@@ -545,6 +553,137 @@ main> (define greet (lambda (x) "Hello, {x}!"))
 main> (greet "world")              ; LLM lambda 経由でモデルへ
 Hello, world!
 ```
+
+### 言語拡張
+
+Lisp core に上乗せされた機能群。 概念だけ列挙、 詳細は `extras.lispy` と REPL の help で。
+
+#### マクロ (`defmacro` + quasiquote)
+
+```lisp
+(defmacro when (c &rest body) `(if ,c (begin ,@body) nil))
+(when (> 3 2) (print "yes") "ok")        ; → ok
+
+(defmacro with-retry (n expr)
+  (if (= n 0) expr
+      `(try ,expr (catch (e) (with-retry ,(- n 1) ,expr)))))
+(with-retry 3 (llm-call env))             ; 3 回まで自動 retry
+```
+
+- `'x` / `` `x `` / `,x` / `,@x` の reader 糖衣
+- `&rest` で残余引数
+- `(gensym)` で衝突しない symbol 生成 (非 hygienic なので変数捕獲は自分で回避)
+- `(macroexpand-1 'form)` で展開結果を覗ける
+
+#### try / catch / error
+
+```lisp
+(try (car (list))
+     (catch (e) (string-append "rescued: " (error-message e))))
+; → "rescued: car: needs a non-empty list"
+
+(error "custom" "io")                     ; tag 付きで raise
+(error? v)  (error-message e)  (error-tag e)
+```
+
+#### set! / box (可変状態)
+
+```lisp
+(define x 10)
+(set! x 20)                ; define 済みを更新
+
+;; closure-shared mutable state には box を使う (lispy の closure は snapshot)
+(define make-counter
+  (lambda ()
+    (let ((c (box 0)))
+      (lambda () (set-box! c (+ (unbox c) 1))))))
+(define ctr (make-counter))
+(ctr) (ctr) (ctr)                        ; → 3
+```
+
+#### recur (明示 TCO)
+
+`recur` は **nearest 内側 lambda を tail call** する。 stack を消費しないので
+無限ループ用途で使える (普通の自己呼び出しは深度 100 制限)。
+
+```lisp
+(define sum-to
+  (lambda (n acc)
+    (if (= n 0) acc (recur (- n 1) (+ n acc)))))
+(sum-to 1000000 0)                       ; → 500000500000
+```
+
+Clojure 流の明示形 (Scheme の auto TCO ではない)。 相互再帰には使えない。
+
+#### fork-env (env を first-class に複製)
+
+```lisp
+(define alt (fork-env env 'system "you are a critic"))
+;; turns / bindings / archive / macros / quoted は独立 copy
+;; tools / db_conn / record_sid は元と共有
+(llm-call alt)                            ; 別 system で同じ会話を試す
+```
+
+debate / counterfactual / parallel sampling を S 式だけで組める素地。
+
+#### llm-call の options + logprob 観測
+
+```lisp
+(llm-call env 'temperature 1.5 'logprobs #t 'max-tokens 4096)
+
+(define r (llm-call env 'logprobs #t))
+(turn-logprobs r)                         ; → ((tok logp) (tok logp) ...)
+(turn-entropy r)                          ; → 平均 -logprob (確信度の代理)
+
+;; 確信度で分岐
+(if (< (turn-entropy r) 0.5) r (renew "more deliberation"))
+```
+
+option は plist 形式 (`'key value 'key value`)。 サポート: `temperature` / `max-tokens` / `logprobs` /
+`top-logprobs` / `think`。
+
+#### 型述語
+
+```lisp
+(list? x)  (symbol? x)  (number? x)  (integer? x)  (boolean? x)
+(lambda? x)  (pair? x)  (eq? a b)  (string? x)
+```
+
+`match` macro (`extras.lispy` で `(load ...)`) と組み合わせると tool-call dispatch が綺麗:
+
+```lisp
+(match resp
+  ((list 'ok v)    (process v))
+  ((list 'err msg) (handle msg))
+  (_               (default)))
+```
+
+#### 副作用 tool (shell / write-file / edit-file / append-file)
+
+agent が tool_call として呼べる。 user は REPL から直接も呼べる:
+
+```lisp
+(shell "git status")                      ; allow-list なので即実行
+(shell "rm -rf foo")                      ; 確認 prompt が出る
+(write-file "/tmp/note.md" "hello")
+(edit-file "foo.py" "old" "new")
+```
+
+危険コマンド (rm, write 系) は y/N 確認が出る。 一括承認したいときは:
+
+```bash
+$ lispy --yolo                            # 起動時から全 skip
+```
+
+```lisp
+main> (set-yolo #t)                       ; session 中だけ切り替え
+main> ...
+main> (set-yolo #f)                       ; 戻す
+main> (yolo?)                             ; 現状確認
+```
+
+allow-list は `;` `&&` `|` backtick `$(` 等 shell metacharacter を検出すると無効化されるので、
+`(shell "git status; rm -rf /")` は素通しせず confirm が出る。
 
 ### 使い方の典型 (Cookbook)
 
@@ -690,23 +829,20 @@ main> (lens (list dbl inc) 5)
 (10 6)
 ```
 
-repo に同梱の `extras.lispy` には以下が入っている:
+repo に同梱の `extras.lispy` には大別して以下が入っている:
 
-```lisp
-;; extras.lispy 抜粋
-(define lens (lambda (fns x) (map (lambda (f) (f x)) fns)))
-(define wrap (lambda (name decorator)
-  (lambda (x) ((lookup name) (decorator x)))))
-(define probe (lambda (id k)
-  (if (<= k 0) (list)
-      (cons (eval-turn-pure id) (probe id (- k 1))))))
-(define debate (lambda (a b topic n)
-  (if (<= n 0) (list)
-      (let ((said (a topic))) (cons said (debate b a said (- n 1)))))))
-(define transform-past (lambda (f) (map f (archive-turns))))
-(define from-pack (lambda (pack key) ...))
-(define condense (lambda (f init xs) (fold f init xs)))
 ```
+list ops     map / length / reverse / append / filter / assoc / member
+             take / drop / nth / last / every? / any? / zip / flatten
+             range / iota
+numeric      inc / dec / even? / odd? / zero? / positive? / negative?
+combinator   identity / const / flip / pipe / compose / lens / wrap / debate / probe
+control      when / unless / cond / let* / match (macro)
+robust       memoize / with-retry / with-fallback / with-default
+agent idiom  transform-past / from-pack / condense
+```
+
+map / reverse / filter / 等は **tail-recursive 化済** (recur + accumulator) なので 1000+ 要素でも安全。
 
 `load` は `_tokenize_sexp` がコメント (`;` 行末まで) を読み飛ばす + `read_all_sexp` で
 複数 S 式列をパースする仕組み。 自分で書いた `.lispy` ファイルを置いて load すれば
@@ -753,28 +889,32 @@ main> 富士山の標高は？    ; 元に戻った
 - **REPL の `[xxxxxxxx]` 8 文字 hex id は session ごとに別** — 他人 (や README) の id をそのまま打っても `not found`。自分の env の `!turns` / `!archive` / `(quoted)` で確認する
 - **LLM lambda 実行中は system prompt が `BODY_SYSTEM` に切り替わる** — 「`(` で始まる行を書くな」「コードブロック禁止」等が強制される。コード生成 / 構造化出力には `prompt` を使うこと
 - **LLM 応答が `(` で始まると auto-eval される** — meta form (`(renew ...)` 等) を LLM に駆動させるための仕組みだが、コード生成では困る。`prompt` ならこの auto-eval をスキップして生 text を返す
-- **`Lambda` 再帰深度上限 5 (LLM) / 32 (Lisp)** — `(compose ...)` の入れ子や `(debate a b "topic" n)` で引っかかったらこれを疑う (`lispy.py:163, 186`)。debate は LLM lambda call が交互に入るため、n=3 までが安全圏
+- **`Lambda` 再帰深度上限 5 (LLM) / 100 (Lisp)** — Lisp lambda の上限は深度 100。 普通の再帰なら届かないが、 ループ的に深く回したいときは `(recur ...)` を使う (`recur` は frame 再利用なので深度を消費しない)。 `debate` 等の LLM lambda call は別カウンタ (5) で、 n=3 までが安全圏
 - **`(archive)` `(quoted)` は空が初期状態** — それぞれ `(renew ...)` / `(quote-turn ...)` で初めて埋まる
 - **`(define x (quote-turn ...))` の REPL 表示は id だけ** — `:quote-turn → stored as ...` の status 行は出ない (define が Value から payload を unwrap するため)。`(quote-turn ...)` 単独で打てば status は出る
 
 ### Lisp 系譜での位置
 
-Scheme R5RS の語彙を一部だけ拾った教育用評価器。
-- `#t/#f`、Lisp-1、`define`/`let`、Scheme 標準の `apply`
-- ただし TCO 無し、continuation 無し、hygienic macro 無し、`quasiquote` 無し
-- LLM lambda の `"body with {x}"` 形式は Scheme 標準ではない (我々独自のテンプレ記法)
+Scheme R5RS の語彙を一部だけ拾った評価器に LLM lambda と agent 用 primitive を混ぜたもの。
+- 取り入れ済み: `#t/#f` / Lisp-1 / `define` / `let` / `let*` / Scheme 標準の `apply` / quasiquote (`` ` `` `,` `,@`) / `defmacro` (非 hygienic、 Common Lisp 流) / `try-catch` / `set!` / box / 短絡 `and`/`or` / `&rest` 残余引数 / `match` macro (extras)
+- TCO は **明示形 `(recur ...)`** (Clojure 流。 Scheme の auto TCO ではない、 相互再帰は不可)
+- 未実装: continuation / hygienic macro / module system / proper TCO / numeric tower
+- LLM lambda の `"body with {x}"` 形式は Scheme 標準ではない (lispy 独自のテンプレ記法)
 
 ### 内部構造 (lispy.py のキー定数)
 
 | シンボル | 意味 |
 |---|---|
-| `Env` | 評価環境。turns / archive / bindings / system / tools 等を持つ |
-| `Lambda` | `kind="llm"` or `"lisp"`、closure と captured bindings を持つ |
-| `evaluate(tree, env)` | 中核評価関数、raw Python 値を返す |
-| `eval_sexp(tree, env)` | 表層 wrapper、Value を返す (REPL 表示用) |
+| `Env` | 評価環境。turns / archive / bindings / macros / system / tools / db_conn 等を持つ |
+| `Lambda` | `kind="llm"` or `"lisp"`、closure と captured bindings、 `rest_param` (`&rest`) |
+| `Turn` | role / content / tool_calls / **logprobs**。 `llm-call` で 'logprobs #t を渡すと埋まる |
+| `Box` / `LispError` / `_Recur` | mutable cell / first-class error 値 / TCO signal |
+| `evaluate(tree, env)` | 中核評価関数、raw Python 値を返す。 macros lookup → special forms → 通常 apply |
+| `eval_sexp(tree, env)` | 表層 wrapper、Value を返す (REPL 表示用)。 `_Recur` 漏れも error 化 |
 | `_SEXP_DISPATCH` | renew / eval-turn / spawn / lambda の評価器メタ form を分岐 |
-| `_SPECIAL_FORM_NOEVAL` | quote / if / define / let (引数を評価しない) |
-| `PRIMITIVES` | + - * / car cdr cons list etc. |
+| `_SPECIAL_FORM_NOEVAL` | quote / if / define / let / begin / defmacro / quasiquote / try / set! / recur / and / or |
+| `PRIMITIVES` | + - * / mod abs min max car cdr cons list 型述語 box error 等 |
+| `LISPY_PRIMITIVES` + `EDIT_TOOL_SCHEMA` | agent から tool_call で叩ける 16 ツール (read 系 12 + 副作用系 4) |
 | `BODY_SYSTEM` | LLM lambda 実行時の差し替え system prompt |
 
 ## ライセンス
