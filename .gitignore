@@ -10,3 +10,5 @@ __pycache__/
 *.egg-info/
 data/
 skills/auto/
+.DS_Store
+.bodies_chat_history
