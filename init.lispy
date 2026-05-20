@@ -1,0 +1,36 @@
+;; init.lispy — lispy 起動時に自動 load される S 式定義集
+;;
+;; ここに置くのは agent-step / compose 等の「言語の seed」。
+;; Python (lispy.py) に hard-code しない方針: 核は S 式である、という宣言と一致させるため。
+;; ユーザーは (load "init.lispy") を打つ必要なし — lispy.py の build_default_env が
+;; _install_meta_primitives の末尾で自動 load する。
+;;
+;; 動かし方:
+;;   - 起動時はここに書かれた binding が pre-defined になる
+;;   - 走行中に (define agent-step (lambda (env input) ...)) で書き換えれば即反映
+;;   - もっと派生 idiom が欲しければ (load "extras.lispy") (opt-in)
+
+;; --- 古典的な関数合成 — FP の universal idiom として 1 つだけ pre-define ---
+(define compose
+  (lambda (f g) (lambda (x) (g (f x)))))
+
+;; --- agent loop の本体 — lispy の核 ---
+;; REPL の平文入力は Python の eval_ から (agent-step env input) として呼ばれる。
+;; この binding を書き換えれば、 走行中の評価規則そのものが変わる。
+(define agent-step
+  (lambda (env input)
+    (let ((env2 (append-turn env (make-turn "user" input))))
+      (let ((response (llm-call env2)))
+        (let ((env3 (append-turn env2 response)))
+          (if (has-tool-calls? response)
+              (agent-step
+                (fold (lambda (e tc)
+                        (append-turn e
+                          (make-turn "tool"
+                            (dispatch-tool (tool-call-name tc)
+                                           (tool-call-args tc))
+                            (tool-call-id tc))))
+                      env3
+                      (tool-calls response))
+                "")
+              response))))))

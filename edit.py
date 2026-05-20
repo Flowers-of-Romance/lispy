@@ -18,6 +18,8 @@ lispy.py から `import edit; edit.install_primitives(env)` で取り込む形�
 """
 from __future__ import annotations
 
+import re
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -49,12 +51,33 @@ def get_yolo() -> bool:
     return _RUNTIME_YOLO
 
 
+_SHELL_META = re.compile(r"[;&|`>$<]|\$\(|>>")
+
+
 def _is_shell_allowed(cmd: str) -> bool:
+    """allow-list と shell metacharacter チェック。
+
+    "git status; rm -rf /" のような複合コマンドは prefix match を突破するので、
+    `;` `&` `|` backtick `$(` `>` `<` のいずれかが含まれていたら **強制 confirm** に倒す。
+    その上で shlex で先頭 1〜2 token を取り、 allow-list と完全一致するかを見る。
+    """
     cmd = cmd.strip()
-    for prefix in SHELL_ALLOWED_PREFIXES:
-        if cmd == prefix or cmd.startswith(prefix + " "):
-            return True
-    return False
+    if not cmd:
+        return False
+    # shell metacharacter (command chaining / substitution / redirect) があれば全部 confirm 側
+    if _SHELL_META.search(cmd):
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False  # quote の不整合 等
+    if not tokens:
+        return False
+    # 候補: 1 語目、 1 語目+2 語目 (例: "git status")
+    candidates = [tokens[0]]
+    if len(tokens) >= 2:
+        candidates.append(f"{tokens[0]} {tokens[1]}")
+    return any(c in SHELL_ALLOWED_PREFIXES for c in candidates)
 
 
 def _confirm(prompt: str) -> bool:
