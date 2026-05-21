@@ -2145,18 +2145,24 @@ def _install_meta_primitives(env: Env) -> None:
             print(f"  (warning: init.lispy load failed: {e})", file=sys.stderr)
 
 
-def _open_recording(env: Env) -> None:
+def _open_recording(env: Env, sid: str = "") -> None:
     try:
         env.db_conn = host.init_db(host.DB_PATH)
-        env.record_sid = host.open_session(env.db_conn)
-        host.log_meta(env.db_conn, "lispy_open", sid=env.record_sid, payload="")
+        if sid:
+            # 既存 session を引き継ぐ。 turns append 先が同じ sid になる。
+            env.record_sid = sid
+            host.ensure_session(env.db_conn, sid)
+            host.log_meta(env.db_conn, "lispy_resume", sid=sid, payload="")
+        else:
+            env.record_sid = host.open_session(env.db_conn)
+            host.log_meta(env.db_conn, "lispy_open", sid=env.record_sid, payload="")
     except Exception as e:
         print(f"  (warning: recording disabled: {e})", file=sys.stderr)
         env.db_conn = None
         env.record_sid = ""
 
 
-def build_default_env(record: bool = True) -> Env:
+def build_default_env(record: bool = True, sid: str = "") -> Env:
     tools, schema = _build_tool_layer()
     env = Env(
         system=SYSTEM_PROMPT,
@@ -2167,7 +2173,7 @@ def build_default_env(record: bool = True) -> Env:
     )
     _install_meta_primitives(env)
     if record:
-        _open_recording(env)
+        _open_recording(env, sid=sid)
     return env
 
 
