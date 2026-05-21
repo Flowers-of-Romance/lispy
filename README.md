@@ -41,6 +41,7 @@ lispy/
 ├── host.py         # host environment (DB, read 系 tool 群, LLM client, CLI)
 ├── edit.py         # 副作用 tool (shell / write-file / edit-file / append-file)
 ├── nl.py           # 日本語 → S 式 翻訳 REPL (lispy sidecar)
+├── server.py       # lispy を HTTP で叩ける常駐プロセス (lispy sidecar)
 ├── lispy.SYSTEM_PROMPT.md   # lispy / nl 共有の system prompt 本体 (Python 外で編集)
 ├── nl.SYSTEM_PROMPT.md      # nl 固有の addendum (翻訳器ルール + binding/tool placeholder)
 ├── init.lispy      # 起動時 auto-load: agent-step / compose (言語の seed)
@@ -981,6 +982,62 @@ nl> @富士山の標高は?
 - LLM が誤った S 式を返したり eval が落ちたりしても履歴に残す。 次のターンで自己修正できる。
 - DB 記録は対話モードでのみ ON。 lispy REPL と同じ session 形式で host.db に書く
   (`host search` / `recall` で振り返れる)。
+
+## server: HTTP で叩ける常駐 lispy
+
+`server.py` は **env を抱えたまま落ちない lispy** を HTTP の薄い経路で外に出す sidecar。
+Claude / nl REPL / 別の bash 端末 / curl から **同じ env を共有** できる。 「考える側」 (LLM / user)
+と「状態を持つ側」(lispy env) を別プロセスに分離する設計。
+
+```bash
+.venv/bin/python server.py                       # 127.0.0.1:9000 で起動
+.venv/bin/python server.py --port 9000 --yolo    # shell 確認 skip (常駐 process では実質必須)
+.venv/bin/python server.py --session 1779360770  # 過去 session に append (prefix 一致)
+.venv/bin/python server.py --stdin               # server と並列に stdin REPL も起動
+```
+
+### endpoints
+
+| method | path | body / query | 用途 |
+|---|---|---|---|
+| GET | `/` | — | healthz: `{ok, bindings, tools, session_id}` |
+| GET | `/bindings` | — | env binding 名の一覧 |
+| GET | `/recall` | `?q=&k=5&mode=auto` | host の trajectory recall (FTS5 / trigram) |
+| POST | `/eval` | `<S 式>` (raw text) | eval して `{ok, result, stdout, error?}` |
+| POST | `/load` | `<file path>` | ファイルから read-all-sexp して全 form を eval |
+| POST | `/reset` | — | env を作り直す (新 session id 発行) |
+
+`POST /` は `POST /eval` の alias。
+
+### 例
+
+```bash
+$ curl -s -X POST http://127.0.0.1:9000/eval -d '(define double (lambda (x) (* x 2)))'
+{"ok": true, "result": "lambda double(x) [lisp]", "stdout": ""}
+
+$ curl -s -X POST http://127.0.0.1:9000/eval -d '(double 21)'
+{"ok": true, "result": "42", "stdout": ""}
+
+$ curl -s http://127.0.0.1:9000/                # healthz
+{"ok": true, "bindings": 160, "tools": 16, "session_id": "1779361030-..."}
+
+$ curl -s "http://127.0.0.1:9000/recall?q=lispy&k=3"
+{"ok": true, "result": "# recall: 3 hits (mode=fts) ..."}
+
+$ curl -s -X POST http://127.0.0.1:9000/reset   # env 作り直し
+{"ok": true, "session_id": "...", "bindings": 159}
+```
+
+### 仕様メモ
+
+- evaluation は serialized (`threading.Lock`)。 同時 mutation は許さない
+- stdout (`(print ...)` 等) は HTTP response の `stdout` field に捕捉される
+- eval error は `result` に文字列で入って HTTP 200 で返る (handler は完走、 500 にしない)
+- `--session <prefix>` は DB の既存 session を引き継ぐ。 turns が同じ sid に append される
+  (bindings 復元は無し、 あくまで「記録の継続」)
+- `--stdin` は server thread と並列に立つ。 ターミナルで `lispy>` プロンプトに S 式を打てる
+- 副作用 tool (shell / write-file 等) の y/N 確認は **常駐 process では事実上ブロック** になるので
+  `--yolo` 推奨
 
 ## ライセンス
 
