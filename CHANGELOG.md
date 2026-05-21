@@ -40,17 +40,4 @@
 - `--yolo` フラグ + `(set-yolo #t/#f)` で session 中切替
 
 ### Changed
-- ピボット: `bodies` → `ds4ds4` → `lispy` (project / file / env var prefix の rename を 2 段階で)
 - shell tool の metacharacter 検出 (`;` `&&` `|` backtick `$(` `>` `<`) で allow-list bypass を強制 confirm に倒す
-
-## 2026-05-16~17 — 前史: bodies (agent 層の trajectory tracer)
-
-### Added
-- SQLite (sessions / turns / FTS5 / trigram / meta_events / tasks) + 日付別 md ダンプ
-- 内蔵 tool: `current_time` / `read_file` / `list_dir` / `glob` / `grep` / `recall` / `recall_session` / `task_*` / `web_fetch` / `web_search`
-- `host` CLI: `list` / `dump` / `search` / `cross` / `events` / `domain` / `label`
-- emoji / animal marker (session 識別の視認性)
-- `.env` auto-load (依存追加せず自前パース)
-
-### Changed
-- 「考古学化」 — retrieval (recall / cross / events) 重視、 curator (能動的な提案層) は削除
