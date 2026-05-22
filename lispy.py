@@ -1302,14 +1302,28 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
         _log("intent", s)
         return f"(intent: {s[:80]})"
 
-    def _commit_R(text: Any) -> str:
-        """(commit-R "...") — 「今この R が見えた」 を session に刻む。
-        R は環境から発見される、 という記事の主張への直接の対応。"""
+    def _commit_R(text: Any, *opts: Any) -> str:
+        """(commit-R "..." ['replaces N]) — 「今この R が見えた」 を session に刻む。
+        R は環境から発見される、 という記事の主張への直接の対応。
+
+        'replaces <prev-id> で 「この R が前の R を置換した」 という lineage を残す。
+        prev-id は meta_events.id (host events で見える整数)。"""
         if env.db_conn is None or not env.record_sid:
             return _no_db_msg("commit-R")
+        if len(opts) % 2 != 0:
+            return "(commit-R: options must be paired (key value ...))"
+        opts_dict: dict[str, Any] = {}
+        for i in range(0, len(opts), 2):
+            k = opts[i].name if isinstance(opts[i], Symbol) else _str(opts[i])
+            opts_dict[k] = opts[i + 1]
         s = _str(text)
-        _log("R", s)
-        return f"(R: {s[:80]})"
+        payload = s
+        suffix = ""
+        if "replaces" in opts_dict:
+            payload += f"\n@replaces={opts_dict['replaces']}"
+            suffix = f" (replaces #{opts_dict['replaces']})"
+        _log("R", payload)
+        return f"(R: {s[:80]}{suffix})"
 
     def _commit_K(name: Any, text: Any) -> str:
         """(commit-K name "...") — K 更新を明示。 binding 名 + 学んだことの記録。
@@ -1332,32 +1346,175 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
         _log("artifact", f"{lab}\n{val}")
         return f"(artifact {lab}: stored, {len(val)} chars)"
 
+    def _replay_with_K(env_arg: Any, turn_id: Any) -> str:
+        """(replay-with-K env id) — env の turn 内容を取り、 現 env (= 現 K) で再評価。
+        meta_events に kind=replay で lineage を刻むので、 後で「この turn を K 更新後に
+        replay した」 履歴が辿れる。 純粋に同じ env で再 eval するなら eval-turn-pure を使う。"""
+        if not isinstance(env_arg, Env):
+            return f"(replay-with-K: env が必要、 受け取った: {type(env_arg).__name__})"
+        tid = _str(turn_id)
+        target = env_arg.find_turn(tid)
+        if target is None:
+            return f"(replay-with-K: turn not found: {tid})"
+        if env.db_conn is not None and env.record_sid:
+            head = (target.content or "")[:120]
+            _log("replay", f"{tid}: {head}")
+        try:
+            result = eval_(env, target.content)
+        except Exception as e:
+            return f"(replay-with-K: eval 失敗: {type(e).__name__}: {e})"
+        return f"replay {tid} → {result.text[:200] if hasattr(result, 'text') else _str(result)[:200]}"
+
+    def _diff_K(env1: Any, env2: Any) -> str:
+        """(diff-K env1 env2) — 2 つの env の K (bindings / macros / 状態) を比較。
+        fork-env で counterfactual に分岐させた 2 つの世界の K 差分を取るための観測道具。"""
+        if not isinstance(env1, Env) or not isinstance(env2, Env):
+            return "(diff-K: 2 つの env を渡す)"
+        keys1 = set(env1.bindings.keys())
+        keys2 = set(env2.bindings.keys())
+        only_1 = sorted(k for k in (keys1 - keys2) if not k.startswith("_"))
+        only_2 = sorted(k for k in (keys2 - keys1) if not k.startswith("_"))
+        differing: list[str] = []
+        for k in sorted(keys1 & keys2):
+            if k.startswith("_"):
+                continue
+            v1, v2 = env1.bindings[k], env2.bindings[k]
+            if isinstance(v1, Lambda) and isinstance(v2, Lambda):
+                # λ は body の text 表現で比較 (kind と params も)
+                b1 = v1.body if isinstance(v1.body, str) else _to_lisp_string(v1.body)
+                b2 = v2.body if isinstance(v2.body, str) else _to_lisp_string(v2.body)
+                if v1.kind != v2.kind or v1.params != v2.params or b1 != b2:
+                    differing.append(k)
+            elif v1 is v2:
+                continue
+            else:
+                try:
+                    if v1 != v2:
+                        differing.append(k)
+                except Exception:
+                    pass
+
+        def _truncate_list(xs: list[str], n: int = 12) -> str:
+            shown = ", ".join(xs[:n])
+            return shown + (f", ... (+{len(xs)-n})" if len(xs) > n else "")
+
+        lines = ["diff-K:"]
+        if only_1:
+            lines.append(f"  - {len(only_1)} only in env1: {_truncate_list(only_1)}")
+        if only_2:
+            lines.append(f"  + {len(only_2)} only in env2: {_truncate_list(only_2)}")
+        if differing:
+            lines.append(f"  ~ {len(differing)} differing: {_truncate_list(differing)}")
+        meta_changed = False
+        if len(env1.turns) != len(env2.turns):
+            lines.append(f"  turns:   {len(env1.turns)} → {len(env2.turns)}")
+            meta_changed = True
+        if len(env1.archive) != len(env2.archive):
+            lines.append(f"  archive: {len(env1.archive)} → {len(env2.archive)}")
+            meta_changed = True
+        if len(env1.macros) != len(env2.macros):
+            lines.append(f"  macros:  {len(env1.macros)} → {len(env2.macros)}")
+            meta_changed = True
+        if env1.system != env2.system:
+            lines.append("  system: differs")
+            meta_changed = True
+        if len(lines) == 1 and not meta_changed:
+            return "(diff-K: no differences)"
+        return "\n".join(lines)
+
+    def _test_S_against_R() -> str:
+        """(test-S-against-R) — 現 session の R event 群 と 現 S (agent-step 中心) を
+        LLM に判定させ、 整合性を問う。 結果は meta_events kind=test-S-R に記録。
+
+        記事の K, S ⊢ R の「S が R を満たすか」 の動的 check 版。 R を append-only に積み重ねた
+        まま session を進めると、 ある瞬間に R 間の矛盾や S の取り残しが見えてくる。 その境界を
+        LLM に判定させる。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db_msg("test-S-against-R")
+        rs = env.db_conn.execute(
+            "SELECT id, payload FROM meta_events "
+            "WHERE session_id = ? AND kind = 'R' ORDER BY ts ASC",
+            (env.record_sid,),
+        ).fetchall()
+        if not rs:
+            return "(test-S-against-R: this session has no commit-R events; 何か (commit-R ...) してから)"
+        r_lines = []
+        for r_id, payload in rs:
+            head = (payload or "").split("\n", 1)[0]
+            r_lines.append(f"- [{r_id}] {head}")
+        r_text = "\n".join(r_lines)
+
+        s_parts: list[str] = []
+        agent_step = env.bindings.get("agent-step")
+        if isinstance(agent_step, Lambda):
+            body_str = (agent_step.body if isinstance(agent_step.body, str)
+                        else _to_lisp_string(agent_step.body))
+            s_parts.append(f"agent-step:\n{body_str}")
+        # 直近の artifact があれば一緒に渡す (3 件まで)
+        arts = env.db_conn.execute(
+            "SELECT payload FROM meta_events "
+            "WHERE session_id = ? AND kind = 'artifact' ORDER BY ts DESC LIMIT 3",
+            (env.record_sid,),
+        ).fetchall()
+        if arts:
+            s_parts.append("recent artifacts:\n" + "\n---\n".join(a[0] for a in arts))
+        s_text = "\n\n".join(s_parts) if s_parts else "(現 S 情報なし: agent-step も artifact も無い)"
+
+        prompt_text = (
+            "次の R 群と S が整合しているか判定して。\n"
+            "- R 同士に矛盾があれば指摘\n"
+            "- S が満たせていない R があれば該当 R の id を挙げる\n"
+            "- すべて整合なら OK と 1 行で理由を述べる\n\n"
+            f"R 群:\n{r_text}\n\n"
+            f"S:\n{s_text}\n\n"
+            "判定 (5 行以内):"
+        )
+        try:
+            judgment = _prim_prompt_call(prompt_text).strip()
+        except Exception as e:
+            return f"(test-S-against-R: LLM 失敗: {type(e).__name__}: {e})"
+        _log("test-S-R", judgment)
+        return f"test-S-against-R:\n{judgment}"
+
     def _rk_log() -> str:
-        """(rk-log) — 現 session の intent / R / K / artifact event を時系列で出す。
-        host events と違って、 R/K 系の kind だけ filter + session 限定。"""
+        """(rk-log) — 現 session の intent / R / K / artifact / replay / test-S-R を時系列で。
+        R の @replaces= がある場合は lineage を表示 (例: R#42 ← #18)。"""
         if env.db_conn is None or not env.record_sid:
             return _no_db_msg("rk-log")
         rows = env.db_conn.execute(
-            "SELECT ts, kind, payload FROM meta_events "
-            "WHERE session_id = ? AND kind IN ('intent', 'R', 'K', 'artifact') "
+            "SELECT id, ts, kind, payload FROM meta_events "
+            "WHERE session_id = ? AND kind IN "
+            "  ('intent','R','K','artifact','replay','test-S-R') "
             "ORDER BY ts ASC",
             (env.record_sid,),
         ).fetchall()
         if not rows:
             return "(no R/K/artifact events in this session)"
-        marker = {"intent": "[intent]", "R": "[R]", "K": "[K]", "artifact": "[art]"}
+        marker = {
+            "intent": "[intent]", "R": "[R]", "K": "[K]",
+            "artifact": "[art]", "replay": "[replay]", "test-S-R": "[test]",
+        }
         lines = ["rk-log:"]
-        for _ts, kind, payload in rows:
+        for row_id, _ts, kind, payload in rows:
             head = (payload or "").split("\n", 1)[0]
-            lines.append(f"  {marker.get(kind, '['+kind+']')} {head[:120]}")
+            lineage = ""
+            if kind == "R" and payload:
+                for ln in payload.split("\n")[1:]:
+                    if ln.startswith("@replaces="):
+                        lineage = f" ← #{ln.split('=',1)[1]}"
+                        break
+            lines.append(f"  #{row_id} {marker.get(kind, '['+kind+']')} {head[:120]}{lineage}")
         return "\n".join(lines)
 
     return {
-        "session-intent":   _session_intent,
-        "commit-R":         _commit_R,
-        "commit-K":         _commit_K,
-        "commit-artifact":  _commit_artifact,
-        "rk-log":           _rk_log,
+        "session-intent":    _session_intent,
+        "commit-R":          _commit_R,
+        "commit-K":          _commit_K,
+        "commit-artifact":   _commit_artifact,
+        "rk-log":            _rk_log,
+        "replay-with-K":     _replay_with_K,
+        "diff-K":            _diff_K,
+        "test-S-against-R":  _test_S_against_R,
     }
 
 
@@ -2355,8 +2512,10 @@ def repl() -> None:
     print("LLM opts:   (llm-call env 'temperature 1.5 'logprobs #t 'max-tokens 4096)")
     print("            (llm-call env 'extra (list 'dir-steering-ffn -1.0))  — provider 固有 field")
     print("            (turn-logprobs t) (turn-entropy t)  — 観測の Lisp 値化")
-    print("R/K event:  (session-intent \"...\")  (commit-R \"...\")  (commit-K name \"...\")")
-    print("            (commit-artifact \"label\" expr)  (rk-log)  — meta_events に記録")
+    print("R/K event:  (session-intent \"...\")  (commit-R \"...\" ['replaces N])")
+    print("            (commit-K 'name \"...\")  (commit-artifact \"label\" expr)")
+    print("            (replay-with-K env id)  (diff-K env1 env2)  (test-S-against-R)")
+    print("            (rk-log)  — meta_events に記録、 session_id 単位で検索可能")
     print("Higher:     (set-mode <lambda>)  (clear-mode)  — 平文入力を λ 経由に")
     print("            (eval-turn-pure id)  — env を汚さず再評価 (probe 用素材)")
     print("REPL meta:  !env !archive !quoted !lambdas !turns !reset")
