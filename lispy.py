@@ -327,7 +327,7 @@ BODY_SYSTEM = (
 
 
 def _load_system_prompt() -> str:
-    """lispy.SYSTEM_PROMPT.md を読む。 lispy / nl.py 共有の system prompt 本体。"""
+    """lispy.SYSTEM_PROMPT.md を読む。 system prompt 本体 (Python 外で編集可)。"""
     p = _HERE / "lispy.SYSTEM_PROMPT.md"
     if not p.exists():
         # 起動を止めない最小 fallback。 ファイルを消すと agent としては機能しないが

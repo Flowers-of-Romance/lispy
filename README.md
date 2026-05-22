@@ -40,10 +40,8 @@ lispy/
 ├── lispy.py        # 評価器本体 (live-redefinable agent evaluator)
 ├── host.py         # host environment (DB, read 系 tool 群, LLM client, CLI)
 ├── edit.py         # 副作用 tool (shell / write-file / edit-file / append-file)
-├── nl.py           # 日本語 → S 式 翻訳 REPL (lispy sidecar)
 ├── server.py       # lispy を HTTP で叩ける常駐プロセス (lispy sidecar)
-├── lispy.SYSTEM_PROMPT.md   # lispy / nl 共有の system prompt 本体 (Python 外で編集)
-├── nl.SYSTEM_PROMPT.md      # nl 固有の addendum (翻訳器ルール + binding/tool placeholder)
+├── lispy.SYSTEM_PROMPT.md   # system prompt 本体 (Python 外で編集)
 ├── init.lispy      # 起動時 auto-load: agent-step / compose (言語の seed)
 ├── extras.lispy    # 派生 idiom 集 (list ops, control macros, combinators, match...)  (load で取り込む)
 ├── ds4.lispy       # ds4-server 固有機能 (directional steering / thinking)  (ds4 接続時のみ load)
@@ -1065,64 +1063,6 @@ Scheme R5RS の語彙を一部だけ拾った評価器に LLM lambda と agent �
 | `PRIMITIVES` | + - * / mod abs min max car cdr cons list 型述語 box error 等 |
 | `LISPY_PRIMITIVES` + `EDIT_TOOL_SCHEMA` | agent から tool_call で叩ける 16 ツール (read 系 12 + 副作用系 4) |
 | `BODY_SYSTEM` | LLM lambda 実行時の差し替え system prompt |
-
-## nl: 日本語 → S 式 翻訳 REPL
-
-`nl.py` は **lispy REPL + 日本語翻訳器** の薄い sidecar。 自然文を 1 度 LLM に通して
-S 式に変換し、 そのまま評価器に流す。 lispy 全機能 (binding / tool / macro / meta) は
-そのまま使える。 既存の `lispy.py` / `host.py` / `init.lispy` は触らない。
-
-```bash
-.venv/bin/python nl.py                # 対話 REPL (DB 記録 ON)
-.venv/bin/python nl.py -e "5の階乗"     # ワンショット (記録なし)
-```
-
-`.env` の `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` が要る。 S 式直叩きと `!env` 系
-の meta だけなら LLM 無しでも動く (client は最初の NL 入力で lazy 初期化)。
-
-### 入力の振り分け
-
-- `!...` — lispy の meta コマンド (`!env` `!turns` `!archive` `!quoted` `!lambdas` `!reset`) に委譲
-- `@文` — NL 翻訳器を介さず `lispy.eval_` に直接渡す (= 本来の `agent-step` ルート、
-  tool-calling 多段 loop)
-- `(` で始まる — S 式として直接評価 (継続行は括弧バランスで自動)
-- `"""` だけの行 — 次の `"""` 行までを **NL の複数行入力** として 1 つにまとめる
-- その他平文 — `env.input_mode` が set されていればその lambda 経由 (lispy 互換)、
-  そうでなければ LLM で S 式に翻訳して評価
-
-### 例
-
-```
-nl> 1 から 10 まで足して
-  ;; (define sum (fold + 0 (range 1 11)))
-sum
-55
-
-nl> さっきの結果を 2 倍して
-  ;; (define result 55)
-(* 2 result)
-110
-
-nl> (+ 1 2 3)
-6
-
-nl> @富士山の標高は?
-;; agent-step (lispy 本来の LLM 多段 loop) が走る
-富士山の標高は 3,776 m です。
-```
-
-### 仕様メモ
-
-- 翻訳器には全 (NL ↔ 生成 S 式 + 結果) を **履歴** として積み上げ、 LLM に渡す。
-  「さっきの〜」 「もう一度〜」 系の参照を解決させるため。 個別ターンの eval 結果は
-  600 文字で truncate (read-file 全文等の暴発防止)。 セッション通算の上限は設けない —
-  鬱陶しくなったら `!reset` で env.turns と翻訳履歴を一緒にクリア。
-- 直接 eval した S 式も履歴に入る (LLM が `fib` 等を再参照できる)。
-- 副作用 tool (`shell` / `write_file` / `edit_file` / `append_file`) の prompt 禁止はしない —
-  実行時の y/N 確認 (`edit.py`) に任せる。
-- LLM が誤った S 式を返したり eval が落ちたりしても履歴に残す。 次のターンで自己修正できる。
-- DB 記録は対話モードでのみ ON。 lispy REPL と同じ session 形式で host.db に書く
-  (`host search` / `recall` で振り返れる)。
 
 ## server: HTTP で叩ける常駐 lispy
 
