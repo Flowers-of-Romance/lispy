@@ -1084,6 +1084,7 @@ Claude / nl REPL / 別の bash 端末 / curl から **同じ env を共有** で
 | GET | `/` | — | healthz: `{ok, bindings, tools, session_id}` |
 | GET | `/bindings` | — | env binding 名の一覧 |
 | GET | `/recall` | `?q=&k=5&mode=auto` | host の trajectory recall (FTS5 / trigram) |
+| GET | `/spec` | `?session=current\|all\|<sid>` | R/K/S/artifact ledger を 1 枚 HTML で render (mermaid で R lineage 描画) |
 | POST | `/eval` | `<S 式>` (raw text) | eval して `{ok, result, stdout, error?}` |
 | POST | `/load` | `<file path>` | ファイルから read-all-sexp して全 form を eval |
 | POST | `/reset` | — | env を作り直す (新 session id 発行) |
