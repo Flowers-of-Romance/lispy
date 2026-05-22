@@ -1476,6 +1476,163 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
         _log("test-S-R", judgment)
         return f"test-S-against-R:\n{judgment}"
 
+    def _commit_S(name_arg: Any, *opts: Any) -> str:
+        """(commit-S 'name [rationale]) — 現在の λ binding を meta_events kind=S に snapshot。
+        redefine の各瞬間 を rhythm point として残す。 後で S-history / restore-S / diff-S。
+
+        λ 本体 (body / params / kind / rest_param) を JSON で payload に格納するので、
+        round-trip (= 後日 restore で binding を復元) が安全。 lisp lambda の body は
+        _serialize_sexp で text 化 (quote 付き = read_all_sexp で parse 可能)。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db_msg("commit-S")
+        name = name_arg.name if isinstance(name_arg, Symbol) else _str(name_arg)
+        rationale = _str(opts[0]) if opts else ""
+        val = env.bindings.get(name)
+        if val is None:
+            return f"(commit-S: binding not found: {name})"
+        if not isinstance(val, Lambda):
+            return f"(commit-S: {name} は lambda ではない (got {type(val).__name__}))"
+        if isinstance(val.body, str):
+            body_text = val.body
+        else:
+            # lisp lambda: 各 form を _serialize_sexp で text 化、 改行で連結
+            body_text = "\n".join(_serialize_sexp(f) for f in val.body)
+        payload = json.dumps({
+            "name": name,
+            "kind": val.kind,
+            "params": list(val.params),
+            "rest_param": val.rest_param,
+            "body": body_text,
+            "rationale": rationale,
+        }, ensure_ascii=False)
+        _log("S", payload)
+        suffix = f" — {rationale[:60]}" if rationale else ""
+        return f"(S {name} [{val.kind}]: snapshot stored{suffix})"
+
+    def _S_history(name_arg: Any) -> str:
+        """(S-history 'name) — 指定 λ の commit-S lineage を時系列で。
+        session を跨いで全部出す (= 「実装は終わらないが区切りはある」 の痕跡を辿る)。"""
+        if env.db_conn is None:
+            return _no_db_msg("S-history")
+        name = name_arg.name if isinstance(name_arg, Symbol) else _str(name_arg)
+        rows = env.db_conn.execute(
+            "SELECT id, ts, session_id, payload FROM meta_events "
+            "WHERE kind = 'S' AND payload LIKE ? "
+            "ORDER BY ts ASC",
+            (f'%"name": "{name}"%',),
+        ).fetchall()
+        if not rows:
+            return f"(S-history {name}: no snapshots)"
+        lines = [f"S-history for {name}:"]
+        for row_id, _ts, sid, payload in rows:
+            try:
+                p = json.loads(payload)
+                if p.get("name") != name:
+                    continue  # LIKE で false match した場合 skip
+                r = p.get("rationale", "")
+                body_preview = p.get("body", "").replace("\n", " ")[:80]
+                sid_short = (sid or "?")[:8]
+                tag = r if r else body_preview
+                lines.append(f"  #{row_id} [{sid_short}] {tag[:100]}")
+            except Exception:
+                lines.append(f"  #{row_id} [parse error]")
+        return "\n".join(lines)
+
+    def _restore_S(name_arg: Any, *opts: Any) -> str:
+        """(restore-S 'name [id]) — snapshot を bindings に戻す。 id 省略で最新版。
+        「3 日前の S に戻したい」 / 「翌日に前日の最新 S を pick up」 のための運動。"""
+        if env.db_conn is None:
+            return _no_db_msg("restore-S")
+        name = name_arg.name if isinstance(name_arg, Symbol) else _str(name_arg)
+        if opts:
+            try:
+                target_id = int(opts[0])
+            except (TypeError, ValueError):
+                return f"(restore-S: id は整数: {opts[0]})"
+            row = env.db_conn.execute(
+                "SELECT id, payload FROM meta_events WHERE id = ? AND kind = 'S'",
+                (target_id,),
+            ).fetchone()
+            if row is None:
+                return f"(restore-S: snapshot #{target_id} not found / not kind=S)"
+        else:
+            row = env.db_conn.execute(
+                "SELECT id, payload FROM meta_events "
+                "WHERE kind = 'S' AND payload LIKE ? "
+                "ORDER BY ts DESC LIMIT 1",
+                (f'%"name": "{name}"%',),
+            ).fetchone()
+            if row is None:
+                return f"(restore-S {name}: no snapshots to restore)"
+        row_id, payload = row
+        try:
+            p = json.loads(payload)
+        except Exception as e:
+            return f"(restore-S: payload parse error: {e})"
+        if p.get("name") != name:
+            return f"(restore-S: #{row_id} is for {p.get('name')!r}, not {name!r})"
+        kind = p.get("kind", "llm")
+        body_text = p.get("body", "")
+        if kind == "lisp":
+            try:
+                body = read_all_sexp(body_text)
+            except Exception as e:
+                return f"(restore-S: body parse 失敗: {e})"
+        else:
+            body = body_text
+        lam = Lambda(
+            name=name,
+            params=list(p.get("params", [])),
+            body=body,
+            closure=env,
+            captured=dict(env.bindings),
+            kind=kind,
+            rest_param=p.get("rest_param", ""),
+        )
+        env.bindings[name] = lam
+        if env.record_sid:
+            _log("restore-S", f"{name} ← #{row_id}")
+        return f"(S {name} restored from #{row_id} [{kind}])"
+
+    def _diff_S(name_arg: Any, id1_arg: Any, id2_arg: Any) -> str:
+        """(diff-S 'name id1 id2) — 2 snapshot の body unified diff。
+        「あの時の版から何が変わったか」 を読むための観測道具。"""
+        if env.db_conn is None:
+            return _no_db_msg("diff-S")
+        name = name_arg.name if isinstance(name_arg, Symbol) else _str(name_arg)
+        try:
+            id1, id2 = int(id1_arg), int(id2_arg)
+        except (TypeError, ValueError):
+            return "(diff-S: id1 / id2 は整数)"
+        rows = env.db_conn.execute(
+            "SELECT id, payload FROM meta_events "
+            "WHERE id IN (?, ?) AND kind = 'S' ORDER BY id ASC",
+            (id1, id2),
+        ).fetchall()
+        if len(rows) != 2:
+            return f"(diff-S: snapshot 両方は見つからない (取得 {len(rows)} / 2))"
+        snaps: list[tuple[int, str, str]] = []
+        for r_id, payload in rows:
+            try:
+                p = json.loads(payload)
+                if p.get("name") != name:
+                    return f"(diff-S: #{r_id} は {p.get('name')!r} の snapshot、 {name!r} ではない)"
+                snaps.append((r_id, p.get("body", ""), p.get("rationale", "")))
+            except Exception as e:
+                return f"(diff-S: parse error at #{r_id}: {e})"
+        a_id, a_body, a_r = snaps[0]
+        b_id, b_body, b_r = snaps[1]
+        import difflib
+        diff_lines = list(difflib.unified_diff(
+            a_body.splitlines(), b_body.splitlines(),
+            fromfile=f"#{a_id} {a_r[:40] or '(no rationale)'}",
+            tofile=f"#{b_id} {b_r[:40] or '(no rationale)'}",
+            lineterm="",
+        ))
+        if not diff_lines:
+            return f"(diff-S {name}: #{a_id} == #{b_id}, no body change)"
+        return "\n".join(diff_lines)
+
     def _rk_log() -> str:
         """(rk-log) — 現 session の intent / R / K / artifact / replay / test-S-R を時系列で。
         R の @replaces= がある場合は lineage を表示 (例: R#42 ← #18)。"""
@@ -1484,15 +1641,16 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
         rows = env.db_conn.execute(
             "SELECT id, ts, kind, payload FROM meta_events "
             "WHERE session_id = ? AND kind IN "
-            "  ('intent','R','K','artifact','replay','test-S-R') "
+            "  ('intent','R','K','S','artifact','replay','test-S-R','restore-S') "
             "ORDER BY ts ASC",
             (env.record_sid,),
         ).fetchall()
         if not rows:
-            return "(no R/K/artifact events in this session)"
+            return "(no R/K/S/artifact events in this session)"
         marker = {
-            "intent": "[intent]", "R": "[R]", "K": "[K]",
-            "artifact": "[art]", "replay": "[replay]", "test-S-R": "[test]",
+            "intent": "[intent]", "R": "[R]", "K": "[K]", "S": "[S]",
+            "artifact": "[art]", "replay": "[replay]",
+            "test-S-R": "[test]", "restore-S": "[restore]",
         }
         lines = ["rk-log:"]
         for row_id, _ts, kind, payload in rows:
@@ -1503,17 +1661,31 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
                     if ln.startswith("@replaces="):
                         lineage = f" ← #{ln.split('=',1)[1]}"
                         break
-            lines.append(f"  #{row_id} {marker.get(kind, '['+kind+']')} {head[:120]}{lineage}")
+            if kind == "S":
+                # payload は JSON。 name + rationale だけ抽出して短く出す。
+                try:
+                    p = json.loads(payload)
+                    name = p.get("name", "?")
+                    r = p.get("rationale", "")
+                    body_preview = p.get("body", "").replace("\n", " ")[:50]
+                    head = f"{name} [{p.get('kind','?')}]" + (f" — {r}" if r else f" — {body_preview}")
+                except Exception:
+                    pass
+            lines.append(f"  #{row_id} {marker.get(kind, '['+kind+']')} {head[:140]}{lineage}")
         return "\n".join(lines)
 
     return {
         "session-intent":    _session_intent,
         "commit-R":          _commit_R,
         "commit-K":          _commit_K,
+        "commit-S":          _commit_S,
         "commit-artifact":   _commit_artifact,
         "rk-log":            _rk_log,
         "replay-with-K":     _replay_with_K,
         "diff-K":            _diff_K,
+        "diff-S":            _diff_S,
+        "S-history":         _S_history,
+        "restore-S":         _restore_S,
         "test-S-against-R":  _test_S_against_R,
     }
 
@@ -2515,6 +2687,8 @@ def repl() -> None:
     print("R/K event:  (session-intent \"...\")  (commit-R \"...\" ['replaces N])")
     print("            (commit-K 'name \"...\")  (commit-artifact \"label\" expr)")
     print("            (replay-with-K env id)  (diff-K env1 env2)  (test-S-against-R)")
+    print("S lineage:  (commit-S 'name [\"rationale\"])  (S-history 'name)")
+    print("            (restore-S 'name [id])  (diff-S 'name id1 id2)")
     print("            (rk-log)  — meta_events に記録、 session_id 単位で検索可能")
     print("Higher:     (set-mode <lambda>)  (clear-mode)  — 平文入力を λ 経由に")
     print("            (eval-turn-pure id)  — env を汚さず再評価 (probe 用素材)")
