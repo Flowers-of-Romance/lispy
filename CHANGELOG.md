@@ -3,10 +3,29 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
-## Unreleased
+## 2026-05-22 — R/K event ledger + ds4 拡張
 
 ### Added
-- `server.py` — lispy を HTTP で叩ける常駐プロセス。 env をプロセス内に持ち、 Claude / nl REPL / 別 bash から **同じ env を共有** できる
+- R/K event ledger の primitive 12 個 — session を跨ぐ要求 / 知識 / 仕様の append-only 記録
+  - 刻む: `session-intent` / `commit-R` (`'replaces N` で lineage) / `commit-K` / `commit-S` / `commit-artifact`
+  - 観測: `rk-log` (intent/R/K/S/artifact/replay/test-S-R/restore-S を時系列 + lineage 付き)
+  - lineage / 復元 / 比較: `S-history` / `restore-S` (id 省略で最新、 lisp/llm 両 kind) / `diff-S` (unified diff) / `diff-K` (env 比較)
+  - 動的 check: `test-S-against-R` (LLM に R 群と S の整合性を判定させ ledger に記録) / `replay-with-K` (過去 turn を 現 K で再評価)
+- `'extra` plist passthrough を `llm-call` の option に追加 — `(llm-call env 'extra (list 'foo 1 'bar 2))` で OpenAI SDK の `extra_body=` に流す。 kebab-case → snake_case 自動変換、 provider 固有 field を lispy.py 改変なしで通せる
+- `ds4.lispy` — ds4-server 接続時のみ load する派生 idiom 集
+  - thinking mode 制御: `think-on` / `think-off` / `(think-effort "max")`
+  - directional steering: `steering` / `steering+` / `steer-call` / `steer-sweep` / `steer-debate` / `steer-entropy-curve`
+- README に 2 つの大セクション追加 — `ds4-server 接続時の拡張` (言語拡張 配下) と `R/K event ledger — 終わらない実装、 でも区切りはある`
+- REPL help に R/K event / S lineage / `'extra` plist の行追加
+
+### Removed
+- `nl.py` (309 行) / `nl.SYSTEM_PROMPT.md` (39 行) — 日本語 → S 式 翻訳 REPL の役割が main REPL + agent-step + `(set-mode <translator>)` に吸収。 翻訳機能を復活させたい場合は 15 行の λ + `set-mode` で `.lispy` ファイル化可能 (README の言語拡張 / R/K event ledger 参照)
+- README の `## nl: 日本語 → S 式 翻訳 REPL` セクション全体
+
+## 2026-05-21 — server (HTTP daemon)
+
+### Added
+- `server.py` — lispy を HTTP で叩ける常駐プロセス。 env をプロセス内に持ち、 Claude / 別 REPL / 別 bash から **同じ env を共有** できる
   - endpoints: `GET /` (healthz) / `GET /bindings` / `GET /recall?q=` / `POST /eval` / `POST /load` / `POST /reset`
   - CLI: `--host` `--port` `--yolo` `--session <id>` (既存 session に append) `--stdin` (server と並列の REPL)
   - evaluation は `threading.Lock` で serialize、 `(print ...)` の stdout は HTTP response の `stdout` field に捕捉
