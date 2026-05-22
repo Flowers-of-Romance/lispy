@@ -2,7 +2,7 @@
 
 **走らせながら評価規則を書き換えられる agent 評価器**。
 
-設計と実装と評価が同じ層で起きる場所。plan / implement / evaluate の分離がない、
+設計と実装と評価が同じ層で起きる場所。plan / implement / evaluate の分離がない。
 
 **agent loop が S 式の binding** 
 
