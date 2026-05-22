@@ -1,0 +1,90 @@
+;; ds4.lispy — ds4-server (DwarfStar 4 / DeepSeek V4 Flash) 固有機能の lispy binding 集
+;;
+;; 使い方:
+;;   main> (load "ds4.lispy")
+;;
+;; extras.lispy が provider 非依存 の Lisp idiom 集なのに対して、 こちらは
+;; ds4-server を LLM_BASE_URL に据えてる前提の拡張群。 他 provider (OpenAI /
+;; Anthropic / OpenRouter 等) では extra_body の field が無視される か エラーに
+;; なる ので、 ds4 接続時のみ load する。
+;;
+;; provider 経路は lispy.py の `(llm-call env 'extra <plist>)` で OpenAI SDK の
+;; extra_body= に流す穴。 kebab-case の key は snake_case に boundary で変換。
+;;
+;; ds4 が提供する per-request 拡張:
+;;   - thinking モード (think / reasoning_effort)
+;;   - directional steering (dir-steering-ffn / dir-steering-attn)
+;;   - その他 ds4 拡張は同じ 'extra 経路で足せる
+
+
+;; ===========================================================================
+;; thinking mode — ds4 の reasoning effort を per-call で切り替える
+;; ===========================================================================
+;;
+;; ds4 は thinking を level で持つ:
+;;   "max" / "high" / "medium" / "low" / "minimal" — 全部 HIGH 相当に倒れる
+;;   (内部 expose は HIGH/MAX のみ)、 "none" だけが thinking off。
+;;   "max" は MAX レベルで thinking 重め。
+;;
+;; lispy.py の `(llm-call env 'think #t)` は bool 切替だけ (extra_body の `think`)。
+;; reasoning_effort の文字列を per-call で渡したいときに使う:
+
+(define think-effort
+  (lambda (level) (list 'reasoning-effort level)))
+
+;; think — bool で thinking on/off。 既存の 'think option と等価だが plist として扱える。
+(define think-on  (list 'think #t))
+(define think-off (list 'think #f))
+
+
+;; ===========================================================================
+;; directional steering — per-request scale 制御
+;; ===========================================================================
+;;
+;; 前提: ds4-server を `--dir-steering-file FILE` 付きで起動しておく。
+;; vector は server 起動時に固定 (1 vector / server)、 scale だけ per-request に flip できる。
+;; 別 vector を試したいなら別 port で別 server を立てる。
+;;
+;; 符号の規約 (式: y = y - scale * dir * dot(dir, y)):
+;;   正 scale → vector 方向を 抑制 (build_direction.py の good - bad の good 側を消す)
+;;   負 scale → vector 方向を 増幅 (good 側を強める)
+;; verbosity vector (= succinct - verbose) なら +1 で verbose 寄り、 -1 で succinct 寄り。
+;;
+;;   (llm-call env 'extra (steering -1.0))           ;; good 方向を増幅
+;;   (llm-call env 'extra (steering+ -1.0 0.5))      ;; ffn / attn 別指定
+;;   (steer-sweep env '(-1 0 1 2))                   ;; 同 env で scale を振って観測
+;;   (steer-debate env -1 2)                         ;; 両端 1 発ずつ生成し (low high)
+
+;; steering — ffn だけ与える (一番よく使う)。 attn は 0。
+(define steering
+  (lambda (ffn) (list 'dir-steering-ffn ffn 'dir-steering-attn 0)))
+
+;; steering+ — ffn と attn の両方を与える。
+(define steering+
+  (lambda (ffn attn) (list 'dir-steering-ffn ffn 'dir-steering-attn attn)))
+
+;; steer-call — env を mutate せず、 1 発だけ steered llm-call を返す。
+(define steer-call
+  (lambda (env ffn) (llm-call env 'extra (steering ffn))))
+
+;; steer-sweep — 同じ env を複数 scale で投げ、 (scale text) のペア list を返す。
+;; env.turns は読むだけで append しない。 比較・観測用。
+(define steer-sweep
+  (lambda (env scales)
+    (map (lambda (s) (list s (turn-content (steer-call env s)))) scales)))
+
+;; steer-debate — 両端 scale で 1 つずつ生成し (low-text high-text) を返す。
+;; turns は mutate しない。 結果を critique / compare に流すための素材。
+(define steer-debate
+  (lambda (env low high)
+    (list (turn-content (steer-call env low))
+          (turn-content (steer-call env high)))))
+
+;; steer-entropy-curve — scale ごとに mean entropy を測る。 logprobs 経由。
+;; 「steering をかけると確信度がどう変わるか」 の観測用。 (scale entropy) ペア list。
+(define steer-entropy-curve
+  (lambda (env scales)
+    (map (lambda (s)
+           (let ((r (llm-call env 'extra (steering s) 'logprobs #t 'max-tokens 64)))
+             (list s (turn-entropy r))))
+         scales)))
