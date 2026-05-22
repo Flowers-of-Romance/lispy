@@ -46,6 +46,7 @@ lispy/
 ├── nl.SYSTEM_PROMPT.md      # nl 固有の addendum (翻訳器ルール + binding/tool placeholder)
 ├── init.lispy      # 起動時 auto-load: agent-step / compose (言語の seed)
 ├── extras.lispy    # 派生 idiom 集 (list ops, control macros, combinators, match...)  (load で取り込む)
+├── ds4.lispy       # ds4-server 固有機能 (directional steering / thinking)  (ds4 接続時のみ load)
 ├── host.db         # SQLite (sessions, turns, FTS5, meta_events, tasks)
 ├── data/
 │   └── turns/      # 日付別 md (DB から再生成可能)
@@ -648,7 +649,17 @@ debate / counterfactual / parallel sampling を S 式だけで組める素地。
 ```
 
 option は plist 形式 (`'key value 'key value`)。 サポート: `temperature` / `max-tokens` / `logprobs` /
-`top-logprobs` / `think`。
+`top-logprobs` / `think` / `extra`。
+
+`'extra` は provider 固有 field を OpenAI SDK の `extra_body=` にそのまま流す窓口で、 plist を取る:
+
+```lisp
+(llm-call env 'extra (list 'dir-steering-ffn -1.0 'dir-steering-attn 0.5))
+;; → kebab-case の key は snake_case に変換、 extra_body={'dir_steering_ffn': -1.0, ...} で送る
+```
+
+これを使えば ds4 / OpenRouter / OpenAI 固有の拡張 (= 標準 OAI 仕様にない field) を lispy.py を触らず通せる。
+ds4 の directional steering を per-request に flip するのが典型 (後述 ds4.lispy を参照)。
 
 #### 型述語
 
@@ -692,6 +703,52 @@ main> (yolo?)                             ; 現状確認
 
 allow-list は `;` `&&` `|` backtick `$(` 等 shell metacharacter を検出すると無効化されるので、
 `(shell "git status; rm -rf /")` は素通しせず confirm が出る。
+
+#### ds4.lispy (ds4-server 接続時の拡張)
+
+`ds4.lispy` は ds4-server (DwarfStar 4 / DeepSeek V4 Flash) を `LLM_BASE_URL` に
+据えてるときだけ load する派生 idiom 集。 他 provider (OpenAI / Anthropic / OpenRouter)
+では `extra_body` の field が無視 or error になる ので、 接続先で出し分ける:
+
+```lisp
+main> (load "ds4.lispy")
+```
+
+提供してる軸は 2 つ:
+
+**(a) thinking mode の per-call 制御** — `think-on` / `think-off` / `(think-effort "max")`。
+ds4 は reasoning effort を `"max"` (= Think Max) / `"high"` (default) / `"none"` で切れる。
+
+**(b) directional steering の per-request scale 制御** — ds4-server を
+`--dir-steering-file FILE` で起動しておけば、 vector 方向の scale を per-request に flip できる。
+vector は server 起動時に 1 つ固定 (別 vector が要るなら別 port で別 server)。
+
+符号の規約 (式: `y = y - scale * dir * dot(dir, y)`):
+- **正 scale → vector 方向を 抑制** (build_direction.py の good - bad の good 側を消す)
+- **負 scale → vector 方向を 増幅** (good 側を強める)
+
+verbosity vector (= succinct - verbose) なら `+1` で verbose 寄り、 `-1` で succinct 寄り。
+
+```lisp
+(steering -1.0)                          ;; ffn scale だけ。 attn は 0。 plist で返る
+(steering+ -1.0 0.5)                     ;; ffn / attn 両方指定
+(llm-call env 'extra (steering -1.0))    ;; 直接 1 発投げる
+(steer-call env -1.0)                    ;; 上の shortcut
+
+(steer-sweep env '(-1 0 1 2))            ;; 同 env で 4 段階 scale を振って観測
+;; → ((-1 "短い 応答") (0 "通常") (1 "長め") (2 "詳細"))
+
+(steer-debate env -1 2)                  ;; 両端 1 発ずつ生成し (low-text high-text)
+
+(steer-entropy-curve env '(-1 0 1 2))    ;; scale ごとに mean entropy を測る
+;; → ((-1 0.42) (0 0.58) (1 0.71) (2 0.95))
+```
+
+`fork-env` × `(steering ...)` で **「同じ env / system / turns、 activation 方向だけズラした
+counterfactual」** が組める。 lispy が固有に持つ位置付け (steering を first-class 値として
+扱える唯一の LLM client)。
+
+ds4 fork (上記の per-request scale patch) は: https://github.com/Flowers-of-Romance/ds4
 
 ### 使い方の典型 (Cookbook)
 
@@ -883,11 +940,95 @@ main> 富士山の標高は？    ; 元に戻った
 - S 式 (`(...)` で始まる) はモードに関係なく直接評価される
 - `(clear-mode)` または `(set-mode)` で解除
 
+### R/K event ledger — 終わらない実装、 でも区切りはある
+
+lispy が向き合ってる problem は **「SDD のように R (要件) を事前に書き下せない開発」**。
+Kent Beck の TDD/XP を「技法」 ではなく「R/K/S の動的発見の運動」 として読む
+([参考記事](https://zenn.dev/j_m/articles/e8ff79acc5c609)) と、 lispy の primitive 群は
+ちょうどその運動を支える形に並ぶ:
+
+| 概念 (記事) | lispy の対応 |
+|---|---|
+| **R** — 環境にある、 事前に書き下せない要求 | `commit-R` で append-only ledger に刻む |
+| **S** — 実行可能な仕様 / 実装 | `define` の λ binding、 `commit-S` で snapshot |
+| **K** — チームの判断密度 / 蓄積知識 | `bindings` / `fork-env` / `commit-K` |
+| **K, S ⊢ R** が動的 | `test-S-against-R` で LLM に整合性を判定させる |
+
+「実装は終わらない、 でも区切りはある」 を物理的に支えるために、 12 の primitive を用意:
+
+```lisp
+;; R/K/S/artifact event を ledger に刻む
+(session-intent "...")                ;; この session の artifact 宣言
+(commit-R "...")                      ;; R が見えた瞬間
+(commit-R "..." 'replaces N)          ;; R の変更 (旧 event id を lineage に)
+(commit-K 'name "...")                ;; 学んだことを binding に紐付け
+(commit-S 'name ["rationale"])        ;; 現 λ body を snapshot
+(commit-artifact "label" expr)        ;; 外に持ち出せる成果を明示
+
+;; 観測 / 比較 / 復元
+(rk-log)                              ;; 全 event を時系列 + lineage で表示
+(S-history 'name)                     ;; 指定 λ の commit lineage を session 跨いで
+(restore-S 'name [id])                ;; 旧 snapshot を bindings に戻す (id 省略で最新)
+(diff-S 'name id1 id2)                ;; 2 snapshot の body unified diff
+(diff-K env1 env2)                    ;; fork-env した 2 env の K 差分
+(replay-with-K env id)                ;; 過去 turn を 現 K で再評価 + replay event 記録
+(test-S-against-R)                    ;; LLM に R 群と S の整合性判定 + 結果を ledger に
+```
+
+全部 既存の `host.log_meta` 経由で `meta_events` テーブルに書く。 `host events --kind R / K / S /
+intent / artifact / test-S-R / replay / restore-S` で CLI からも検索可能。
+session_id 単位なので 後日 cross-session で振り返れる。
+
+#### 典型的な多日 session の流れ
+
+```lisp
+;; 1 日目
+main> (session-intent "user 入力から要約を作る tool")
+main> (commit-R "要約は 3 行、 簡潔に")
+main> (define summarize (lambda (x) "次を 3 行で要約: {x}"))
+main> (commit-S 'summarize "v1: 3 行で要約")
+main> (commit-artifact "summarize-v1" (lambda-body (lookup "summarize")))
+
+;; 2 日目 — 実際に動かしたら「違う」 と気づいた
+main> (load-session ...)  ;; or (restore-S 'summarize)
+main> (commit-R "実際 user に見せたら『bullet 欲しい』 と言われた。 R が動いた"
+                'replaces 2)
+main> (commit-K 'summarize "3 行より bullet の方が R に合う")
+main> (define summarize (lambda (x) "次を 3-5 個の bullet で要約: {x}"))
+main> (commit-S 'summarize "v2: bullet 形式に")
+
+;; 3 日目 — R が積み重なって、 S が満たせてるか不安
+main> (test-S-against-R)
+;; → LLM 判定: #4 (R v2) は満たすが #2 (R v1) との整合が怪しい...
+
+;; 振り返り
+main> (rk-log)
+rk-log:
+  #1 [intent] user 入力から要約を作る tool
+  #2 [R] 要約は 3 行、 簡潔に
+  #3 [S] summarize [llm] — v1: 3 行で要約
+  #4 [art] summarize-v1
+  #5 [R] 実際 user に見せたら... ← #2
+  #6 [K] summarize: 3 行より bullet の方が R に合う
+  #7 [S] summarize [llm] — v2: bullet 形式に
+  #8 [test] LLM 判定...
+```
+
+#### 設計の含意
+
+- **「やり直し」 概念が存在しない** — R が変わっても旧 R は ledger に残り、 新 R は append される。 spec doc を書き直す ≠ ledger に積む
+- **session を跨いで実装が継続する** — `commit-S` した λ body は DB に持続、 翌日 `restore-S` で復帰。 server.py 経由なら process 生存中 env そのまま
+- **観測道具が ledger backed** — `rk-log` / `S-history` / `diff-S` / `diff-K` は memory ではなく DB を読む。 落ちても残る
+- **「区切り」 は user が明示的に刻む** — `commit-artifact` を打った瞬間が rhythm point。 道具は強要しない、 user の判断
+
+これは production-y な「コードを書く agent」 ではなく **「R/K 発見運動の盤」** という lispy 固有の位置付け。
+ds4-agent / Claude Code が S の高速生成に最適化されてるのに対して、 lispy は R/K の判断密度を引き受ける所に居る。
+
 ### 落とし穴
 
 実際に試して引っかかりやすい点:
 
-- **λ は session を跨いで残らない** — REPL を再起動したら `(lambda critique ...)` から打ち直し。`!lambdas` / `(lambdas)` で確認できる
+- **λ は session を跨いで残らない (default)** — REPL を再起動したら `(lambda critique ...)` から打ち直し。`!lambdas` / `(lambdas)` で確認できる。 永続化したい λ は `(commit-S 'name "...")` で snapshot し、 翌日 `(restore-S 'name)` で bindings に戻す。 server.py 経由なら process 生存中 env そのまま (落とすまで)
 - **`(critique ...)` `(rate ...)` などは README の例の名前** — 実環境では未定義。未束縛の symbol を関数呼び出しすると次のエラーで落ちる:
   ```
   main> (critique (turn "last-assistant"))
