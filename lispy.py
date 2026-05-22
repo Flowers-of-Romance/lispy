@@ -1326,6 +1326,9 @@ def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
       'logprobs #t         — 各 token の logprob を Turn.logprobs に詰める
       'top-logprobs 5      — 各 token に対して上位 N 候補も取る (要 'logprobs #t)
       'think #t            — DeepSeek の thinking モード (default off)
+      'extra (list k v...) — 任意の追加 field を OpenAI SDK の extra_body に流す。
+                             kebab-case の key は snake_case に変換される。
+                             ds4 拡張 (dir-steering-ffn 等) はここから通す。
 
     agent loop を S 式で書くための基盤。 template 展開 / auto-eval / 履歴 append は **しない**。
     呼び出し側で `(append-turn env response)` を打つ責任がある (= loop の規則が S 式に出る)。
@@ -1348,6 +1351,17 @@ def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
             kwargs["top_logprobs"] = int(opts_dict["top-logprobs"])
     max_tok = int(opts_dict.get("max-tokens", 2048))
     extra = {"think": bool(_truthy(opts_dict.get("think", False)))}
+    if "extra" in opts_dict:
+        # 'extra (list 'dir-steering-ffn -1.0 'dir-steering-attn 0.5) のような plist。
+        # ds4 拡張など、 lispy.py を再び触らずに provider 固有 field を流すための窓口。
+        extra_arg = opts_dict["extra"]
+        if not isinstance(extra_arg, list):
+            raise ValueError("llm-call: 'extra value must be a plist (use list ...)")
+        if len(extra_arg) % 2 != 0:
+            raise ValueError("llm-call: 'extra plist must be paired (k v ...)")
+        for i in range(0, len(extra_arg), 2):
+            ek = extra_arg[i].name if isinstance(extra_arg[i], Symbol) else str(extra_arg[i])
+            extra[ek.replace("-", "_")] = extra_arg[i + 1]
 
     client = host.get_client()
     resp = client.chat.completions.create(
@@ -2251,6 +2265,7 @@ def repl() -> None:
     print("            (renew \"carry\")  (quote-turn expr)  (eval-turn id)  (spawn \"task\")")
     print("            (fork-env env 'system \"...\")  — env を first-class に copy + override")
     print("LLM opts:   (llm-call env 'temperature 1.5 'logprobs #t 'max-tokens 4096)")
+    print("            (llm-call env 'extra (list 'dir-steering-ffn -1.0))  — provider 固有 field")
     print("            (turn-logprobs t) (turn-entropy t)  — 観測の Lisp 値化")
     print("Higher:     (set-mode <lambda>)  (clear-mode)  — 平文入力を λ 経由に")
     print("            (eval-turn-pure id)  — env を汚さず再評価 (probe 用素材)")
