@@ -1275,6 +1275,92 @@ def _prim_label_factory(env: Env) -> Callable[..., Any]:
     return _label
 
 
+def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
+    """R/K 発見運動の primitive 群。 meta_events ledger に kind=intent/R/K/artifact で書く。
+
+    動機: lispy session は終わらない運動だが、 局所的な 「R が見えた」 「K が更新された」
+    「外に持ち出せる artifact ができた」 という rhythm point を明示的に刻むための道具。
+    後で host events / host search で振り返れる (meta_events は FTS には乗らないが
+    session_id で検索可能)。
+    """
+
+    def _no_db_msg(name: str) -> str:
+        return f"({name}: no db / sid — record=True で session を開く必要あり)"
+
+    def _str(v: Any) -> str:
+        return v if isinstance(v, str) else _to_lisp_string(v)
+
+    def _log(kind: str, payload: str) -> None:
+        host.log_meta(env.db_conn, kind, sid=env.record_sid, payload=payload)
+
+    def _session_intent(text: Any) -> str:
+        """(session-intent "...") — この session で何を artifact として外に出すか宣言。
+        運動を始める前の R 宣言 (= 「ここで何を発見したいか」)。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db_msg("session-intent")
+        s = _str(text)
+        _log("intent", s)
+        return f"(intent: {s[:80]})"
+
+    def _commit_R(text: Any) -> str:
+        """(commit-R "...") — 「今この R が見えた」 を session に刻む。
+        R は環境から発見される、 という記事の主張への直接の対応。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db_msg("commit-R")
+        s = _str(text)
+        _log("R", s)
+        return f"(R: {s[:80]})"
+
+    def _commit_K(name: Any, text: Any) -> str:
+        """(commit-K name "...") — K 更新を明示。 binding 名 + 学んだことの記録。
+        既存 λ / value に対する「ここまで分かった」 のメタ層。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db_msg("commit-K")
+        n = name.name if isinstance(name, Symbol) else _str(name)
+        s = _str(text)
+        _log("K", f"{n}: {s}")
+        return f"(K {n}: {s[:60]})"
+
+    def _commit_artifact(label: Any, value: Any) -> str:
+        """(commit-artifact "label" expr) — 外に持ち出せる artifact を明示。
+        session が終わらない運動だとしても、 各 rhythm point で「これは出した」 を残す。
+        value は string / list / lambda / number、 全部 _to_lisp_string で text 化。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db_msg("commit-artifact")
+        lab = _str(label)
+        val = _str(value)
+        _log("artifact", f"{lab}\n{val}")
+        return f"(artifact {lab}: stored, {len(val)} chars)"
+
+    def _rk_log() -> str:
+        """(rk-log) — 現 session の intent / R / K / artifact event を時系列で出す。
+        host events と違って、 R/K 系の kind だけ filter + session 限定。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db_msg("rk-log")
+        rows = env.db_conn.execute(
+            "SELECT ts, kind, payload FROM meta_events "
+            "WHERE session_id = ? AND kind IN ('intent', 'R', 'K', 'artifact') "
+            "ORDER BY ts ASC",
+            (env.record_sid,),
+        ).fetchall()
+        if not rows:
+            return "(no R/K/artifact events in this session)"
+        marker = {"intent": "[intent]", "R": "[R]", "K": "[K]", "artifact": "[art]"}
+        lines = ["rk-log:"]
+        for _ts, kind, payload in rows:
+            head = (payload or "").split("\n", 1)[0]
+            lines.append(f"  {marker.get(kind, '['+kind+']')} {head[:120]}")
+        return "\n".join(lines)
+
+    return {
+        "session-intent":   _session_intent,
+        "commit-R":         _commit_R,
+        "commit-K":         _commit_K,
+        "commit-artifact":  _commit_artifact,
+        "rk-log":           _rk_log,
+    }
+
+
 def _prim_load_factory(env: Env) -> Callable[..., Any]:
     """(load "path.lispy") — ファイル内の全 S 式を順に evaluate。
 
@@ -2109,6 +2195,8 @@ def _install_meta_primitives(env: Env) -> None:
     env.bindings["lookup"] = _prim_lookup_factory(env)
     env.bindings["load"] = _prim_load_factory(env)
     env.bindings["label"] = _prim_label_factory(env)
+    # R/K 発見運動の primitive 群 (session-intent / commit-R / commit-K / commit-artifact / rk-log)
+    env.bindings.update(_prim_rk_factory(env))
     env.bindings["archive-turns"] = _prim_archive_turns_factory(env)
     env.bindings["set-mode"] = _prim_set_mode_factory(env)
     env.bindings["clear-mode"] = _prim_clear_mode_factory(env)
@@ -2267,6 +2355,8 @@ def repl() -> None:
     print("LLM opts:   (llm-call env 'temperature 1.5 'logprobs #t 'max-tokens 4096)")
     print("            (llm-call env 'extra (list 'dir-steering-ffn -1.0))  — provider 固有 field")
     print("            (turn-logprobs t) (turn-entropy t)  — 観測の Lisp 値化")
+    print("R/K event:  (session-intent \"...\")  (commit-R \"...\")  (commit-K name \"...\")")
+    print("            (commit-artifact \"label\" expr)  (rk-log)  — meta_events に記録")
     print("Higher:     (set-mode <lambda>)  (clear-mode)  — 平文入力を λ 経由に")
     print("            (eval-turn-pure id)  — env を汚さず再評価 (probe 用素材)")
     print("REPL meta:  !env !archive !quoted !lambdas !turns !reset")
