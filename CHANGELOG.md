@@ -3,6 +3,26 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-05-24 — RDD (Requirement-Don't-Die) と server.py 主経路化
+
+**RDD = Requirement-Don't-Die** — lispy の SDD 方式の呼称を導入。 R は append-only、
+`'replaces` で lineage は動くが原本は消えない。 SDD の形式張った workflow との対比で、
+RDD は opportunistic / LLM-callable / ledger-resident。
+
+### Added
+- `commit-R` に LLM auto-judge (a/b/c) — RDD curator
+  - `'replaces N` 無しで `commit-R` を打つと、 LLM が現 session の既存 R 群と照合して
+    a (= 無関係追加) / b (= refines R#N) / c (= contradicts R#N) を判定
+  - payload に `@judge=*` / `@judge-target=N` / `@judge-reason` / `@judge-impact` を残す
+  - `@replaces=` は自動付与しない (= advisory only; ledger は append-only 維持、
+    上流 LLM が同意するなら次 turn で explicit `'replaces` 付きで commit し直す)
+  - LLM 失敗時は `@judge-error` を残して通常 commit (= 致命傷にならない)
+- `lispy-server` を `pyproject.toml` の CLI entry に昇格 — `server.py --stdin` を主経路化
+  - `lispy-server --stdin --yolo` で REPL + HTTP server + `/spec` (R/K/S/artifact 1 枚 HTML) が同時に立つ
+
+### Changed
+- `README.md` を `docs/reference.md` に rename — ルートを軽くする (新 README は workflow が固まってから書く)
+
 ## 2026-05-22 — R/K event ledger + ds4 拡張
 
 ### Added
