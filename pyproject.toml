@@ -11,15 +11,17 @@ dependencies = [
 [project.scripts]
 lispy = "lispy:main"
 host = "host:main"
+lispy-server = "server:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["host.py", "lispy.py", "edit.py"]
+only-include = ["host.py", "lispy.py", "edit.py", "server.py"]
 
 [tool.hatch.build.targets.wheel.sources]
 "host.py" = "host.py"
 "lispy.py" = "lispy.py"
 "edit.py" = "edit.py"
+"server.py" = "server.py"
