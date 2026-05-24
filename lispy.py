@@ -1302,12 +1302,53 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
         _log("intent", s)
         return f"(intent: {s[:80]})"
 
+    def _parse_judge_lines(text: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for line in text.split("\n"):
+            line = line.strip()
+            if ":" not in line:
+                continue
+            k, _, v = line.partition(":")
+            k = k.strip().lower()
+            v = v.strip()
+            if k in ("class", "target", "reason", "impact"):
+                result[k] = v
+        return result
+
+    def _judge_new_R(prior: list, new_text: str) -> dict[str, str]:
+        r_lines = []
+        for r_id, payload in prior:
+            head_text = (payload or "").split("\n", 1)[0]
+            r_lines.append(f"- [{r_id}] {head_text[:120]}")
+        prompt_text = (
+            "新しい R event を ledger に追加する。 既存 R 群との関係を判定して。\n\n"
+            "class:\n"
+            "  a = 既存 R と無関係な追加\n"
+            "  b = 既存 R#N を精緻化 (refines、 矛盾しない)\n"
+            "  c = 既存 R#N と矛盾 (contradicts)\n\n"
+            "既存 R 群:\n" + "\n".join(r_lines) + "\n\n"
+            f"新 R:\n{new_text}\n\n"
+            "次の 4 行のみで返して (他は書かない):\n"
+            "class: a | b | c\n"
+            "target: <既存 R id, class=b or c のとき> | none\n"
+            "reason: <1 行、 60 字以内>\n"
+            "impact: <S や artifact への影響、 1 行 60 字以内>\n"
+        )
+        out = _prim_prompt_call(prompt_text).strip()
+        return _parse_judge_lines(out)
+
     def _commit_R(text: Any, *opts: Any) -> str:
         """(commit-R "..." ['replaces N]) — 「今この R が見えた」 を session に刻む。
         R は環境から発見される、 という記事の主張への直接の対応。
 
         'replaces <prev-id> で 「この R が前の R を置換した」 という lineage を残す。
-        prev-id は meta_events.id (host events で見える整数)。"""
+        prev-id は meta_events.id (host events で見える整数)。
+
+        'replaces 無しで commit すると、 LLM が現 session の既存 R 群と照合して
+        a (= 無関係追加) / b (= refines R#N) / c (= contradicts R#N) を判定し、
+        payload に @judge=* / @judge-target=N / @judge-reason / @judge-impact を残す。
+        @replaces= は自動付与しない (= advisory only; 上書きしたい場合は再度
+        explicit 'replaces で commit-R を打ち直す)。"""
         if env.db_conn is None or not env.record_sid:
             return _no_db_msg("commit-R")
         if len(opts) % 2 != 0:
@@ -1319,11 +1360,50 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
         s = _str(text)
         payload = s
         suffix = ""
+        judge: dict[str, str] | None = None
+        judge_err: str | None = None
+
         if "replaces" in opts_dict:
             payload += f"\n@replaces={opts_dict['replaces']}"
             suffix = f" (replaces #{opts_dict['replaces']})"
+        else:
+            prior = env.db_conn.execute(
+                "SELECT id, payload FROM meta_events "
+                "WHERE session_id = ? AND kind = 'R' ORDER BY ts ASC",
+                (env.record_sid,),
+            ).fetchall()
+            if prior:
+                try:
+                    judge = _judge_new_R(prior, s)
+                    payload += f"\n@judge={judge.get('class', '?')}"
+                    tgt = judge.get("target", "none")
+                    if tgt and tgt != "none":
+                        payload += f"\n@judge-target={tgt}"
+                    if judge.get("reason"):
+                        payload += f"\n@judge-reason={judge['reason']}"
+                    if judge.get("impact"):
+                        payload += f"\n@judge-impact={judge['impact']}"
+                except Exception as e:
+                    judge_err = f"{type(e).__name__}: {e}"
+                    payload += f"\n@judge-error={judge_err}"
+
         _log("R", payload)
-        return f"(R: {s[:80]}{suffix})"
+
+        lines = [f"(R: {s[:80]}{suffix})"]
+        if judge:
+            cls = judge.get("class", "?")
+            tgt = judge.get("target", "none")
+            head = f"  [judge] {cls}"
+            if cls in ("b", "c") and tgt and tgt != "none":
+                head += f": → R#{tgt}"
+            lines.append(head)
+            if judge.get("reason"):
+                lines.append(f"  [reason] {judge['reason']}")
+            if judge.get("impact"):
+                lines.append(f"  [impact] {judge['impact']}")
+        elif judge_err:
+            lines.append(f"  [judge-error] {judge_err}")
+        return "\n".join(lines)
 
     def _commit_K(name: Any, text: Any) -> str:
         """(commit-K name "...") — K 更新を明示。 binding 名 + 学んだことの記録。
