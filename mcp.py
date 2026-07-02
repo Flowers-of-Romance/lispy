@@ -1,11 +1,14 @@
 """mcp — MCP (Model Context Protocol) client。 stdio transport のみの最小実装。
 
-設定は `.lispy-mcp.json` (cwd から上方探索、 LISPY_MCP で明示指定可):
+設定は **LISPY_MCP=<path> で明示 opt-in したファイルだけ** 有効:
 
     {"servers": {
        "fs": {"command": "npx",
               "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
               "env": {}}}}
+
+cwd 上方の `.lispy-mcp.json` は検出して案内するだけで自動起動しない — clone してきた
+リポジトリ同梱の設定で任意コマンドが走る (supply-chain) のを防ぐため。
 
 server ごとに 1 プロセスを spawn して initialize → tools/list し、 各 tool を
 `mcp__<server>__<tool>` の名前で lispy の tool layer に載せる (agent からは他の tool と
@@ -17,6 +20,7 @@ server ごとに 1 プロセスを spawn して initialize → tools/list し、
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import subprocess
@@ -142,7 +146,16 @@ class MCPServer:
 _REGISTRY: dict[str, dict[str, MCPServer]] = {}  # config path -> {server name: MCPServer}
 
 
+_HINTED = False
+
+
 def _find_config() -> Path | None:
+    """server を起動してよい設定は LISPY_MCP で明示されたものだけ。
+
+    cwd 上方の .lispy-mcp.json は「検出して案内する」 に留める — clone してきた
+    リポジトリ同梱の設定で任意コマンドが自動実行される (supply-chain) のを防ぐ。
+    使うときは LISPY_MCP=<path> で opt-in する。"""
+    global _HINTED
     explicit = os.environ.get("LISPY_MCP", "").strip()
     if explicit:
         p = Path(explicit).expanduser()
@@ -151,7 +164,11 @@ def _find_config() -> Path | None:
     for parent in [d, *d.parents]:
         f = parent / ".lispy-mcp.json"
         if f.exists():
-            return f
+            if not _HINTED:
+                _HINTED = True
+                print(f"  (mcp: {f} を検出したが自動起動はしない — 使うには LISPY_MCP={f} を設定)",
+                      file=sys.stderr)
+            return None
     return None
 
 
@@ -173,6 +190,7 @@ def connect_all() -> dict[str, MCPServer]:
     for name, spec in (cfg.get("servers") or {}).items():
         if not isinstance(spec, dict) or not spec.get("command"):
             continue
+        srv: MCPServer | None = None
         try:
             srv = MCPServer(
                 name=str(name),
@@ -184,6 +202,12 @@ def connect_all() -> dict[str, MCPServer]:
             servers[str(name)] = srv
             print(f"  (mcp: {name} connected, {len(srv.tools)} tools)", file=sys.stderr)
         except Exception as e:
+            # initialize 失敗時に spawn 済みプロセスを orphan にしない (registry 外は atexit も拾えない)
+            if srv is not None:
+                try:
+                    srv.close()
+                except Exception:
+                    pass
             print(f"  (mcp: {name} connect failed: {type(e).__name__}: {e})", file=sys.stderr)
     _REGISTRY[key] = servers
     return servers
@@ -194,12 +218,21 @@ def tool_layer() -> tuple[dict[str, Any], list[dict]]:
     handler は (args, env) -> str — 他の tool と同じ signature。"""
     tools: dict[str, Any] = {}
     schema: list[dict] = []
+    seen: set[str] = set()
     for sname, srv in connect_all().items():
         for t in srv.tools:
             tname = str(t.get("name", ""))
             if not tname:
                 continue
-            fq = f"mcp__{sname}__{tname}"[:64]
+            fq = f"mcp__{sname}__{tname}"
+            if len(fq) > 64 or fq in seen:
+                # 長い名前の切り詰めで衝突すると handler が上書きされ schema に重複が残る —
+                # 安定 hash を付けて一意化する
+                digest = hashlib.sha1(f"{sname}/{tname}".encode()).hexdigest()[:8]
+                fq = (fq[:55] + "_" + digest)[:64]
+            if fq in seen:
+                continue  # 完全な二重報告 (同 server が同名 tool を重複列挙) は skip
+            seen.add(fq)
             desc = f"[mcp:{sname}] " + str(t.get("description") or "")
 
             def handler(args: dict, env: Any, _srv: MCPServer = srv, _tn: str = tname) -> str:
@@ -224,7 +257,7 @@ def info() -> str:
     """(mcp-list) — 接続中の server と tool 一覧。"""
     servers = connect_all()
     if not servers:
-        return "(mcp: 設定なし — .lispy-mcp.json を cwd 上方に置くか LISPY_MCP で指定)"
+        return "(mcp: 未接続 — LISPY_MCP=<設定ファイル> で明示 opt-in する)"
     out = []
     for name, srv in servers.items():
         alive = "up" if srv.proc.poll() is None else f"dead ({srv.proc.returncode})"

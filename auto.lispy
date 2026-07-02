@@ -81,6 +81,8 @@
           (renew-at   (if (or (null? opts) (null? (cdr opts))) 80 (car (cdr opts)))))
       (begin
         (session-intent goal)
+        ;; n は今走らせた round 番号 (1-based)。 n >= max-rounds で終了 = 作業 round は
+        ;; ちょうど max-rounds 回 (0 始まりだと 1 round 余分に走る off-by-one になる)
         ((lambda (input n)
            (let ((r ((lookup "agent-step") env input)))
              (if (>= n max-rounds)
@@ -97,4 +99,4 @@
                                   verdict
                                   "\n未達成。NEXT の指示に従って作業を続けること。完了したと判断したら、根拠となる tool の実行結果を明示すること。</system-reminder>")
                                 (+ n 1))))))))
-         goal 0)))))
+         goal 1)))))
