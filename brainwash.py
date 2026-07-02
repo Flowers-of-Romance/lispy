@@ -38,9 +38,15 @@ if str(_HERE) not in sys.path:
 import host  # noqa: E402
 
 MEMORY_DIR = Path(os.environ.get("LISPY_MEMORY_DIR", str(_HERE / "data" / "memory")))
+# 洗脳が管理するディレクトリの marker。 wipe (全 *.md 削除) はこの marker があるときだけ —
+# LISPY_MEMORY_DIR に一般のディレクトリ (~/notes 等) を誤って指しても消さないための床。
+MEMORY_MARKER = ".lispy-memory"
 MAX_TOKENS = int(os.environ.get("BRAINWASH_MAX_TOKENS", "8192"))
 MAX_SESSIONS = int(os.environ.get("BRAINWASH_MAX_SESSIONS", "10"))
 MAX_CHARS = int(os.environ.get("BRAINWASH_MAX_CHARS", "200000"))
+# prompt に載せる既存記憶の上限 (transcript とは別枠)。 per-file / 合計の二段。
+MEMORY_MAX_CHARS = int(os.environ.get("BRAINWASH_MEMORY_MAX_CHARS", "100000"))
+_MEMFILE_TRUNC = 20000
 INDEX_MAX_LINES = int(os.environ.get("BRAINWASH_INDEX_MAX_LINES", "100"))
 _TURN_TRUNC = 1500
 
@@ -70,25 +76,52 @@ def _strip_fences(s: str) -> str:
     return m.group(1).strip() if m else s
 
 
-def _last_wash_ts(db) -> float:
-    row = db.execute(
-        "SELECT MAX(ts) FROM meta_events WHERE kind = 'brainwash'"
-    ).fetchone()
-    return float(row[0]) if row and row[0] else 0.0
+def _wash_history(db) -> list[tuple[float, list[str]]]:
+    """kind=brainwash の ledger から (洗脳時刻, 洗った session id 群) を時系列で返す。
+    watermark は session ごと — 全体で 1 本の MAX(ts) にすると、 対象を絞った洗脳や
+    MAX_SESSIONS で溢れた session が「洗われていないのに watermark の下」 になり
+    永久に skip される。"""
+    out: list[tuple[float, list[str]]] = []
+    rows = db.execute(
+        "SELECT ts, payload FROM meta_events WHERE kind = 'brainwash' ORDER BY ts ASC"
+    ).fetchall()
+    for ts, payload in rows:
+        try:
+            sids = json.loads(payload or "{}").get("sessions") or []
+        except Exception:
+            continue
+        out.append((float(ts), [str(s) for s in sids]))
+    return out
 
 
 def _pick_sessions(db, sessions: list[str] | None) -> list[str]:
-    """洗う session を決める。 指定があれば prefix 解決、 無ければ前回の洗脳以降に
-    turn が増えた session (新しい順に MAX_SESSIONS 件)。"""
+    """洗う session を決める。 指定があれば prefix 解決。 無ければ「最後にその session を
+    洗った時刻」 より新しい turn を持つ session を、 新しい順に MAX_SESSIONS 件。
+    溢れた session は watermark が進まないので次回に持ち越される (取りこぼさない)。"""
     if sessions:
         return [host.resolve_session(db, s) for s in sessions]
-    since = _last_wash_ts(db)
+    history = _wash_history(db)
+
+    def last_wash(sid: str) -> float:
+        t = 0.0
+        for ts, sids in history:
+            for s in sids:
+                # 旧 payload は 12 字 prefix で記録されていた — prefix 一致で拾う
+                if sid == s or (len(s) < len(sid) and sid.startswith(s)):
+                    t = max(t, ts)
+        return t
+
     rows = db.execute(
-        "SELECT session_id, MAX(ts) AS latest FROM turns WHERE ts > ? "
-        "GROUP BY session_id ORDER BY latest DESC LIMIT ?",
-        (since, MAX_SESSIONS),
+        "SELECT session_id, MAX(ts) AS latest FROM turns "
+        "GROUP BY session_id ORDER BY latest DESC"
     ).fetchall()
-    return [r[0] for r in rows]
+    picked: list[str] = []
+    for sid, latest in rows:
+        if float(latest) > last_wash(str(sid)):
+            picked.append(str(sid))
+            if len(picked) >= MAX_SESSIONS:
+                break
+    return picked
 
 
 def _session_transcript(db, sid: str) -> str:
@@ -111,8 +144,28 @@ def _read_memory_files() -> dict[str, str]:
         return {}
     out: dict[str, str] = {}
     for p in sorted(MEMORY_DIR.rglob("*.md")):
-        out[str(p.relative_to(MEMORY_DIR))] = p.read_text(encoding="utf-8")
+        text = p.read_text(encoding="utf-8")
+        if len(text) > _MEMFILE_TRUNC:
+            text = text[:_MEMFILE_TRUNC] + f"\n…(truncated, {len(text)} chars)"
+        out[str(p.relative_to(MEMORY_DIR))] = text
     return out
+
+
+def _memory_prompt_text(memory: dict[str, str]) -> str:
+    """既存記憶を prompt 用に連結。 合計 MEMORY_MAX_CHARS で打ち切る
+    (per-file は _read_memory_files 側で truncate 済み)。"""
+    if not memory:
+        return "(まだ記憶なし)"
+    parts: list[str] = []
+    used = 0
+    for path, content in memory.items():
+        block = f"### {path}\n{content}"
+        if used + len(block) > MEMORY_MAX_CHARS:
+            parts.append(f"### {path}\n(memory budget 超過 — 省略。次回の洗脳で圧縮すること)")
+            continue
+        parts.append(block)
+        used += len(block)
+    return "\n\n".join(parts)
 
 
 def _safe_rel_path(path: str) -> Path | None:
@@ -149,7 +202,7 @@ def brainwash(db, sessions: list[str] | None = None) -> str:
             break
 
     memory = _read_memory_files()
-    mem_text = "\n\n".join(f"### {p}\n{c}" for p, c in memory.items()) or "(まだ記憶なし)"
+    mem_text = _memory_prompt_text(memory)
 
     user_content = (
         "現在の記憶ファイル群:\n" + mem_text
@@ -195,12 +248,22 @@ def brainwash(db, sessions: list[str] | None = None) -> str:
     if index_path not in writes:
         return "(brainwash: 出力に index.md が無い — 蒸留層は無変更)"
     index_lines = writes[index_path].count("\n") + 1
-    warn = ""
     if index_lines > INDEX_MAX_LINES:
-        warn = f"\n  (warning: index.md が {index_lines} 行 — 上限 {INDEX_MAX_LINES} 行を超過、次回の洗脳で圧縮すること)"
+        # index-first 読みの規律そのものなので warn で通さない — 蒸留層は無変更のまま返す
+        return (f"(brainwash: index.md が {index_lines} 行で上限 {INDEX_MAX_LINES} を超過 — "
+                f"蒸留層は無変更。index は 1 事実 1 行・詳細はリンク先、の形に圧縮して再実行すること)")
 
-    # 置き換え: 既存 *.md を消して書き直す (蒸留層は生層からの派生物なので全置換でよい)
+    # 置き換え: 既存 *.md を消して書き直す (蒸留層は生層からの派生物なので全置換でよい)。
+    # ただし wipe は marker (.lispy-memory) がある = 洗脳が管理してきたディレクトリに限る。
+    # LISPY_MEMORY_DIR が誤って一般ディレクトリ (~/notes 等) を指していた場合の誤削除防止。
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    marker = MEMORY_DIR / MEMORY_MARKER
+    if any(MEMORY_DIR.rglob("*.md")) and not marker.exists():
+        return (f"(brainwash: {MEMORY_DIR} に marker ({MEMORY_MARKER}) が無いのに .md がある — "
+                f"洗脳管理外のディレクトリの可能性があるため wipe しない。 "
+                f"LISPY_MEMORY_DIR を専用ディレクトリにするか、 管理下に置くなら "
+                f"{marker} を手で作成すること)")
+    marker.touch()
     for p in MEMORY_DIR.rglob("*.md"):
         p.unlink()
     for target, content in writes.items():
@@ -208,7 +271,8 @@ def brainwash(db, sessions: list[str] | None = None) -> str:
         target.write_text(content, encoding="utf-8")
 
     payload = json.dumps({
-        "sessions": [s[:12] for s in sids],
+        # 完全 id で記録する — _pick_sessions の session 別 watermark がこれを照合する
+        "sessions": sids,
         "kept": len(kept),
         "dropped": len(dropped),
         "dropped_claims": [d[:200] for d in dropped],
@@ -222,7 +286,7 @@ def brainwash(db, sessions: list[str] | None = None) -> str:
 
     lines = [
         f"brainwash: {len(sids)} sessions を洗った → {len(writes)} files"
-        f" (kept {len(kept)} / dropped {len(dropped)}){warn}",
+        f" (kept {len(kept)} / dropped {len(dropped)})",
     ]
     for d in dropped[:8]:
         lines.append(f"  [dropped] {d[:120]}")

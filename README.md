@@ -176,7 +176,7 @@ judge client を使う。
 | プロジェクト文脈 | cwd から上方の AGENTS.md / CLAUDE.md を system prompt に注入 |
 | 並列 tool | read-only だけの batch は並列実行 (dispatch-tools) |
 | hooks | `.lispy-hooks.json` — pre-tool (ブロック可) / post-tool (結果に添付) / stop (止まれなくする) |
-| MCP | `.lispy-mcp.json` の server (stdio) を `mcp__<server>__<tool>` として tool 化。 `(mcp-list)` で確認 |
+| MCP | `LISPY_MCP=<設定>` で opt-in した server (stdio) を `mcp__<server>__<tool>` として tool 化。 `(mcp-list)` で確認 |
 | skills | `.lispy/skills/<name>/SKILL.md` の一覧を system prompt に常駐、 本文は合致時に agent が read。 agent 自身が更新できる (judge 審査つき — 検証を弱める変更は却下)。 更新履歴は rk-log の [skill] |
 
 hooks の例:

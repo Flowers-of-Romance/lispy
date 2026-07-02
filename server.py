@@ -358,6 +358,11 @@ def _eval_src(env: lispy.Env, src: str) -> dict:
                 "error": f"{type(e).__name__}: {e}",
                 "stdout": buf.getvalue(),
             }
+        finally:
+            # /interrupt で set された flag は 1 回の評価にだけ効かせる。
+            # 残すと以後の /eval が全部即死する (REPL 側の finally と同じ扱い)。
+            if env.interrupt is not None:
+                env.interrupt.clear()
 
 
 def _resume_or_new(sid_arg: str) -> str:
@@ -558,8 +563,9 @@ def main() -> None:
             pass
 
     sid = _resume_or_new(args.session)
-    if args.resume and not sid:
-        # --resume 単独 = 直近の session を引き継ぐ
+    if args.resume and not args.session and not sid:
+        # --resume 単独のときだけ直近 session に fallback。 --session が明示されて
+        # 解決に失敗した場合は fallback しない (別の session を誤って resume しない)
         db = host.init_db(host.DB_PATH)
         try:
             sid = lispy._last_session_id(db)

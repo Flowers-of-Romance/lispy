@@ -678,7 +678,8 @@ ThreadPool で並列、 副作用系が 1 つでも混ざれば発行順の直�
 **プロジェクト文脈。** build_default_env が cwd から上方に AGENTS.md / CLAUDE.md を探し、
 最初に見つかったものを system prompt に注入する (20k 字上限)。
 
-**MCP (stdio)。** `.lispy-mcp.json` (cwd 上方探索 / LISPY_MCP):
+**MCP (stdio)。** `LISPY_MCP=<設定ファイル>` で **明示 opt-in** (cwd 上方の `.lispy-mcp.json` は
+検出して案内するだけで自動起動しない — repo 同梱設定による任意コマンド実行を防ぐ):
 
 ```json
 {"servers": {"fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}}}

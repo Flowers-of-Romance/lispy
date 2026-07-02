@@ -3,6 +3,24 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-07-02 (7) — レビュー指摘の修正 (安全側の締め直し 10 件)
+
+### Fixed
+- auto-step の off-by-one — round 番号を 1-based にし、 作業 round がちょうど max-rounds 回に
+- brainwash: 蒸留層の wipe を marker (`.lispy-memory`) のあるディレクトリに限定 —
+  LISPY_MEMORY_DIR が一般ディレクトリを指していても *.md を消さない
+- brainwash: watermark を session 別に (ledger の payload は完全 id で記録) —
+  狙い撃ち洗脳や MAX_SESSIONS 溢れで他 session が永久 skip されない
+- brainwash: prompt に載せる既存記憶に上限 (BRAINWASH_MEMORY_MAX_CHARS、 per-file 20k)
+- brainwash: index.md の行数超過は warn でなく abort (蒸留層無変更) — index-first の規律なので
+- mcp: **LISPY_MCP による明示 opt-in 必須に** — cwd 上方の .lispy-mcp.json は検出案内のみ。
+  clone した repo 同梱の設定で任意コマンドが自動実行されるのを防ぐ
+- mcp: initialize 失敗時に spawn 済みプロセスを close (orphan 防止)
+- mcp: tool 名の 64 字切り詰め衝突を hash suffix で一意化
+- server: /interrupt の flag を評価 1 回で clear (以後の /eval が全部即死しない)
+- server: --resume + 解決失敗の --session が直近 session に fallback しない
+  (別 session の誤 resume 防止)
+
 ## 2026-07-02 (6) — skill の自己更新 (審査つき)
 
 skill は詰まったとき・現実とずれたときに更新される — 凍結させない。
