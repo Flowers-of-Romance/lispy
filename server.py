@@ -10,6 +10,11 @@ endpoints:
   POST /load            body=<path>            ファイルから read_all_sexp → 全 form を eval
   GET  /bindings        env.bindings の名前一覧
   GET  /recall?q=&k=&mode=  host の trajectory recall を直接叩く
+  GET  /view            ledger ダッシュボード (view.py)
+  GET  /view/state      ダッシュボードのスナップショット (JSON、 pending gate / agent view 含む)
+  GET  /view/events     SSE — ledger (meta_events) + turns の追記 + gate/view の変化通知
+  POST /view/gate/<id>  pending gate の解決。 body = "approve" | "deny" (先着採用)
+  POST /view/action     agent view の button 押下 (action 記号 + inputs) を queue に積む
   POST /reset           env を作り直す (旧 session を close → 新 session を open)
 
 CLI:
@@ -30,6 +35,7 @@ import json
 import re
 import sys
 import threading
+import time
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +44,13 @@ from urllib.parse import urlsplit, parse_qs
 
 import lispy
 import host
+
+# View 層は optional — view.py を消しても server core (/eval 等) は動く
+# (lispy.py / edit.py の optional import と同じ規約)。 無ければ /view 系は 503。
+try:
+    import view
+except ImportError:
+    view = None  # type: ignore[assignment]
 
 _HERE = Path(__file__).resolve().parent
 _LOCK = threading.Lock()
@@ -413,6 +426,9 @@ def make_handler(env_box: list[lispy.Env]):
             url = urlsplit(self.path)
             path = url.path
             env = env_box[0]
+            if path.startswith("/view") and view is None:
+                self._send_json(503, {"ok": False, "error": "view 層なし (view.py が無い)"})
+                return
             if path in ("/", "/healthz"):
                 self._send_json(200, {
                     "ok": True,
@@ -451,13 +467,116 @@ def make_handler(env_box: list[lispy.Env]):
                         500, f"<h1>spec render error</h1><pre>{html.escape(str(e))}</pre>"
                     )
                 return
+            if path == "/view":
+                self._send_html(200, view.VIEW_HTML)
+                return
+            if path == "/view/state":
+                # 読み取り専用接続で ledger を読む。 _LOCK は取らない —
+                # eval が長時間 lock を握っていても view は固まらない。
+                qs = parse_qs(url.query)
+                scope = qs.get("session", ["current"])[0] or "current"
+                try:
+                    db = view.open_ro()
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "error": f"db open: {e}"})
+                    return
+                try:
+                    sid = view.resolve_sid(db, scope, env.record_sid)
+                    body = view.state_json(db, sid, scope)
+                    # 要約 (直近 24h・全 session) — 抜き取り検査の一枚目
+                    body["summary"] = view.summary_24h(db)
+                    # pending gate と agent view は ledger でなくプロセス内の runtime 状態
+                    body["pending"] = view.GATES.pending_list()
+                    body["view"] = view.CURRENT_VIEW.get()
+                    self._send_json(200, body)
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "error": str(e)})
+                finally:
+                    db.close()
+                return
+            if path == "/view/events":
+                self._serve_view_events(url)
+                return
             self._send_json(404, {"ok": False, "error": f"no route: {path}"})
+
+        def _serve_view_events(self, url) -> None:
+            """SSE — ledger (meta_events) + turns の追記を 1s ポーリングで流す。
+            scope=current で env の session が切り替わったら (renew / reset)
+            {"type": "session"} を送って閉じる — client 側が再接続して仕切り直す。"""
+            qs = parse_qs(url.query)
+            scope = qs.get("session", ["current"])[0] or "current"
+            try:
+                meta_after = int(qs.get("meta_after", ["0"])[0] or 0)
+                turn_after = int(qs.get("turn_after", ["0"])[0] or 0)
+            except ValueError:
+                self._send_json(400, {"ok": False, "error": "meta_after/turn_after must be int"})
+                return
+            try:
+                db = view.open_ro()
+            except Exception as e:
+                self._send_json(500, {"ok": False, "error": f"db open: {e}"})
+                return
+
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream; charset=utf-8")
+            self.send_header("cache-control", "no-cache")
+            self.end_headers()
+
+            def emit(obj: dict) -> None:
+                data = json.dumps(obj, ensure_ascii=False)
+                self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+            # SSE 接続中 = ブラウザが見ている = gate の答え手がいる、 を registry に知らせる
+            view.GATES.watcher_add()
+            try:
+                sid = view.resolve_sid(db, scope, env_box[0].record_sid)
+                # -1 始まり = 接続直後の 1 周目で必ず gate/view イベントを流す。
+                # client の /view/state 取得とこの snapshot の間に登録された gate が
+                # 「version 変化なし」 で永久に見えなくなる隙間を閉じる。
+                gate_v = -1
+                view_v = -1
+                idle = 0
+                while True:
+                    if scope == "current" and env_box[0].record_sid != sid:
+                        emit({"type": "session", "session_id": env_box[0].record_sid})
+                        return
+                    sent = False
+                    if view.GATES.version != gate_v:
+                        gate_v = view.GATES.version
+                        emit({"type": "gate"})
+                        sent = True
+                    if view.CURRENT_VIEW.version != view_v:
+                        view_v = view.CURRENT_VIEW.version
+                        emit({"type": "view"})
+                        sent = True
+                    events, meta_after, turn_after = view.poll_events(
+                        db, sid, meta_after, turn_after)
+                    for ev in events:
+                        emit(ev)
+                    if events or sent:
+                        idle = 0
+                    else:
+                        idle += 1
+                        if idle >= 15:  # keepalive — 切断検知も兼ねる
+                            self.wfile.write(b": ka\n\n")
+                            self.wfile.flush()
+                            idle = 0
+                    time.sleep(1.0)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # client 切断
+            finally:
+                view.GATES.watcher_remove()
+                db.close()
 
         # ----- POST -----
         def do_POST(self):
             url = urlsplit(self.path)
             path = url.path
             env = env_box[0]
+            if path.startswith("/view") and view is None:
+                self._send_json(503, {"ok": False, "error": "view 層なし (view.py が無い)"})
+                return
             if path in ("/", "/eval"):
                 src = self._read_body()
                 if not src.strip():
@@ -480,6 +599,43 @@ def make_handler(env_box: list[lispy.Env]):
                     self._send_json(500, {"ok": False, "error": f"read error: {e}"})
                     return
                 self._send_json(200, _eval_src(env, src))
+                return
+            m = re.match(r"^/view/gate/(\d+)$", path)
+            if m:
+                # pending gate の解決。 body は action 記号のみ ("approve" | "deny")。
+                # _LOCK は取らない — eval スレッドが lock を握って承認待ちしている。
+                decision = self._read_body().strip().lower()
+                if decision not in ("approve", "deny"):
+                    self._send_json(400, {"ok": False, "error": 'body must be "approve" or "deny"'})
+                    return
+                if view.GATES.resolve(int(m.group(1)), decision, "browser"):
+                    self._send_json(200, {"ok": True, "decision": decision})
+                else:
+                    self._send_json(409, {"ok": False, "error": "not pending (先着済み or 不明 id)"})
+                return
+            if path == "/view/action":
+                # agent view の button 押下。 queue に積むだけ — 解釈は agent 側
+                # (view-next-action / await-view-action)。 _LOCK は取らない。
+                try:
+                    body = json.loads(self._read_body() or "{}")
+                    action = str(body.get("action", ""))[:200]
+                    inputs_raw = body.get("inputs") or {}
+                    if not isinstance(inputs_raw, dict):
+                        raise ValueError("inputs must be an object")
+                    inputs = {str(k)[:100]: str(v)[:10000]
+                              for k, v in list(inputs_raw.items())[:100]}
+                except (json.JSONDecodeError, ValueError) as e:
+                    self._send_json(400, {"ok": False, "error": f"bad body: {e}"})
+                    return
+                if not action:
+                    self._send_json(400, {"ok": False, "error": "action required"})
+                    return
+                if not view.ACTIONS.push(action, inputs):
+                    self._send_json(429, {"ok": False, "error": "action queue full"})
+                    return
+                view._log_meta_rw("view-action", env_box[0].record_sid, json.dumps(
+                    {"action": action, "inputs": inputs}, ensure_ascii=False))
+                self._send_json(200, {"ok": True})
                 return
             if path == "/interrupt":
                 # 走行中の agent loop を step 境界で止める。 _LOCK は取らない —
@@ -515,10 +671,37 @@ def _stdin_repl(env_box: list[lispy.Env]) -> None:
 
     server と並列で動く軽量 REPL。 多行 S 式はカッコバランスで継続。
     """
+    # terminal が gate の答え手になれるのはこの thread が生きている間だけ —
+    # Ctrl-D で抜けたら clear する (立てっぱなしだと誰も読まない stdin を
+    # 答え手として数え、 headless の 600s 停止が再発する)。
+    if view is not None:
+        view.GATES.terminal_answerer = sys.stdin.isatty()
+        view.GATES.terminal_thread = threading.get_ident()
+    try:
+        _stdin_repl_loop(env_box)
+    finally:
+        if view is not None:
+            view.GATES.terminal_answerer = False
+            view.GATES.terminal_thread = None
+
+
+def _stdin_repl_loop(env_box: list[lispy.Env]) -> None:
     try:
         while True:
             line = input("lispy> ")
             if not line.strip():
+                continue
+            # pending gate への terminal 回答 (ブラウザとの先着採用)。
+            # 裸の y/n は「pending 1 件 + 最後に告知した gate」のときだけ効き、
+            # 複数 pending 時は `y <id>` / `n <id>` で対象を指定する (誤射防止)。
+            # 注意: この REPL スレッド自身が評価した eval の確認には答えられない
+            # (スレッドが eval 内で block 中) — その場合はブラウザが出口。
+            m = re.match(r"^(y|yes|n|no)(?:\s+(\d+))?$", line.strip().lower())
+            if m and view is not None and view.GATES.has_pending():
+                gid = int(m.group(2)) if m.group(2) else None
+                msg = view.GATES.resolve_from_terminal(
+                    gid, "approve" if m.group(1) in ("y", "yes") else "deny")
+                print(f"  {msg}")
                 continue
             buf = [line]
             while not lispy._parens_balanced("\n".join(buf)):
@@ -575,10 +758,18 @@ def main() -> None:
     _load_extras(env)
     env_box: list[lispy.Env] = [env]
 
+    # View 層 (フェーズ 2): server では y/N 確認を pending gate に載せる —
+    # ブラウザ (/view) と terminal (y/n) の先着採用。 --yolo では確認自体が skip される。
+    # 答え手 (SSE watcher / stdin REPL) がいなければ gate は登録されず即 fail-closed。
+    # terminal_answerer は _stdin_repl が thread の生存期間だけ立てる。
+    if view is not None:
+        view.GATES.remote = True
+        view.GATES.sid_provider = lambda: env_box[0].record_sid
+
     sid_note = f"resumed {env.record_sid[:12]}" if sid else f"new session {env.record_sid[:12]}"
     print(f"lispy-server on http://{args.host}:{args.port}  ({sid_note})")
     print(f"  bindings: {len(env.bindings)}  tools: {len(env.tools)}")
-    print("  endpoints: POST /eval /load /reset /interrupt  GET / /bindings /recall?q=")
+    print("  endpoints: POST /eval /load /reset /interrupt  GET / /bindings /recall?q= /spec /view")
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(env_box))
 
