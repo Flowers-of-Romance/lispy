@@ -2409,47 +2409,16 @@ def _prim_plan_factory(env: Env) -> dict[str, Callable[..., Any]]:
             return v.text
         return v if isinstance(v, str) else _to_lisp_string(v)
 
-    # ----- ledger からの導出 -----
+    # ----- ledger からの導出 — 投影規則は host.plan_* に一本化 (view.py と共有) -----
 
     def _latest_plan() -> dict | None:
-        row = env.db_conn.execute(
-            "SELECT id, payload FROM meta_events WHERE kind = 'plan' "
-            "ORDER BY id DESC LIMIT 1").fetchone()
-        if row is None:
-            return None
-        try:
-            p = json.loads(row[1] or "")
-        except Exception:
-            return None
-        p["id"] = row[0]
-        return p
+        return host.plan_latest(env.db_conn)
 
     def _approval_of(plan_id: int) -> dict | None:
-        rows = env.db_conn.execute(
-            "SELECT payload FROM meta_events WHERE kind = 'plan-approval' "
-            "ORDER BY id DESC LIMIT 30").fetchall()
-        for (payload,) in rows:
-            try:
-                p = json.loads(payload or "")
-            except Exception:
-                continue
-            if p.get("plan_id") == plan_id:
-                return p
-        return None
+        return host.plan_approval(env.db_conn, plan_id)
 
     def _done_steps(plan_id: int) -> set[int]:
-        rows = env.db_conn.execute(
-            "SELECT payload FROM meta_events WHERE kind = 'plan-progress' "
-            "ORDER BY id DESC LIMIT 200").fetchall()
-        done: set[int] = set()
-        for (payload,) in rows:
-            try:
-                p = json.loads(payload or "")
-            except Exception:
-                continue
-            if p.get("plan_id") == plan_id and isinstance(p.get("step"), int):
-                done.add(p["step"])
-        return done
+        return host.plan_done_steps(env.db_conn, plan_id)
 
     def _plan_text(plan: dict) -> str:
         appr = _approval_of(plan["id"])
