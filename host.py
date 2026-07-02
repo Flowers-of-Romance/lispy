@@ -62,6 +62,19 @@ MODEL    = os.environ.get("LLM_MODEL", "")
 BASE_URL = os.environ.get("LLM_BASE_URL", "")
 API_KEY  = os.environ.get("LLM_API_KEY", "")
 CTX_WINDOW = int(os.environ.get("LISPY_CTX_WINDOW", "200000"))
+## agent 呼び出しの default max_tokens (llm-call / apply_ / prompt が使う)。
+## 2048 は agentic な出力には足りないことが多い。 provider に合わせて .env で調整。
+MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
+## thinking mode の default。 ds4 / DeepSeek 系は extra_body の "think" を解釈する。
+## 他 provider は未知 field として無視するのが普通 (今までも "think": False を常に送っていた)。
+THINK = os.environ.get("LLM_THINK", "").strip().lower() in ("1", "true", "yes", "on")
+## 審査者 (judge) LLM — define-gate の install 審査と auto.lispy の judge-done が使う。
+## executor (LLM_*) と別のモデルを据えるための設定。 3 つとも未設定なら executor に fallback
+## (= 文脈は分かれるが重みは同じ、 という弱い独立性で動く)。
+JUDGE_MODEL    = os.environ.get("JUDGE_MODEL", "")
+JUDGE_BASE_URL = os.environ.get("JUDGE_BASE_URL", "")
+JUDGE_API_KEY  = os.environ.get("JUDGE_API_KEY", "")
+JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "2048"))
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +245,28 @@ def get_client():
         )
     from openai import OpenAI  # lazy import
     return OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+
+def judge_configured() -> bool:
+    """JUDGE_* 3 変数が揃っているか。 揃っていなければ judge は executor に fallback する。"""
+    return bool(JUDGE_MODEL and JUDGE_BASE_URL and JUDGE_API_KEY)
+
+
+def get_judge_client():
+    """審査者 LLM の client。 JUDGE_* が未設定なら executor の client を返す (fallback)。
+
+    fallback は「別モデルによる独立審査」 ではなく 「同じ重みの別文脈審査」 に弱まる。
+    self-modifying 運用では JUDGE_* を設定すること (.env.example 参照)。
+    """
+    if not judge_configured():
+        return get_client()
+    from openai import OpenAI  # lazy import
+    return OpenAI(api_key=JUDGE_API_KEY, base_url=JUDGE_BASE_URL)
+
+
+def judge_model() -> str:
+    """審査に使う model 名。 JUDGE_MODEL が無ければ executor の MODEL。"""
+    return JUDGE_MODEL if judge_configured() else MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +574,11 @@ TOOL_SCHEMA = [
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": "List the contents of a directory.",
+            "description": (
+                "List the contents of a directory. "
+                "対象の構造を把握する最初の一手。 名前のパターンが分かっているなら glob、 "
+                "中身の文字列で探すなら grep を使う。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -571,7 +610,11 @@ TOOL_SCHEMA = [
         "type": "function",
         "function": {
             "name": "glob",
-            "description": "Find files matching a glob pattern.",
+            "description": (
+                "Find files matching a glob pattern. "
+                "ファイル名・拡張子のパターンで探すときに使う (例: **/*.py)。 "
+                "ファイルの中身で探すなら grep。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -586,7 +629,11 @@ TOOL_SCHEMA = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search a regex pattern in files under a path.",
+            "description": (
+                "Search a regex pattern in files under a path. "
+                "定義箇所・使用箇所・設定値の所在を探すときは、 read_file で1つずつ開くより先にこれ。 "
+                "ヒットしたファイルだけ read_file で読む。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -644,7 +691,10 @@ TOOL_SCHEMA = [
         "type": "function",
         "function": {
             "name": "task_list",
-            "description": "current session の task 一覧 (completed は default で除外)。",
+            "description": (
+                "current session の task 一覧 (completed は default で除外)。 "
+                "複数手の作業の途中で「次に何が残っているか」 を確認するために呼ぶ。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"include_completed": {"type": "boolean"}},
@@ -655,7 +705,11 @@ TOOL_SCHEMA = [
         "type": "function",
         "function": {
             "name": "task_add",
-            "description": "current session に task を追加。 pending 状態で作る。",
+            "description": (
+                "current session に task を追加。 pending 状態で作る。 "
+                "3 手以上かかる依頼を受けたら、 着手前に手順を分解してここに登録する "
+                "(1 手順 = 1 task)。 進行中の抜け漏れ防止。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"content": {"type": "string", "description": "task の内容"}},
@@ -667,7 +721,10 @@ TOOL_SCHEMA = [
         "type": "function",
         "function": {
             "name": "task_done",
-            "description": "task を completed にマーク。",
+            "description": (
+                "task を completed にマーク。 該当作業を検証し終えた直後に呼ぶ "
+                "(まとめて後で消さない — どこまで進んだかが常に見えるように)。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"id": {"type": "integer", "description": "task id"}},
@@ -1449,6 +1506,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dom.add_argument("domain", nargs="?")
     p_dom.add_argument("--clear", action="store_true")
     p_label = sub.add_parser("label", help="LLM が session の title/keyphrases/tags を提案 → DB に書く")
+    p_bw = sub.add_parser("brainwash", help="洗脳: 生層 (turns) から蒸留層 (data/memory/) を作り直す (.env の JUDGE_* / LLM_* 必須)")
+    p_bw.add_argument("--session", action="append", default=[],
+                      help="洗う session (prefix 可、 複数指定可)。 省略時は前回の洗脳以降に turn が増えた session")
     p_label.add_argument("session", nargs="?", help="session_id prefix (省略時は --unlabeled 必須)")
     p_label.add_argument("--unlabeled", action="store_true", help="title が空の全 session を順に label")
     p_label.add_argument("--yes", action="store_true", help="承認 prompt を skip して LLM 提案をそのまま書く")
@@ -1496,6 +1556,12 @@ def cmd_label(args: argparse.Namespace) -> None:
                 print("  → skip")
 
 
+def cmd_brainwash(args: argparse.Namespace) -> None:
+    import brainwash
+    db = init_db(DB_PATH)
+    print(brainwash.brainwash(db, sessions=args.session or None))
+
+
 def main() -> None:
     args = build_parser().parse_args()
     handler = {
@@ -1506,6 +1572,7 @@ def main() -> None:
         "events": cmd_events,
         "domain": cmd_domain,
         "label": cmd_label,
+        "brainwash": cmd_brainwash,
     }[args.cmd]
     handler(args)
 

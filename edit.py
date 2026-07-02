@@ -18,11 +18,15 @@ lispy.py から `import edit; edit.install_primitives(env)` で取り込む形�
 """
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
+
+_HERE = Path(__file__).resolve().parent
 
 
 # 自動承認する shell command の prefix。 read-only operation。
@@ -119,6 +123,127 @@ def shell(cmd: Any, *, yolo: bool = False, cwd: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# undo stack — file 編集の巻き戻し (opencode の /undo、 Claude Code の /rewind 相当)
+#
+# write / edit / append の直前に「変更前の内容」 を積む。 (undo [n]) で直近 n 件を戻す。
+# 対象は file tool の編集だけ — shell 経由の副作用は捕捉できない (Claude Code の
+# checkpoint と同じ制約。 opencode は毎 step git snapshot なので網羅性が上)。
+# ---------------------------------------------------------------------------
+
+_UNDO_STACK: list[dict] = []
+_UNDO_MAX = 200
+
+
+def _push_undo(path: Path, tool: str) -> None:
+    try:
+        before = path.read_text(encoding="utf-8") if path.exists() else None
+    except Exception:
+        return  # binary 等、 読めないものは undo 対象外
+    _UNDO_STACK.append({"path": str(path), "before": before, "tool": tool, "ts": time.time()})
+    if len(_UNDO_STACK) > _UNDO_MAX:
+        del _UNDO_STACK[: len(_UNDO_STACK) - _UNDO_MAX]
+
+
+def undo(n: Any = 1) -> str:
+    """(undo [n]) — 直近 n 件の file 編集 (write-file / edit-file / append-file) を巻き戻す。
+    新規作成だったファイルは削除される。 shell の副作用は対象外。"""
+    if not _UNDO_STACK:
+        return "(undo: 編集履歴なし)"
+    lines = []
+    for _ in range(max(1, int(n))):
+        if not _UNDO_STACK:
+            break
+        rec = _UNDO_STACK.pop()
+        p = Path(rec["path"])
+        try:
+            if rec["before"] is None:
+                if p.exists():
+                    p.unlink()
+                lines.append(f"undid {rec['tool']}: removed {p} (新規作成だった)")
+            else:
+                p.write_text(rec["before"], encoding="utf-8")
+                lines.append(f"undid {rec['tool']}: restored {p}")
+        except Exception as e:
+            lines.append(f"(undo failed for {p}: {e})")
+    return "\n".join(lines)
+
+
+def undo_list() -> str:
+    """(undo-list) — undo stack の中身 (新しい順)。"""
+    if not _UNDO_STACK:
+        return "(empty)"
+    out = []
+    for i, rec in enumerate(reversed(_UNDO_STACK[-20:])):
+        kind = "new" if rec["before"] is None else f"{len(rec['before'])} chars"
+        out.append(f"  -{i + 1}: {rec['tool']} {rec['path']} (before: {kind})")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# post-edit check — 編集直後にチェックコマンドを自動実行して結果を tool result に添付
+# (opencode の LSP diagnostics の軽量版。 型エラー・lint を agent に即フィードバックする)
+#
+# 設定は明示 opt-in のみ: 環境変数 LISPY_CHECK_CMD (コマンド文字列)、 または
+# LISPY_CHECK_FILE=<path> (そのファイルの 1 行目をコマンドとして使う)。
+# cwd 上方の .lispy-check は検出して案内するのみで自動実行しない — repo 同梱の設定で
+# 任意コマンドが走るのを防ぐ (hooks / mcp と同じ規律)。 {file} は編集ファイルに置換。
+# ---------------------------------------------------------------------------
+
+_CHECK_HINTED = [False]
+
+
+def _read_check_file(f: Path) -> tuple[str, Path] | None:
+    try:
+        lines = f.read_text(encoding="utf-8").strip().splitlines()
+    except Exception:
+        return None
+    cmd = lines[0].strip() if lines else ""
+    return (cmd, f.parent) if cmd else None
+
+
+def _find_check_cmd(start: Path) -> tuple[str, Path] | None:
+    envcmd = os.environ.get("LISPY_CHECK_CMD", "").strip()
+    d = start if start.is_dir() else start.parent
+    if envcmd:
+        return envcmd, d
+    envfile = os.environ.get("LISPY_CHECK_FILE", "").strip()
+    if envfile:
+        f = Path(envfile).expanduser()
+        return _read_check_file(f) if f.exists() else None
+    # 検出案内のみ — 自動実行しない
+    for parent in [d, *d.parents]:
+        f = parent / ".lispy-check"
+        if f.exists():
+            if not _CHECK_HINTED[0]:
+                _CHECK_HINTED[0] = True
+                print(f"  (post-edit check: {f} を検出したが自動実行しない — "
+                      f"使うには LISPY_CHECK_FILE={f} を設定)")
+            break
+    return None
+
+
+def _post_edit_check(p: Path) -> str:
+    found = _find_check_cmd(p.resolve())
+    if not found:
+        return ""
+    cmd, cwd = found
+    cmd_full = cmd.replace("{file}", str(p)) if "{file}" in cmd else cmd
+    try:
+        r = subprocess.run(
+            cmd_full, shell=True, capture_output=True, text=True,
+            cwd=str(cwd), timeout=60,
+        )
+        out = ((r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")).strip()
+        status = "ok" if r.returncode == 0 else f"exit {r.returncode}"
+        tail = out[-2000:]
+        return f"\n[post-edit check `{cmd_full[:60]}` → {status}]" + (f"\n{tail}" if tail else "")
+    except subprocess.TimeoutExpired:
+        return f"\n[post-edit check timeout 60s: {cmd_full[:60]}]"
+    except Exception as e:
+        return f"\n[post-edit check error: {e}]"
+
+
+# ---------------------------------------------------------------------------
 # file write / edit
 # ---------------------------------------------------------------------------
 
@@ -135,11 +260,12 @@ def write_file(path: Any, text: Any, *, yolo: bool = False) -> str:
     if p.exists() and not (yolo or _RUNTIME_YOLO):
         if not _confirm(f"  [edit.write-file] '{p}' を上書きしますか? [y/N]: "):
             return f"(skipped: {p})"
+    _push_undo(p, "write-file")
     _backup(p)
     p.parent.mkdir(parents=True, exist_ok=True)
     s = str(text)
     p.write_text(s, encoding="utf-8")
-    return f"(wrote {len(s)} bytes to {p})"
+    return f"(wrote {len(s)} bytes to {p})" + _post_edit_check(p)
 
 
 def edit_file(path: Any, old: Any, new: Any, *, yolo: bool = False) -> str:
@@ -161,9 +287,10 @@ def edit_file(path: Any, old: Any, new: Any, *, yolo: bool = False) -> str:
             f"  [edit.edit-file] '{p}' の '{preview_old}' を '{preview_new}' に? [y/N]: "
         ):
             return f"(skipped: {p})"
+    _push_undo(p, "edit-file")
     _backup(p)
     p.write_text(content.replace(old_s, str(new)), encoding="utf-8")
-    return f"(edited {p})"
+    return f"(edited {p})" + _post_edit_check(p)
 
 
 def append_file(path: Any, text: Any) -> str:
@@ -171,10 +298,81 @@ def append_file(path: Any, text: Any) -> str:
     確認 prompt は不要 (副作用が局所的)。"""
     p = Path(str(path)).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
+    _push_undo(p, "append-file")
     s = str(text)
     with open(p, "a", encoding="utf-8") as f:
         f.write(s)
     return f"(appended {len(s)} bytes to {p})"
+
+
+# ---------------------------------------------------------------------------
+# background shell — 長時間プロセス (dev server / watch / 長いビルド) 用
+# ---------------------------------------------------------------------------
+
+_BG: dict[int, dict] = {}
+_BG_SEQ = [0]
+BG_DIR = _HERE / "data" / "bg"
+
+
+def shell_bg(cmd: Any, *, yolo: bool = False, cwd: str | None = None) -> str:
+    """コマンドをバックグラウンドで起動し id を返す。 出力は log file に落ちる。
+    確認ポリシーは shell と同じ (allow-list / y/N / yolo)。"""
+    cmd = str(cmd)
+    if not _is_shell_allowed(cmd) and not (yolo or _RUNTIME_YOLO):
+        if not _confirm(f"  [edit.shell-bg] '{cmd[:80]}' をバックグラウンド起動しますか? [y/N]: "):
+            return f"(skipped: {cmd[:80]})"
+    BG_DIR.mkdir(parents=True, exist_ok=True)
+    _BG_SEQ[0] += 1
+    bid = _BG_SEQ[0]
+    log = BG_DIR / f"bg-{int(time.time())}-{bid}.log"
+    try:
+        f = open(log, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            cmd, shell=True, stdout=f, stderr=subprocess.STDOUT,
+            cwd=cwd, text=True,
+        )
+    except Exception as e:
+        return f"(shell_bg error: {e})"
+    _BG[bid] = {"proc": proc, "log": log, "cmd": cmd, "started": time.time()}
+    return f"(bg {bid} started: pid {proc.pid}, log {log})"
+
+
+def shell_out(bid: Any, lines: Any = 50) -> str:
+    """バックグラウンドプロセスの状態と出力の末尾を返す。"""
+    try:
+        rec = _BG.get(int(bid))
+    except (TypeError, ValueError):
+        rec = None
+    if rec is None:
+        active = ", ".join(str(k) for k in _BG) or "(none)"
+        return f"(shell_out: bg id {bid} not found — active: {active})"
+    proc = rec["proc"]
+    status = "running" if proc.poll() is None else f"exited {proc.returncode}"
+    try:
+        text = rec["log"].read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        text = ""
+    tail = "\n".join(text.splitlines()[-max(1, int(lines)):])
+    return f"(bg {bid} [{status}] {rec['cmd'][:80]})\n{tail}"
+
+
+def shell_kill(bid: Any) -> str:
+    """バックグラウンドプロセスを terminate (3 秒待って kill)。"""
+    try:
+        rec = _BG.get(int(bid))
+    except (TypeError, ValueError):
+        rec = None
+    if rec is None:
+        return f"(shell_kill: bg id {bid} not found)"
+    proc = rec["proc"]
+    if proc.poll() is not None:
+        return f"(bg {bid} already exited {proc.returncode})"
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    return f"(bg {bid} killed)"
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +385,14 @@ def install_primitives(env, *, yolo: bool = False) -> None:
     yolo=True にすると確認 prompt を全 skip (auto-test 等で使用)。
     """
     env.bindings["shell"]      = lambda cmd: shell(cmd, yolo=yolo)
+    env.bindings["shell-bg"]   = lambda cmd: shell_bg(cmd, yolo=yolo)
+    env.bindings["shell-out"]  = lambda bid, lines=50: shell_out(bid, lines)
+    env.bindings["shell-kill"] = lambda bid: shell_kill(bid)
     env.bindings["write-file"] = lambda path, text: write_file(path, text, yolo=yolo)
     env.bindings["edit-file"]  = lambda path, old, new: edit_file(path, old, new, yolo=yolo)
     env.bindings["append-file"] = lambda path, text: append_file(path, text)
+    env.bindings["undo"]       = undo
+    env.bindings["undo-list"]  = undo_list
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +427,8 @@ EDIT_TOOL_SCHEMA: list[dict] = [
             "name": "write_file",
             "description": (
                 "ファイルを overwrite。 既存があれば .bak に backup してから書く。 "
-                "上書きは y/N 確認が出る。 新規作成 (path が存在しない) のときは確認なし。"
+                "上書きは y/N 確認が出る。 新規作成 (path が存在しない) のときは確認なし。 "
+                "使うのは新規作成か全面書き換えのとき — 既存ファイルの部分修正は edit_file。"
             ),
             "parameters": {
                 "type": "object",
@@ -242,7 +446,9 @@ EDIT_TOOL_SCHEMA: list[dict] = [
             "name": "edit_file",
             "description": (
                 "ファイル内の文字列 1 箇所を置換。 old は unique match を要求 (複数 match や 0 match は error)。 "
-                "y/N 確認が出る。 .bak backup あり。"
+                "y/N 確認が出る。 .bak backup あり。 "
+                "既存ファイルの修正はこれが第一選択。 必ず直前に read_file で該当箇所を読み、 "
+                "表示された内容から old を組み立てる (記憶で書くと 0 match になる)。"
             ),
             "parameters": {
                 "type": "object",
@@ -259,7 +465,10 @@ EDIT_TOOL_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "append_file",
-            "description": "ファイル末尾に追記。 副作用が局所的なので確認なし。",
+            "description": (
+                "ファイル末尾に追記。 副作用が局所的なので確認なし。 "
+                "ログ・メモ・台帳への追記に使う。 本文の修正は edit_file。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -267,6 +476,56 @@ EDIT_TOOL_SCHEMA: list[dict] = [
                     "text": {"type": "string"},
                 },
                 "required": ["path", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shell_bg",
+            "description": (
+                "コマンドをバックグラウンドで起動して id を返す。 出力は log に落ち、 shell_out で読む。 "
+                "使うのは終わらない・長いプロセス: dev server、 watch、 数分かかるビルドやテスト。 "
+                "数秒で終わるコマンドは通常の shell を使う。 プロセスは shell_kill するまで生きる。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string", "description": "実行する shell コマンド"},
+                },
+                "required": ["cmd"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shell_out",
+            "description": (
+                "shell_bg で起動したプロセスの状態 (running / exited) と出力末尾を読む。 "
+                "server の起動確認・ビルドの進行確認は、 待つのではなくこれを都度呼ぶ。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "shell_bg が返した id"},
+                    "lines": {"type": "integer", "description": "末尾何行読むか (default 50)"},
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "shell_kill",
+            "description": "shell_bg のプロセスを止める (terminate → 3 秒で kill)。 使い終わった server は放置せず止める。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "shell_bg が返した id"},
+                },
+                "required": ["id"],
             },
         },
     },
@@ -289,8 +548,23 @@ def _tool_append_file(args: dict) -> str:
     return append_file(args.get("path", ""), args.get("text", ""))
 
 
+def _tool_shell_bg(args: dict) -> str:
+    return shell_bg(args.get("cmd", ""))
+
+
+def _tool_shell_out(args: dict) -> str:
+    return shell_out(args.get("id", -1), args.get("lines", 50))
+
+
+def _tool_shell_kill(args: dict) -> str:
+    return shell_kill(args.get("id", -1))
+
+
 EDIT_TOOL_DISPATCH = {
     "shell": _tool_shell,
+    "shell_bg": _tool_shell_bg,
+    "shell_out": _tool_shell_out,
+    "shell_kill": _tool_shell_kill,
     "write_file": _tool_write_file,
     "edit_file": _tool_edit_file,
     "append_file": _tool_append_file,

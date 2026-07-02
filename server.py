@@ -358,6 +358,11 @@ def _eval_src(env: lispy.Env, src: str) -> dict:
                 "error": f"{type(e).__name__}: {e}",
                 "stdout": buf.getvalue(),
             }
+        finally:
+            # /interrupt で set された flag は 1 回の評価にだけ効かせる。
+            # 残すと以後の /eval が全部即死する (REPL 側の finally と同じ扱い)。
+            if env.interrupt is not None:
+                env.interrupt.clear()
 
 
 def _resume_or_new(sid_arg: str) -> str:
@@ -476,6 +481,15 @@ def make_handler(env_box: list[lispy.Env]):
                     return
                 self._send_json(200, _eval_src(env, src))
                 return
+            if path == "/interrupt":
+                # 走行中の agent loop を step 境界で止める。 _LOCK は取らない —
+                # /eval が lock を握って走っている最中に外から叩けることが要件。
+                if env.interrupt is not None:
+                    env.interrupt.set()
+                    self._send_json(200, {"ok": True, "interrupt": "requested"})
+                else:
+                    self._send_json(200, {"ok": False, "error": "no interrupt event on env"})
+                return
             if path == "/reset":
                 with _LOCK:
                     try:
@@ -534,6 +548,9 @@ def main() -> None:
                    help="副作用 tool の y/N 確認を全 skip (常駐 process では実質必須)")
     p.add_argument("--session", default="",
                    help="既存 session id (prefix 一致) を引き継ぐ。 省略で新規 session")
+    p.add_argument("--resume", action="store_true",
+                   help="session の会話を DB から復元 + commit-S 済み λ を restore。 "
+                        "--session 省略時は直近の session を対象にする")
     p.add_argument("--stdin", action="store_true",
                    help="stdin からも S 式を読む REPL を server と並列で起動")
     args = p.parse_args()
@@ -546,14 +563,22 @@ def main() -> None:
             pass
 
     sid = _resume_or_new(args.session)
-    env = lispy.build_default_env(record=True, sid=sid)
+    if args.resume and not args.session and not sid:
+        # --resume 単独のときだけ直近 session に fallback。 --session が明示されて
+        # 解決に失敗した場合は fallback しない (別の session を誤って resume しない)
+        db = host.init_db(host.DB_PATH)
+        try:
+            sid = lispy._last_session_id(db)
+        finally:
+            db.close()
+    env = lispy.build_default_env(record=True, sid=sid, resume=args.resume and bool(sid))
     _load_extras(env)
     env_box: list[lispy.Env] = [env]
 
     sid_note = f"resumed {env.record_sid[:12]}" if sid else f"new session {env.record_sid[:12]}"
     print(f"lispy-server on http://{args.host}:{args.port}  ({sid_note})")
     print(f"  bindings: {len(env.bindings)}  tools: {len(env.tools)}")
-    print("  endpoints: POST /eval /load /reset  GET / /bindings /recall?q=")
+    print("  endpoints: POST /eval /load /reset /interrupt  GET / /bindings /recall?q=")
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(env_box))
 
