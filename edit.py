@@ -183,25 +183,42 @@ def undo_list() -> str:
 # post-edit check — 編集直後にチェックコマンドを自動実行して結果を tool result に添付
 # (opencode の LSP diagnostics の軽量版。 型エラー・lint を agent に即フィードバックする)
 #
-# 設定: 環境変数 LISPY_CHECK_CMD、 または編集ファイルから上方探索した .lispy-check の 1 行目。
-# コマンド中の {file} は編集したファイルのパスに置換される。
+# 設定は明示 opt-in のみ: 環境変数 LISPY_CHECK_CMD (コマンド文字列)、 または
+# LISPY_CHECK_FILE=<path> (そのファイルの 1 行目をコマンドとして使う)。
+# cwd 上方の .lispy-check は検出して案内するのみで自動実行しない — repo 同梱の設定で
+# 任意コマンドが走るのを防ぐ (hooks / mcp と同じ規律)。 {file} は編集ファイルに置換。
 # ---------------------------------------------------------------------------
+
+_CHECK_HINTED = [False]
+
+
+def _read_check_file(f: Path) -> tuple[str, Path] | None:
+    try:
+        lines = f.read_text(encoding="utf-8").strip().splitlines()
+    except Exception:
+        return None
+    cmd = lines[0].strip() if lines else ""
+    return (cmd, f.parent) if cmd else None
+
 
 def _find_check_cmd(start: Path) -> tuple[str, Path] | None:
     envcmd = os.environ.get("LISPY_CHECK_CMD", "").strip()
     d = start if start.is_dir() else start.parent
     if envcmd:
         return envcmd, d
+    envfile = os.environ.get("LISPY_CHECK_FILE", "").strip()
+    if envfile:
+        f = Path(envfile).expanduser()
+        return _read_check_file(f) if f.exists() else None
+    # 検出案内のみ — 自動実行しない
     for parent in [d, *d.parents]:
         f = parent / ".lispy-check"
         if f.exists():
-            try:
-                first = f.read_text(encoding="utf-8").strip().splitlines()
-            except Exception:
-                return None
-            cmd = first[0].strip() if first else ""
-            if cmd:
-                return cmd, parent
+            if not _CHECK_HINTED[0]:
+                _CHECK_HINTED[0] = True
+                print(f"  (post-edit check: {f} を検出したが自動実行しない — "
+                      f"使うには LISPY_CHECK_FILE={f} を設定)")
+            break
     return None
 
 

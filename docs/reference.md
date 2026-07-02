@@ -646,7 +646,8 @@ transcript 形式の system turn 1 つに畳んで復元 (DB は tool_call_id �
 生 replay は API に弾かれる)。 その session で commit-S された λ は最新 snapshot から自動
 restore — 「λ は session を跨いで残らない」 の運用面の答えは commit-S + resume になった。
 
-**hooks (`.lispy-hooks.json`、 cwd から上方探索、 LISPY_HOOKS で明示指定可)。**
+**hooks (`LISPY_HOOKS=<path>` で明示 opt-in。 cwd 上方の `.lispy-hooks.json` は検出案内のみ
+— repo 同梱設定による任意コマンド実行を防ぐ、 MCP と同じ規律)。**
 
 ```json
 {"pre-tool":  [{"match": "shell", "cmd": "my-guard.sh"}],
@@ -660,9 +661,10 @@ restore — 「λ は session を跨いで残らない」 の運用面の答え�
   system-reminder として次 round に入る。 1 入力 2 回まで (hook 故障で無限拘束しない)
 - hook には LISPY_HOOK_EVENT / LISPY_TOOL_NAME / LISPY_TOOL_ARGS / LISPY_TOOL_RESULT が渡る
 
-**post-edit check。** write_file / edit_file の直後に LISPY_CHECK_CMD (または編集ファイルから
-上方探索した `.lispy-check` の 1 行目、 `{file}` 置換可) を自動実行し、 結果を tool result に
-添付する。 opencode の LSP diagnostics の軽量版。
+**post-edit check。** write_file / edit_file の直後に LISPY_CHECK_CMD (コマンド文字列) か
+LISPY_CHECK_FILE (そのファイルの 1 行目、 `{file}` 置換可) を自動実行し、 結果を tool result に
+添付する。 opencode の LSP diagnostics の軽量版。 cwd 上方の `.lispy-check` は検出案内のみ
+(明示 opt-in が必要)。
 
 **undo。** `(undo [n])` / `(undo-list)` — write-file / edit-file / append-file の変更前内容を
 スタックに積んで巻き戻す (新規作成は削除)。 shell 経由の副作用は対象外 — Claude Code の

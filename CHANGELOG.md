@@ -5,6 +5,12 @@
 
 ## 2026-07-02 (7) — レビュー指摘の修正 (安全側の締め直し 10 件)
 
+### Changed
+- **hooks / post-edit check も明示 opt-in に** (mcp と同じ規律) — `LISPY_HOOKS=<path>` /
+  `LISPY_CHECK_CMD` または `LISPY_CHECK_FILE=<path>` で指定したものだけ実行。
+  cwd 上方の `.lispy-hooks.json` / `.lispy-check` は検出して案内するのみ —
+  clone した repo 同梱の設定で任意コマンドが走る経路を全部閉じた
+
 ### Fixed
 - auto-step の off-by-one — round 番号を 1-based にし、 作業 round がちょうど max-rounds 回に
 - brainwash: 蒸留層の wipe を marker (`.lispy-memory`) のあるディレクトリに限定 —
