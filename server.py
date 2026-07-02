@@ -531,8 +531,11 @@ def make_handler(env_box: list[lispy.Env]):
             view.GATES.watcher_add()
             try:
                 sid = view.resolve_sid(db, scope, env_box[0].record_sid)
-                gate_v = view.GATES.version
-                view_v = view.CURRENT_VIEW.version
+                # -1 始まり = 接続直後の 1 周目で必ず gate/view イベントを流す。
+                # client の /view/state 取得とこの snapshot の間に登録された gate が
+                # 「version 変化なし」 で永久に見えなくなる隙間を閉じる。
+                gate_v = -1
+                view_v = -1
                 idle = 0
                 while True:
                     if scope == "current" and env_box[0].record_sid != sid:
@@ -668,6 +671,21 @@ def _stdin_repl(env_box: list[lispy.Env]) -> None:
 
     server と並列で動く軽量 REPL。 多行 S 式はカッコバランスで継続。
     """
+    # terminal が gate の答え手になれるのはこの thread が生きている間だけ —
+    # Ctrl-D で抜けたら clear する (立てっぱなしだと誰も読まない stdin を
+    # 答え手として数え、 headless の 600s 停止が再発する)。
+    if view is not None:
+        view.GATES.terminal_answerer = sys.stdin.isatty()
+        view.GATES.terminal_thread = threading.get_ident()
+    try:
+        _stdin_repl_loop(env_box)
+    finally:
+        if view is not None:
+            view.GATES.terminal_answerer = False
+            view.GATES.terminal_thread = None
+
+
+def _stdin_repl_loop(env_box: list[lispy.Env]) -> None:
     try:
         while True:
             line = input("lispy> ")
@@ -743,10 +761,10 @@ def main() -> None:
     # View 層 (フェーズ 2): server では y/N 確認を pending gate に載せる —
     # ブラウザ (/view) と terminal (y/n) の先着採用。 --yolo では確認自体が skip される。
     # 答え手 (SSE watcher / stdin REPL) がいなければ gate は登録されず即 fail-closed。
+    # terminal_answerer は _stdin_repl が thread の生存期間だけ立てる。
     if view is not None:
         view.GATES.remote = True
         view.GATES.sid_provider = lambda: env_box[0].record_sid
-        view.GATES.terminal_answerer = bool(args.stdin and sys.stdin.isatty())
 
     sid_note = f"resumed {env.record_sid[:12]}" if sid else f"new session {env.record_sid[:12]}"
     print(f"lispy-server on http://{args.host}:{args.port}  ({sid_note})")

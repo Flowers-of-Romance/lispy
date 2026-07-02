@@ -1020,12 +1020,12 @@ def _gate_human_confirm(env: Env, name: str, value: Any) -> tuple[str, str]:
         import edit as _edit_mod
     except ImportError:
         return ("deny", f"(gate: {name} の変更には人間の承認が必要だが edit 層が無い — fail-closed)")
-    diff = None
+    # _confirm_diff は remote mode のときだけ・サイズ上限つきで diff を計算する —
+    # 巨大 body で _LOCK を握ったまま difflib が固まる事故を edit.py 側と同じ規約で防ぐ
     try:
-        import view as _view_mod
-        diff = _view_mod.diff_lines(cur_text, cand_text)
-    except ImportError:
-        pass
+        diff = _edit_mod._confirm_diff(cur_text, cand_text)
+    except Exception:
+        diff = None
     approved = _edit_mod._confirm(
         f"  [gate] {name} (エスカレーション分類 step) を書き換えますか?\n"
         f"    現行: {cur_text[:120]}\n    提案: {cand_text[:120]}\n  [y/N]: ",

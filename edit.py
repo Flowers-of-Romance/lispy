@@ -23,6 +23,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -98,7 +99,13 @@ def _confirm(prompt: str, *, kind: str = "confirm", title: str = "",
     ブラウザの承認ボタンと terminal の y/n の先着を採用する。
     それ以外 (単体 REPL) は従来どおり input() — 挙動は変えない。
     input() が失敗 (non-tty 等) なら False (skip 扱い)。"""
-    if _view is not None and _view.GATES.remote:
+    remote = _view is not None and _view.GATES.remote
+    if remote and _view.GATES.terminal_thread == threading.get_ident():
+        # server の stdin REPL 自身が評価中の確認 — この thread が stdin を持っている
+        # ので registry に載せず従来の対話 input() で聞く。 registry に載せると
+        # 自分の gate を自分で待つ形になり、 stdin を誰も読まないまま timeout する。
+        remote = False
+    if remote:
         approved, source = _view.GATES.ask(
             kind, title or prompt.strip(), detail=detail, diff=diff)
         # stderr へ — /eval の redirect_stdout に飲まれず server の terminal に届く
@@ -106,10 +113,13 @@ def _confirm(prompt: str, *, kind: str = "confirm", title: str = "",
               f"{'approve' if approved else 'deny'} ({source})", file=sys.stderr, flush=True)
         return approved
     try:
-        ans = input(prompt).strip().lower()
+        # prompt は stderr へ — server の _eval_src が stdout を redirect していても
+        # terminal に届く。 tty 上では見た目は従来と同じ
+        print(prompt, end="", file=sys.stderr, flush=True)
+        ans = input().strip().lower()
         return ans in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
-        print()
+        print(file=sys.stderr)
         return False
 
 

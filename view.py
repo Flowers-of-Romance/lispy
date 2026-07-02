@@ -56,6 +56,15 @@ def _log_meta_rw(kind: str, sid: str | None, payload: str) -> None:
 # する。 先着採用 — 2 番手は False が返る。 解決は kind=confirm で ledger に残る。
 # ---------------------------------------------------------------------------
 
+# 答え手喪失の扱い (誤 deny と 600s 停止の間のバランス):
+#   GRACE  — 登録時: 直近この秒数以内に watcher がいたなら登録を許す。 F5 / session
+#            切替での SSE 再接続 (数秒) の隙間で、 見ている人がいるのに即 deny しない
+#   LOST   — 待機中: 答え手不在がこの秒数続いたら deny。 SSE の keepalive (15s) で
+#            切断は検知されるので、 閉じたタブを timeout (600s) まで待たない
+ANSWERER_GRACE = 60.0
+ANSWERER_LOST_DENY = 45.0
+
+
 class GateRegistry:
     def __init__(self) -> None:
         self._cond = threading.Condition()
@@ -66,23 +75,35 @@ class GateRegistry:
         self.sid_provider: Any = None  # () -> record_sid。 server が env_box を差す
         # 「答え手」の把握 — 誰も見ていない gate は登録せず即 fail-closed (旧 _confirm の
         # 「non-tty なら即 skip」の保存)。 watchers = /view の SSE 接続数、
-        # terminal_answerer = server の stdin REPL が tty で動いているか。
+        # terminal_answerer = server の stdin REPL が tty で動いているか (REPL thread の
+        # 生存期間だけ True — server 側が set/clear する)。
         self.watchers = 0
         self.terminal_answerer = False
+        self.terminal_thread: int | None = None  # stdin REPL の thread id
+        self.last_watcher_ts = 0.0  # watcher の増減があった時刻 (GRACE 判定用)
         # 最後に terminal へ告知した gate id — 裸の y/n はこの gate にだけ効く
         self.last_announced = 0
 
     def watcher_add(self) -> None:
         with self._cond:
             self.watchers += 1
+            self.last_watcher_ts = time.time()
 
     def watcher_remove(self) -> None:
         with self._cond:
             self.watchers = max(0, self.watchers - 1)
+            self.last_watcher_ts = time.time()
+
+    def _answerers(self, asker: int) -> bool:
+        """asker (thread id) 以外に答えられる者がいるか。 terminal は REPL thread 自身が
+        gate を起こしている場合は数えない — その thread は ask() で block していて
+        stdin を読めない。 呼び出し側が self._cond を握っていること。"""
+        return (self.watchers > 0
+                or (self.terminal_answerer and self.terminal_thread not in (None, asker)))
 
     def can_answer(self) -> bool:
         with self._cond:
-            return self.watchers > 0 or self.terminal_answerer
+            return self._answerers(threading.get_ident())
 
     def has_pending(self) -> bool:
         with self._cond:
@@ -116,7 +137,13 @@ class GateRegistry:
                 pass
         # 答え手がいなければ登録せず即 fail-closed — 旧 _confirm (input() が non-tty で
         # 即 False) の性質を保存する。 headless 運用で eval が timeout ぶん止まらない。
-        if not self.can_answer():
+        # ただし直近 GRACE 秒以内に watcher がいたなら登録を許す — F5 / session 切替の
+        # SSE 再接続の隙間で、 実際には見ている人がいるのに即 deny しない。
+        me = threading.get_ident()
+        with self._cond:
+            answerable = (self._answerers(me)
+                          or time.time() - self.last_watcher_ts < ANSWERER_GRACE)
+        if not answerable:
             print(f"  [gate] no answerer (browser/terminal とも不在) — fail-closed deny: {title[:80]}",
                   file=sys.stderr, flush=True)
             _log_meta_rw("confirm", sid, json.dumps({
@@ -140,11 +167,22 @@ class GateRegistry:
             print(f"  [gate #{gid}] pending: {entry['title'][:80]} — /view で承認/却下 (terminal: y/n)",
                   file=sys.stderr, flush=True)
             deadline = time.time() + timeout
+            lost_since: float | None = None
             while entry["decision"] is None:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     entry["decision"] = "deny"
                     entry["source"] = "timeout"
+                    break
+                # 待機中も答え手を監視 — タブが閉じられたら timeout まで待たずに deny。
+                # 一時的な喪失 (再接続中) は LOST 秒まで許す。
+                if self._answerers(me):
+                    lost_since = None
+                elif lost_since is None:
+                    lost_since = time.time()
+                elif time.time() - lost_since > ANSWERER_LOST_DENY:
+                    entry["decision"] = "deny"
+                    entry["source"] = "answerer-lost"
                     break
                 self._cond.wait(min(remaining, 1.0))
             del self._pending[gid]
@@ -254,11 +292,14 @@ def _sym_name(v: Any) -> str | None:
 
 
 def _plain_value(v: Any, depth: int = 0) -> Any:
-    """属性値の JSON 化。 scalar / symbol / (入れ子の) list だけ許す — 関数や env は通さない。"""
+    """属性値の JSON 化。 scalar / symbol / (入れ子の) list だけ許す — 関数や env は通さない。
+    文字列は text の content と同じ上限でキャップ (agent 制御の面は全部同じガード)。"""
     s = _sym_name(v)
     if s is not None:
-        return s
-    if isinstance(v, (str, int, float, bool)) or v is None:
+        return s[:10000]
+    if isinstance(v, str):
+        return v[:10000]
+    if isinstance(v, (int, float, bool)) or v is None:
         return v
     if isinstance(v, list):
         if depth >= 4:
@@ -287,16 +328,25 @@ def sexp_to_view(node: Any, _depth: int = 0, _count: list[int] | None = None) ->
         raise ViewError(f"unknown tag: {tag} (語彙: {', '.join(sorted(VIEW_VOCAB))})")
 
     # :key value ペアを先頭から読む → 残りが children。
-    # キーは symbol のみ — ":" で始まるただの文字列は text 子要素として扱う。
+    # symbol keyword は厳格 (語彙外 attr はエラー)。 文字列は原則 text 子要素だが、
+    # 後方互換として「その tag の既知 attr 名に一致し、 値が続く」 ときだけ attr と
+    # 読む — json-parse 等で組んだ木 (keyword が文字列になる) を壊さないため。
+    # ":warning ..." のような普通の文章は既知 attr 名に一致しないので text のまま。
     attrs: dict[str, Any] = {}
     i = 1
     while i < len(node):
         k = _sym_name(node[i])
-        if k is None or not k.startswith(":"):
+        if k is not None:
+            if not k.startswith(":"):
+                break
+            key = k[1:]
+            if key not in spec["attrs"]:
+                raise ViewError(f"unknown attr :{key} for {tag}")
+        elif (isinstance(node[i], str) and node[i].startswith(":")
+              and node[i][1:] in spec["attrs"] and i + 1 < len(node)):
+            key = node[i][1:]
+        else:
             break
-        key = k[1:]
-        if key not in spec["attrs"]:
-            raise ViewError(f"unknown attr :{key} for {tag}")
         if i + 1 >= len(node):
             raise ViewError(f":{key} に値がない ({tag})")
         attrs[key] = _plain_value(node[i + 1])
@@ -605,6 +655,10 @@ def summary_24h(db: sqlite3.Connection) -> dict:
         except Exception:
             continue
         if kind == "confirm":
+            # escalation の confirm は同一イベントが kind=gate 行にも記録される
+            # (_gate_log_bind) — 二重計上しない
+            if p.get("kind") == "escalation":
+                continue
             if p.get("decision") != "approve":
                 out["rejects"] += 1
         elif not p.get("approved"):
@@ -1059,6 +1113,9 @@ async function init() {
       .then(r => r.json());
   } catch (e) { scheduleRetry(); return; }
   if (!st.ok) { scheduleRetry(); return; }
+  // 再接続 = server が再起動している可能性 — version 番号は process ごとに 1 から
+  // 振り直されるため、 前 process の番号と衝突して stale view を掴まないようリセット
+  aviewVersion = -1;
   renderPanels(st);
   seen.clear();
   document.getElementById("timeline").replaceChildren();
