@@ -491,6 +491,37 @@ def _timeline(db: sqlite3.Connection, sid: str | None, limit: int = TIMELINE_LIM
     return events[-limit:]
 
 
+def summary_24h(db: sqlite3.Connection) -> dict:
+    """最上段の要約 (要約ファースト)。 直近 24 時間・全 session の活動量 —
+    抜き取り検査の一枚目なので、 scope に依らず箱全体を集計する。
+    ledger + turns からの導出のみ (メモリ上の独自集計は持たない — 再起動に強い)。"""
+    since = time.time() - 86400
+    out = {"steps": 0, "tools": 0, "rejects": 0, "skill_updates": 0}
+    for role, n in db.execute(
+        "SELECT role, COUNT(*) FROM turns WHERE ts > ? GROUP BY role", (since,),
+    ).fetchall():
+        if role == "assistant":
+            out["steps"] = n
+        elif role == "tool":
+            out["tools"] = n
+    for kind, payload in db.execute(
+        "SELECT kind, payload FROM meta_events WHERE ts > ? AND kind IN ('gate', 'skill', 'confirm')",
+        (since,),
+    ).fetchall():
+        try:
+            p = json.loads(payload or "")
+        except Exception:
+            continue
+        if kind == "confirm":
+            if p.get("decision") != "approve":
+                out["rejects"] += 1
+        elif not p.get("approved"):
+            out["rejects"] += 1
+        elif kind == "skill":
+            out["skill_updates"] += 1
+    return out
+
+
 def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
     """初期スナップショット。 cursors は timeline より先に読む — 隙間の行は SSE 側と
     重複して届く可能性があるが、 client が (src, id) で dedupe する (欠落よりまし)。"""
@@ -582,6 +613,21 @@ VIEW_HTML = """<!doctype html>
   li.tag-tool .tag{color:#a60}
   li.rejected{background:#f8d7da}
   li.rejected .head{color:#a11;font-weight:bold}
+  .stats{display:flex;gap:.8em;margin:1em 0;flex-wrap:wrap}
+  .stat{display:flex;flex-direction:column;align-items:center;min-width:7.5em;
+        padding:.5em .8em;border:1px solid #ddd;border-radius:6px;background:#fafafa;
+        text-decoration:none;color:#222}
+  .stat b{font-size:1.6em;line-height:1.2}
+  .stat span{font-size:.75em;color:#666}
+  .stat.alert{background:#f8d7da;border-color:#c33}
+  .stat.alert b{color:#a11}
+  .stat.attn{background:#fff8e6;border-color:#c70}
+  .stat.attn b{color:#c70}
+  details.fold{border:1px solid #ddd;border-radius:4px;background:#fff;margin:.4em 0}
+  details.fold>summary{cursor:pointer;padding:.4em .6em;font-size:.9em;color:#444;
+                       background:#f6f6f6;border-radius:4px}
+  details.fold[open]>summary{border-bottom:1px solid #ddd;border-radius:4px 4px 0 0}
+  details.fold>#timeline{border:none;border-radius:0}
   .why{color:#a11;font-size:.9em;margin-left:1.5em;white-space:pre-wrap}
   .replaced{text-decoration:line-through;color:#999}
   li.tag-confirm{background:#e8f5e9}
@@ -621,23 +667,34 @@ VIEW_HTML = """<!doctype html>
   <a href="/view?session=all">all sessions</a>
   <a href="/spec">spec</a>
 </div>
-<div class="panels">
-  <div class="panel"><h2>R</h2><ul id="panel-R"></ul></div>
-  <div class="panel"><h2>K</h2><ul id="panel-K"></ul></div>
-  <div class="panel"><h2>S</h2><ul id="panel-S"></ul></div>
+<div class="stats" id="summary">
+  <a class="stat" href="#timeline-wrap"><b id="st-steps">0</b><span>step (24h)</span></a>
+  <a class="stat" href="#timeline-wrap"><b id="st-tools">0</b><span>tool (24h)</span></a>
+  <a class="stat" id="stat-rejects" href="#gates-wrap"><b id="st-rejects">0</b><span>REJECT (24h)</span></a>
+  <a class="stat" id="stat-skill" href="#gates-wrap"><b id="st-skill">0</b><span>SKILL.md 書換 (24h)</span></a>
+  <a class="stat" id="stat-pending" href="#pending-wrap"><b id="st-pending">0</b><span>承認待ち</span></a>
 </div>
 <div id="pending-wrap" style="display:none">
   <h2>承認待ち gate</h2>
   <div id="pending"></div>
 </div>
+<div class="panels">
+  <div class="panel"><h2>R</h2><ul id="panel-R"></ul></div>
+  <div class="panel"><h2>K</h2><ul id="panel-K"></ul></div>
+  <div class="panel"><h2>S</h2><ul id="panel-S"></ul></div>
+</div>
 <div id="aview-wrap" style="display:none">
   <h2>agent view <span class="note">(show-view による提示)</span></h2>
   <div id="aview"></div>
 </div>
-<h2>timeline <span class="note">(turns + ledger)</span></h2>
-<ol id="timeline"></ol>
-<h2>gate / confirm 判定履歴 <span class="note">(直近 20 件)</span></h2>
-<ul id="gates"></ul>
+<details class="fold" id="timeline-wrap">
+  <summary>timeline — 掘る用 <span class="note">(turns + ledger、 直近 100 件)</span></summary>
+  <ol id="timeline"></ol>
+</details>
+<div id="gates-wrap">
+  <h2>gate / confirm 判定履歴 <span class="note">(直近 20 件)</span></h2>
+  <ul id="gates"></ul>
+</div>
 <script>
 "use strict";
 const params = new URLSearchParams(location.search);
@@ -668,7 +725,27 @@ function setStatus(on) {
   document.getElementById("conn").className = "dot " + (on ? "on" : "off");
 }
 
+function renderSummary(st) {
+  const s = st.summary || {};
+  const nPending = (st.pending || []).length;
+  document.getElementById("st-steps").textContent = s.steps || 0;
+  document.getElementById("st-tools").textContent = s.tools || 0;
+  document.getElementById("st-rejects").textContent = s.rejects || 0;
+  document.getElementById("st-skill").textContent = s.skill_updates || 0;
+  document.getElementById("st-pending").textContent = nPending;
+  document.getElementById("stat-rejects").className =
+    "stat" + ((s.rejects || 0) > 0 ? " alert" : "");
+  document.getElementById("stat-pending").className =
+    "stat" + (nPending > 0 ? " attn" : "");
+}
+
+function bumpSummary(id) {
+  const b = document.getElementById(id);
+  b.textContent = (parseInt(b.textContent, 10) || 0) + 1;
+}
+
 function renderPanels(st) {
+  renderSummary(st);
   document.getElementById("sess").textContent =
     st.session_id === null ? "(all)" : (st.session_id || "(none)");
 
@@ -862,6 +939,9 @@ function connect(cur) {
     if (ev.type === "session") { if (es) { es.close(); es = null; } init(); return; }
     if (ev.type === "gate" || ev.type === "view") { refreshPanels(); return; }
     appendTimeline(ev);
+    // 要約カウンタの即時更新 (真値は refreshPanels の再取得で揃う)
+    if (ev.src === "turn" && ev.tag === "assistant") bumpSummary("st-steps");
+    if (ev.src === "turn" && ev.tag === "tool") bumpSummary("st-tools");
     if (["R", "K", "S", "gate", "skill", "confirm", "intent"].includes(ev.tag)) refreshPanels();
   };
   es.onerror = scheduleRetry;

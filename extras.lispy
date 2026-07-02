@@ -377,3 +377,22 @@
               (append acc (_match-binds `(nth ,i ,v) ep))))
           (list)
           (zip (iota (length elems)) elems))))
+
+;; ===========================================================================
+;; エスカレーション分類 step (View 層 v2)
+;; ===========================================================================
+;; event の kind → 'sync | 'notify | 'silent の三層に分類する。
+;;   sync   = 人間が応答するまで停止 (同期ゲート)
+;;   notify = 停止しないが通知に積む (非同期通知)
+;;   silent = ledger に沈むのみ (正常系)
+;; 通知の受け口 (フェーズ2) がこの step を引いて振り分ける。
+;; 分類規則は step なので実行時に書き換えられるが、 この binding の agent による
+;; 再定義だけは常に人間の同期ゲートを通る (lispy 本体の GATE_HUMAN_SYNC で
+;; ハードコード — 再帰の底は人間が握る)。
+(define escalation-class
+  (lambda (kind)
+    (cond ((eq? kind "gate-reject")      'notify)   ; judge / gate の REJECT
+          ((eq? kind "skill-reject")     'notify)   ; SKILL.md 更新の REJECT
+          ((eq? kind "skill-update")     'notify)   ; SKILL.md の世代交代 (承認済み)
+          ((eq? kind "step-repeat-fail") 'notify)   ; 同一 step の反復失敗
+          (else                          'silent))))

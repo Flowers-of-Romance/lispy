@@ -1003,6 +1003,39 @@ def _gate_call_judge(env: Env, name: str, value: Any) -> tuple[bool, str]:
     return first.startswith("APPROVE"), out
 
 
+# エスカレーション分類 step (escalation-class、 extras.lispy 定義) — どのイベントを
+# 人間に見せるかの規則。 この binding の agent による変更だけは judge に委ねず、
+# 常に人間の同期ゲート (y/N or ブラウザ承認) を通す。 再帰の底は人間が握る —
+# この不変条件は step 側でなくここ (lispy 本体) でハードコードする (V2 設計)。
+GATE_HUMAN_SYNC = frozenset({"escalation-class"})
+
+
+def _gate_human_confirm(env: Env, name: str, value: Any) -> tuple[str, str]:
+    """人間の同期ゲート。 server では /view の承認ボタン、 単体 REPL では y/N。
+    edit/view 層が無い環境では fail-closed (deny)。"""
+    current = env.bindings.get(name)
+    cur_text = _gate_body_text(current) if current is not None else "(未定義)"
+    cand_text = _gate_body_text(value)
+    try:
+        import edit as _edit_mod
+    except ImportError:
+        return ("deny", f"(gate: {name} の変更には人間の承認が必要だが edit 層が無い — fail-closed)")
+    diff = None
+    try:
+        import view as _view_mod
+        diff = _view_mod.diff_lines(cur_text, cand_text)
+    except ImportError:
+        pass
+    approved = _edit_mod._confirm(
+        f"  [gate] {name} (エスカレーション分類 step) を書き換えますか?\n"
+        f"    現行: {cur_text[:120]}\n    提案: {cand_text[:120]}\n  [y/N]: ",
+        kind="escalation", title=f"escalation step の再定義: {name}",
+        detail=f"現行:\n{cur_text[:1000]}\n\n提案:\n{cand_text[:1000]}", diff=diff)
+    if approved:
+        return ("approve", "human-approved: エスカレーション分類 step の変更")
+    return ("deny", f"(gate: {name} は人間の同期ゲートで却下された — 分類規則の変更は人間の承認が必須)")
+
+
 def _gate_log_bind(env: Env, name: str, approved: bool, why: str) -> None:
     """bind gate の判定結果を ledger (kind=gate) に残す — /view のタイムライン表示用。
     ledger 書き込みの成否は gate の判定に影響しない (ベストエフォート)。"""
@@ -1024,6 +1057,10 @@ def gate_check_bind(env: Env, name: str, value: Any) -> tuple[str, str] | None:
     if not _gate_active(env):
         return None
     gate = env.gate
+    if name in GATE_HUMAN_SYNC:
+        result = _gate_human_confirm(env, name, value)
+        _gate_log_bind(env, name, result[0] == "approve", result[1])
+        return result
     if name in gate.protected_py:
         _gate_log_bind(env, name, False, "python primitive の shadow は禁止")
         return ("deny", f"(gate: {name} は Python primitive — shadow は禁止。 別名で define すること)")
@@ -1048,7 +1085,7 @@ def gate_check_macro(env: Env, name: str) -> str | None:
         return f"(defmacro: {name} は special form と衝突 — 評価器を迂回するため禁止)"
     if _gate_active(env):
         gate = env.gate
-        if name in gate.protected_py or name in gate.protected_loop:
+        if name in gate.protected_py or name in gate.protected_loop or name in GATE_HUMAN_SYNC:
             return f"(gate: macro {name} は保護 binding を shadow する — 禁止)"
     return None
 
@@ -1233,6 +1270,22 @@ def _is_skill_path(path_str: str) -> bool:
     return p.name == "SKILL.md" and "skills" in p.parts
 
 
+# View 層のファイル — agent の自己修正の対象外 (V2 設計の不変条件)。
+# 自己修正で書き換わってよいのは「どんなデータを送るか」の側だけで、
+# ブラウザで走るコードとレンダラーには及ばない。 judge 審査にも回さず一律 deny。
+_VIEW_LAYER_FILES = frozenset({"view.py"})
+
+
+def _is_view_layer_path(path_str: str) -> bool:
+    if not path_str:
+        return False
+    try:
+        p = Path(str(path_str)).expanduser().resolve()
+    except OSError:
+        return False
+    return p.name in _VIEW_LAYER_FILES and p.parent == Path(__file__).resolve().parent
+
+
 def _gate_judge_skill(env: Env, path: str, current: str, proposed: str) -> tuple[bool, str]:
     """judge LLM に現行と提案の SKILL.md を見せて APPROVE / REJECT。 fail-closed。"""
     user_content = (
@@ -1275,13 +1328,20 @@ def _gate_check_skill_write(env: Env, name: str, args: dict) -> str | None:
     if gate is None or not gate.enabled:
         return None
     if name in ("shell", "shell_bg"):
-        if "SKILL.md" in str(args.get("cmd", "")):
+        cmd = str(args.get("cmd", ""))
+        if "SKILL.md" in cmd:
             return ("(gate: SKILL.md を shell で触るのは禁止 — 読むなら read_file、"
                     " 更新は write_file / edit_file で提案すること (審査を通すため))")
+        if any(f in cmd for f in _VIEW_LAYER_FILES):
+            return ("(gate: View 層のファイルを shell で触るのは禁止 — "
+                    "View 層は自己修正の対象外。 読むなら read_file)")
         return None
     if name not in ("write_file", "edit_file", "append_file"):
         return None
     path = str(args.get("path", ""))
+    if _is_view_layer_path(path):
+        return ("(gate: View 層のファイルは自己修正の対象外 — 書き換え不可。 "
+                "画面はデータで組む: (show-view ...) を使うこと)")
     if not _is_skill_path(path):
         return None
     p = Path(path).expanduser()
