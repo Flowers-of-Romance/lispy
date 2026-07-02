@@ -474,6 +474,8 @@ def make_handler(env_box: list[lispy.Env]):
                 try:
                     sid = view.resolve_sid(db, scope, env.record_sid)
                     body = view.state_json(db, sid, scope)
+                    # 要約 (直近 24h・全 session) — 抜き取り検査の一枚目
+                    body["summary"] = view.summary_24h(db)
                     # pending gate と agent view は ledger でなくプロセス内の runtime 状態
                     body["pending"] = view.GATES.pending_list()
                     body["view"] = view.CURRENT_VIEW.get()
