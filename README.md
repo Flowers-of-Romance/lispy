@@ -171,15 +171,15 @@ judge client を使う。
 | auto-compaction | context の 8 割超えで自動要約 + renew。 overflow エラー時は緊急退避 + retry の二段構え |
 | resume | `lispy --resume` / `lispy-server --resume` — 前回 session の会話 + commit-S 済み λ を復元 |
 | bg プロセス | `shell_bg` / `shell_out` / `shell_kill` — dev server や長いビルドを待たずに回す |
-| post-edit check | `.lispy-check` (1 行目のコマンド、 `{file}` 置換) を編集直後に自動実行 → 結果を agent に返す |
+| post-edit check | `LISPY_CHECK_CMD` (または `LISPY_CHECK_FILE`) のコマンドを編集直後に自動実行 → 結果を agent に返す |
 | undo | `(undo [n])` — file 編集の巻き戻し (shell の副作用は対象外) |
 | プロジェクト文脈 | cwd から上方の AGENTS.md / CLAUDE.md を system prompt に注入 |
 | 並列 tool | read-only だけの batch は並列実行 (dispatch-tools) |
-| hooks | `.lispy-hooks.json` — pre-tool (ブロック可) / post-tool (結果に添付) / stop (止まれなくする) |
+| hooks | `LISPY_HOOKS=<設定>` — pre-tool (ブロック可) / post-tool (結果に添付) / stop (止まれなくする) |
 | MCP | `LISPY_MCP=<設定>` で opt-in した server (stdio) を `mcp__<server>__<tool>` として tool 化。 `(mcp-list)` で確認 |
 | skills | `.lispy/skills/<name>/SKILL.md` の一覧を system prompt に常駐、 本文は合致時に agent が read。 agent 自身が更新できる (judge 審査つき — 検証を弱める変更は却下)。 更新履歴は rk-log の [skill] |
 
-hooks の例:
+hooks の例 (`LISPY_HOOKS=./.lispy-hooks.json` で opt-in):
 
 ```json
 {
@@ -187,6 +187,9 @@ hooks の例:
   "stop": [{"cmd": "test -f data/receipt.md"}]
 }
 ```
+
+設定ファイル (hooks / check / MCP) は **cwd で見つかっても自動実行されない** — repo 同梱の
+設定で任意コマンドが走るのを防ぐため、 env での明示 opt-in が必要。
 
 ## CLI 3 つ
 

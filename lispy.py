@@ -1064,7 +1064,9 @@ def _check_interrupt(env: Env) -> None:
 # hooks — プロジェクト設定の shell コマンドを agent loop の決定的な点に差し込む
 # (Claude Code の PreToolUse / PostToolUse / Stop hook 相当)
 #
-# 設定: cwd から上方探索した .lispy-hooks.json (LISPY_HOOKS で明示指定も可)。 形式:
+# 設定: **LISPY_HOOKS=<path> で明示 opt-in したファイルだけ** 有効。 cwd 上方の
+# .lispy-hooks.json は検出して案内するのみで自動適用しない — clone した repo 同梱の
+# hook 設定で任意コマンドが走る (supply-chain) のを防ぐ (mcp の LISPY_MCP と同じ規律)。 形式:
 #   {"pre-tool":  [{"match": "write_file|edit_file", "cmd": "..."}],
 #    "post-tool": [{"match": "edit_file", "cmd": "ruff check ."}],
 #    "stop":      [{"cmd": "test -f data/receipt.md"}]}
@@ -1075,9 +1077,11 @@ def _check_interrupt(env: Env) -> None:
 # ---------------------------------------------------------------------------
 
 _HOOKS_CACHE: dict[str, tuple[float, dict]] = {}
+_HOOKS_HINTED = False
 
 
 def _hooks_config() -> dict:
+    global _HOOKS_HINTED
     explicit = os.environ.get("LISPY_HOOKS", "").strip()
     path: Path | None = None
     if explicit:
@@ -1085,12 +1089,17 @@ def _hooks_config() -> dict:
         if p.exists():
             path = p
     else:
+        # 検出案内のみ — 自動適用しない
         d = Path(os.getcwd())
         for parent in [d, *d.parents]:
             f = parent / ".lispy-hooks.json"
             if f.exists():
-                path = f
+                if not _HOOKS_HINTED:
+                    _HOOKS_HINTED = True
+                    print(f"  (hooks: {f} を検出したが自動適用しない — 使うには LISPY_HOOKS={f} を設定)",
+                          file=sys.stderr)
                 break
+        return {}
     if path is None:
         return {}
     key = str(path)
