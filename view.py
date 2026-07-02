@@ -662,41 +662,20 @@ def _timeline(db: sqlite3.Connection, sid: str | None, limit: int = TIMELINE_LIM
 
 
 def plan_state(db: sqlite3.Connection) -> dict | None:
-    """最新の計画 (kind=plan) + 承認 (kind=plan-approval) + 進捗 (kind=plan-progress)
-    をチェックリストに畳む。 lispy.py の _prim_plan_factory と同じ導出規則 —
-    ledger が唯一の真実で、 ここはその投影。 scope に依らず最新 1 件 (計画は run 単位)。"""
-    row = db.execute(
-        "SELECT id, payload FROM meta_events WHERE kind = 'plan' "
-        "ORDER BY id DESC LIMIT 1").fetchone()
-    if row is None:
+    """最新の計画 + 承認 + 進捗をチェックリストに畳む。 導出規則は host.plan_*
+    (lispy.py の plan primitives と共有) — ここは表示用の整形だけを持つ。
+    ledger が唯一の真実で、 scope に依らず最新 1 件 (計画は run 単位)。"""
+    p = host.plan_latest(db)
+    if p is None:
         return None
-    try:
-        p = json.loads(row[1] or "")
-    except Exception:
-        return None
-    plan_id = row[0]
-    status, source = "proposed", ""
-    for (payload,) in db.execute(
-        "SELECT payload FROM meta_events WHERE kind = 'plan-approval' "
-        "ORDER BY id DESC LIMIT 30").fetchall():
-        try:
-            a = json.loads(payload or "")
-        except Exception:
-            continue
-        if a.get("plan_id") == plan_id:
-            status = "approved" if a.get("approved") else "rejected"
-            source = a.get("source", "")
-            break
-    done: set[int] = set()
-    for (payload,) in db.execute(
-        "SELECT payload FROM meta_events WHERE kind = 'plan-progress' "
-        "ORDER BY id DESC LIMIT 200").fetchall():
-        try:
-            g = json.loads(payload or "")
-        except Exception:
-            continue
-        if g.get("plan_id") == plan_id and isinstance(g.get("step"), int):
-            done.add(g["step"])
+    plan_id = p["id"]
+    appr = host.plan_approval(db, plan_id)
+    if appr is None:
+        status, source = "proposed", ""
+    else:
+        status = "approved" if appr.get("approved") else "rejected"
+        source = appr.get("source", "")
+    done = host.plan_done_steps(db, plan_id)
     steps = [
         {"what": _head(s.get("what", "")), "why": _head(s.get("why", "")), "done": i in done}
         for i, s in enumerate(p.get("steps") or [], 1)

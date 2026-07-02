@@ -232,6 +232,55 @@ def log_meta(db: sqlite3.Connection, kind: str, sid: str | None = None, payload:
     db.commit()
 
 
+# --- plan ledger の投影 (kind=plan / plan-approval / plan-progress) ---
+# lispy.py の plan primitives と view.py の計画パネルが同じ導出規則を共有する
+# ための helper — 二重実装で規則が乖離しないよう、 投影はここに一本化する。
+# 書き込みは log_meta 経由 (append-only)、 ここは読むだけ。
+
+def plan_latest(db: sqlite3.Connection) -> dict | None:
+    """最新の kind=plan 行。 payload dict に "id" を足して返す。 無ければ None。"""
+    row = db.execute(
+        "SELECT id, payload FROM meta_events WHERE kind = 'plan' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return None
+    try:
+        p = json.loads(row[1] or "")
+    except Exception:
+        return None
+    p["id"] = row[0]
+    return p
+
+
+def plan_approval(db: sqlite3.Connection, plan_id: int) -> dict | None:
+    """plan_id への最新の承認判定 (kind=plan-approval の payload)。 無ければ None。"""
+    for (payload,) in db.execute(
+        "SELECT payload FROM meta_events WHERE kind = 'plan-approval' "
+        "ORDER BY id DESC LIMIT 30").fetchall():
+        try:
+            a = json.loads(payload or "")
+        except Exception:
+            continue
+        if a.get("plan_id") == plan_id:
+            return a
+    return None
+
+
+def plan_done_steps(db: sqlite3.Connection, plan_id: int) -> set[int]:
+    """plan_id の完了ステップ番号 (kind=plan-progress、 1-based) の集合。"""
+    done: set[int] = set()
+    for (payload,) in db.execute(
+        "SELECT payload FROM meta_events WHERE kind = 'plan-progress' "
+        "ORDER BY id DESC LIMIT 200").fetchall():
+        try:
+            g = json.loads(payload or "")
+        except Exception:
+            continue
+        if g.get("plan_id") == plan_id and isinstance(g.get("step"), int):
+            done.add(g["step"])
+    return done
+
+
 def get_client():
     missing = [k for k, v in (
         ("LLM_API_KEY", API_KEY),
