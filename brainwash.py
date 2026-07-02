@@ -191,9 +191,11 @@ def brainwash(db, sessions: list[str] | None = None) -> str:
     蒸留層に触らず message を返す (fail-safe: 壊れた出力で記憶を消さない)。"""
     try:
         sids = _pick_sessions(db, sessions)
-    except (SystemExit, Exception) as e:
-        # resolve_session は不存在/曖昧 prefix で SystemExit を投げる — agent の tool 経路から
-        # 呼ばれたとき Exception ハンドラを素通りして harness ごと落ちるので、 ここで message 化する
+    except SystemExit as e:
+        # resolve_session は不存在/曖昧 prefix で SystemExit を投げる (この 2 経路のみ) —
+        # agent の tool 経路から呼ばれたとき Exception ハンドラを素通りして harness ごと
+        # 落ちるので、 ここで message 化する。 それ以外の例外 (DB 障害等) は session 解決失敗に
+        # 偽装せず上位へ伝播させる (tool 経路では eval_ が "agent error: ..." として拾う)
         return f"(brainwash: session 解決失敗 — {e})"
     if not sids:
         return "(brainwash: 前回の洗脳以降に新しい turn が無い — 洗うものがない)"
