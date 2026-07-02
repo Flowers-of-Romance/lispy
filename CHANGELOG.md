@@ -3,6 +3,25 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-07-02 (6) — skill の自己更新 (審査つき)
+
+skill は詰まったとき・現実とずれたときに更新される — 凍結させない。
+SKILL.md は自然言語で書かれた loop 規則なので、 agent による更新は S 式の define-gate と
+同じく judge の審査を通す — gate があるからこそ、 更新の奨励を強く書ける。
+
+### Added
+- **skill 更新 gate** — tool_call (write_file / edit_file / append_file) の対象が
+  `skills/*/SKILL.md` なら、 現行と提案の全文を judge LLM に見せて APPROVE / REJECT。
+  判定基準: 検証手順を弱めていないか / 改善として筋が通るか / 無関係な指示の混入がないか。
+  却下理由は tool result で agent に返り、 修正して再提案できる。 fail-closed
+- 経路分離は define-gate と同型: 人間の REPL primitive (`(write-file ...)`) や editor 直編集は
+  dispatch を通らないので自由。 shell / shell_bg で SKILL.md に触るのは名指しで拒否
+  (yolo 時の `cat > SKILL.md` 迂回を塞ぐ)
+- 更新の記録: meta_events kind="skill" (approved / 理由)、 rk-log に [skill] で表示 —
+  RDD の S lineage の自然言語版 (skill がいつどう育ったかが台帳に残る)
+- system prompt の skills 一覧に更新規律を追記: 「詰まった・ずれていたら SKILL.md を更新すること —
+  凍結させない。 更新は installer の審査を通る」
+
 ## 2026-07-02 (5) — MCP client + skills
 
 ### Added
