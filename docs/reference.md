@@ -694,6 +694,14 @@ LISPY_MCP_TIMEOUT で request timeout (default 60s)。 SSE / HTTP transport は�
 system prompt に常駐させ、 本文はタスクに合致したとき agent が read_file で読む
 (progressive disclosure — 蒸留層の index-first と同じ規律)。
 
+**skill の自己更新 (審査つき)。** agent は詰まったとき・手順が現実とずれていたとき、
+SKILL.md を write_file / edit_file で更新するよう促される (凍結させない)。 ただし
+SKILL.md は自然言語の loop 規則なので、 tool_call 経由の書き込みは judge の審査を通る:
+検証手順を弱める変更 (stop 条件の緩和、 チェックの削除) は REJECT され、 理由が agent に
+返る。 shell 経由の編集は名指しで拒否 (審査の迂回になるため)。 人間の REPL primitive /
+editor 直編集は対象外。 更新は meta_events kind="skill" に記録され rk-log で辿れる —
+S lineage の自然言語版。
+
 ### 状態確認
 
 ```lisp
