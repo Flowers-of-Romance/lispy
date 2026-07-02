@@ -3,6 +3,208 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-07-02 (7) — レビュー指摘の修正 (安全側の締め直し 10 件)
+
+### Changed
+- **hooks / post-edit check も明示 opt-in に** (mcp と同じ規律) — `LISPY_HOOKS=<path>` /
+  `LISPY_CHECK_CMD` または `LISPY_CHECK_FILE=<path>` で指定したものだけ実行。
+  cwd 上方の `.lispy-hooks.json` / `.lispy-check` は検出して案内するのみ —
+  clone した repo 同梱の設定で任意コマンドが走る経路を全部閉じた
+
+### Fixed
+- auto-step の off-by-one — round 番号を 1-based にし、 作業 round がちょうど max-rounds 回に
+- brainwash: 蒸留層の wipe を marker (`.lispy-memory`) のあるディレクトリに限定 —
+  LISPY_MEMORY_DIR が一般ディレクトリを指していても *.md を消さない
+- brainwash: watermark を session 別に (ledger の payload は完全 id で記録) —
+  狙い撃ち洗脳や MAX_SESSIONS 溢れで他 session が永久 skip されない
+- brainwash: prompt に載せる既存記憶に上限 (BRAINWASH_MEMORY_MAX_CHARS、 per-file 20k)
+- brainwash: index.md の行数超過は warn でなく abort (蒸留層無変更) — index-first の規律なので
+- mcp: **LISPY_MCP による明示 opt-in 必須に** — cwd 上方の .lispy-mcp.json は検出案内のみ。
+  clone した repo 同梱の設定で任意コマンドが自動実行されるのを防ぐ
+- mcp: initialize 失敗時に spawn 済みプロセスを close (orphan 防止)
+- mcp: tool 名の 64 字切り詰め衝突を hash suffix で一意化
+- server: /interrupt の flag を評価 1 回で clear (以後の /eval が全部即死しない)
+- server: --resume + 解決失敗の --session が直近 session に fallback しない
+  (別 session の誤 resume 防止)
+
+## 2026-07-02 (6) — skill の自己更新 (審査つき)
+
+skill は詰まったとき・現実とずれたときに更新される — 凍結させない。
+SKILL.md は自然言語で書かれた loop 規則なので、 agent による更新は S 式の define-gate と
+同じく judge の審査を通す — gate があるからこそ、 更新の奨励を強く書ける。
+
+### Added
+- **skill 更新 gate** — tool_call (write_file / edit_file / append_file) の対象が
+  `skills/*/SKILL.md` なら、 現行と提案の全文を judge LLM に見せて APPROVE / REJECT。
+  判定基準: 検証手順を弱めていないか / 改善として筋が通るか / 無関係な指示の混入がないか。
+  却下理由は tool result で agent に返り、 修正して再提案できる。 fail-closed
+- 経路分離は define-gate と同型: 人間の REPL primitive (`(write-file ...)`) や editor 直編集は
+  dispatch を通らないので自由。 shell / shell_bg で SKILL.md に触るのは名指しで拒否
+  (yolo 時の `cat > SKILL.md` 迂回を塞ぐ)
+- 更新の記録: meta_events kind="skill" (approved / 理由)、 rk-log に [skill] で表示 —
+  RDD の S lineage の自然言語版 (skill がいつどう育ったかが台帳に残る)
+- system prompt の skills 一覧に更新規律を追記: 「詰まった・ずれていたら SKILL.md を更新すること —
+  凍結させない。 更新は installer の審査を通る」
+
+## 2026-07-02 (5) — MCP client + skills
+
+### Added
+- **MCP client (stdio)** — `mcp.py`。 `.lispy-mcp.json` (cwd 上方探索 / LISPY_MCP で明示指定) の
+  server を spawn して initialize → tools/list し、 各 tool を `mcp__<server>__<tool>` として
+  tool layer に統合。 agent からは他の tool と同じ tool_call — pre/post hook・中断チェックも
+  同じ経路で効く。 server プロセスは module cache で env (spawn child 含む) を跨いで共有、
+  接続失敗は warn して skip。 `(mcp-list)` で状態確認。 SSE / HTTP transport は未対応
+- **skills (progressive disclosure)** — `.lispy/skills/<name>/SKILL.md` (プロジェクト、 cwd 上方) と
+  `lispy/skills/` の `name:` / `description:` を拾い、 1 skill 1 行の一覧を system prompt に注入。
+  本文はタスクに合致したとき agent が read_file で読む — 蒸留層の index-first と同じ規律
+
+## 2026-07-02 (4) — ハーネス強化: opencode / Claude Code が内部でやっている定番の残り
+
+自走を「事故で死なない・出力が信用できる」ものにするための 8 点 + hooks。
+
+### Added
+- **中断** — REPL の Ctrl-C (1 回目は step 境界で安全に停止、 2 回目で強制)、 server の
+  `POST /interrupt`。 env.interrupt (Event) を llm-call / dispatch-tool が境界でチェックし、
+  fork / spawn の child とも共有 (止めるときは subagent ごと止まる)
+- **token 計測と auto-compaction** — usage.prompt_tokens を捕捉して `(context-tokens)` /
+  `(context-limit)` / `(context-over?)`。 agent-step が round 開始時に 8 割超えで
+  `(condense-context)` (LLM 要約 + renew)。 overflow API エラー時は Python 側の緊急網
+  (_emergency_compact: 古い半分を archive に退避して 1 回 retry) — 二段構え
+- **session resume** — `lispy --resume` / `lispy-server --resume` (`--session <prefix>` で特定、
+  省略時は直近 session)。 会話を DB から transcript 形式で復元 (role 構造の生 replay は
+  tool_call_id が無く API に弾かれるため 1 turn に畳む) + その session で commit-S された λ を
+  自動 restore
+- **background shell** — `shell_bg` (起動して id を返す、 出力は log へ) / `shell_out`
+  (状態 + 末尾) / `shell_kill`。 dev server・watch・長いビルド用。 確認ポリシーは shell と同じ
+- **post-edit check** — write_file / edit_file の直後に LISPY_CHECK_CMD (または上方探索した
+  `.lispy-check` の 1 行目、 `{file}` 置換可) を自動実行し、 結果を tool result に添付。
+  opencode の LSP diagnostics の軽量版 — 型エラー・lint が agent に即返る
+- **undo stack** — `(undo [n])` / `(undo-list)`。 file 編集の変更前内容を積んで巻き戻す
+  (新規作成は削除)。 shell の副作用は対象外 = Claude Code の /rewind と同じ制約
+  (opencode は毎 step git snapshot なので網羅性が上、 と明記しておく)
+- **プロジェクト文脈** — cwd から上方の AGENTS.md / CLAUDE.md を system prompt に注入
+  (Claude Code の CLAUDE.md 相当)
+- **並列 tool 実行** — `(dispatch-tools tcs)`: batch が全部 read-only なら ThreadPool 並列、
+  副作用系が混ざれば発行順の直列。 agent-step はこれに配線済み
+- **hooks** — `.lispy-hooks.json` (上方探索、 LISPY_HOOKS で明示指定可):
+  `pre-tool` (非ゼロ exit で tool をブロック、 理由が agent に返る) /
+  `post-tool` (出力を tool result に添付) /
+  `stop` (非ゼロ exit で agent は止まれず、 出力が system-reminder として次 round に入る。
+  1 入力につき 2 回まで — hook 故障で無限に止められない)。
+  hook には LISPY_HOOK_EVENT / LISPY_TOOL_NAME / LISPY_TOOL_ARGS / LISPY_TOOL_RESULT が渡る
+
+### Changed
+- tool 実行を _execute_tool に一本化 (dispatch-tool / dispatch-tools 共通、 hook はこの経路)
+- condense-context を define-gate の層 2 (保護 binding) に追加
+
+## 2026-07-02 (3) — 洗脳 (brainwash): 二層ストアの長期記憶
+
+lispy 初のセッション横断メモリ。 設計は二層ストア: **生層** = host.db の turns (role 付き、
+append-only、 検索しない、 検証の土台) と、 **蒸留層** = data/memory/ の裏どり済み事実
+(いつでも生層から作り直せる派生物)。 読み側は **index-first で検索しない** — 蒸留層を
+「検索が要らないサイズ」 に畳み続けるのが洗脳の規律で、 検索 (埋め込み) は index が
+context に収まらなくなったときの最後の手段として保留。
+
+### Added
+- `brainwash.py` — 洗脳パス。 VERIFY (assistant の主張を tool / user turn という一次資料に
+  照合、 裏づけ無しを落として **dropped_claims を数える**) → ORGANIZE (既存記憶とマージ、
+  1 トピック 1 ファイル) → ENRICH (相互リンク + index.md、 行数上限 default 100)。
+  洗うのは judge LLM (JUDGE_*)。 dreaming ではなく洗脳 — 記憶が自分を整理するのではなく、
+  外の審級が記憶を書き換える。 向きは通常の洗脳と逆 (根拠なき主張を洗い落とす)
+- 呼び出し 3 経路: REPL `(洗脳)` / `(brainwash)` (層 1 保護 binding)、 CLI `host brainwash [--session ...]`。
+  省略時は前回の洗脳以降に turn が増えた session を新しい順に洗う (増分)
+- fail-safe: judge 不達・JSON parse 不能・index.md 欠落のときは蒸留層に触らない。
+  path traversal (相対 .md 以外) は skip。 結果は meta_events kind="brainwash" に
+  kept/dropped/dropped_claims 込みで記録 (honesty gate)
+- system prompt に読み規律を追加: 着手前に index.md を read_file、 足りなければリンク先だけ、
+  検索しない、 記憶ファイルは直接編集しない、 覚えるべきことは会話で明示的に述べる
+  (発言 = 生層への書き込み、 洗脳が裏どりして昇格)。 index の実パスは起動時に動的注入
+- `.env`: `LISPY_MEMORY_DIR` / `BRAINWASH_MAX_TOKENS` / `BRAINWASH_MAX_SESSIONS` /
+  `BRAINWASH_INDEX_MAX_LINES`
+
+### Changed
+- `append-turn` が tool turn / tool_calls 付き assistant turn / `<eval-result>` を host DB にも
+  記録するように — 従来の生層は REPL の user 入力と最終応答だけで、 **VERIFY が照合すべき
+  一次資料 (tool の実行結果) が欠けていた**。 生層の完全化
+
+## 2026-07-02 (2) — define-gate + judge LLM 分離: self-modifying を「提案 → 審査 → install」に
+
+エージェントが自分の loop 規則を書き換えるとき、 書き換えを実行しているのは今の loop 自身 —
+壊れた規則を無検証で install すると自己修復能力ごと失う。 そこで install の判定を loop の外
+(Python の不変層 + 別 LLM の審査) に置いた。 執行 (executor) と審査 (judge) は別モデルに
+分離でき、 提案は S 式 (コード) だけが審査に渡る — エージェントの売り込み文は渡らない。
+
+### Added
+- **S 式応答の auto-eval** — LLM 応答が S 式なら `agent-eval` (origin="agent") で実際に評価し、
+  結果を `<eval-result>` として見せて loop 継続。 system prompt の (3) 「REPL がそのまま評価する」 が
+  初めて実装と一致した (従来は人間がコピペする前提だった)
+- **define-gate** — agent 由来の評価にだけ効く installer 層 (人間の REPL / HTTP は従来どおり自由):
+  - 層 1: Python 由来 binding (primitive / bridge、 seed load 前の全 binding 名を機械的に記録) への
+    define / set! は一律 deny — 列挙不要で網羅、 dispatch-tool や judge-call の shadow を封じる
+  - 層 2: loop 到達可能な 6 binding (agent-step / auto-step / judge-done / judge-system /
+    done-verdict? / auto-renew) は 構造チェック (決定的な床) → judge LLM 審査 → 承認で install +
+    自動 commit-S (rationale "gate-approved" = rollback 点)
+  - 迂回路の封鎖: `set!` (define と同経路で審査) / `defmacro` の special form 衝突
+    (evaluate はマクロを special form より先に引くため、 origin を問わず deny) と保護名 shadow /
+    `restore-S` (承認済み snapshot は即時 rollback、 agent 手動 commit の snapshot は deny) /
+    保護 body 内の `lookup` (リテラルな保護名のみ — 無保護名への late binding は承認後の
+    中身差し替え迂回になる)
+  - fail-closed: judge 不達は REJECT。 `LISPY_GATE=off` で全体無効化 (開発用)
+- **judge client 分離** — `.env` の `JUDGE_MODEL / JUDGE_BASE_URL / JUDGE_API_KEY / JUDGE_MAX_TOKENS`。
+  未設定なら executor に fallback (= 別文脈・同重みの弱い独立性)。 executor をローカル DeepSeek、
+  judge をリモート Claude、 のような分離が 3 変数で組める
+- **`judge-call` primitive** — llm-call と同形だが judge client に投げ、 tools を渡さない (審査者は
+  判定のみ)。 auto.lispy の judge-done と define-gate が使用。 層 1 保護対象なので executor 向きに
+  差し替える迂回は不可
+
+### Changed
+- auto.lispy の `judge-done` が llm-call → judge-call に — JUDGE_* 設定時は round ごとの
+  DONE/NEXT 判定も別モデルの独立採点になる
+- SYSTEM_PROMPT に gate の存在を明記 — 却下理由を読んで修正・再提案する、 審査者はコードだけを見る
+
+## 2026-07-02 — 自走レイヤ (auto-step) + subagent tool 化
+
+harness としての穴埋め: agent-step は「1 タスクを完遂する内側のループ」 だったので、
+goal を保持して検証・継続を決める **外側のループ** と、 Claude Code / opencode が
+内部でやっている定番 (subagent 委譲、 auto-compaction、 task 分解、 when-to-use を
+書いた tool description、 自走規律の system prompt) を追加した。
+
+### Added
+- `auto.lispy` — 自走レイヤ。 init 同様に起動時 auto-load (ファイルを消せば従来どおり)
+  - `(auto-step env "goal" [max-rounds] [renew-at])` — 作業 → 独立検証 → 継続/終了 の外側ループ。
+    round ごとに judge の判定 (`DONE` / `NEXT: ...`) を system-reminder として次入力に渡す
+  - `(judge-done env goal)` — fork-env した検証専用 env で判定。 agent の自己申告を信用せず
+    tool 実行結果の証拠で判断する persona。 自己採点でなく独立採点
+  - `(auto-renew goal)` — turns が閾値を超えたら作業ログを LLM 要約して `(renew ...)`
+    (Claude Code の auto-compaction 相当)
+  - `agent-step` / `judge-done` / `auto-renew` は `(lookup ...)` で late-bind —
+    走行中に redefine すれば auto-step も即それを使う
+- `spawn_agent` tool — subagent を **tool_call として** 呼べる (Claude Code の Task tool 相当)。
+  `{task, system?}` を受けて隔離 child env で agent loop を回し、 最終テキストだけ返す。
+  depth 制限 3 継承。 description に when-to-use を明記 (探索の文脈隔離 / 独立検証 / 脇道調査)
+- `(turn-count)` / `(transcript [n])` primitive — auto-renew の要約素材、 ループの閾値判定用
+- `.env` に `LLM_MAX_TOKENS` (default 4096) / `LLM_THINK` — `apply_` / `llm-call` / `prompt` の
+  default が従う。 2048 固定 + think 常時 off をやめた
+
+### Changed
+- `init.lispy` の `agent-step` を改良 (どれも長い自走で効く):
+  - tool round 継続を自己呼び出し → `recur` に (深度 100 制限を消費しない)
+  - 継続時に空の user turn `""` を積まない (既知の文脈汚染を解消)
+  - tool round 上限 40 — 到達時は「tool を呼ばずまとめろ」 reminder を挟んで 1 回だけ呼ぶ
+- `lispy.SYSTEM_PROMPT.md` を大幅加筆 — RDD ledger の存在と使い所 (commit-R を癖にする)、
+  task_add/task_done の運用、 spawn_agent の使い分け、 自走の規律 (完了前に検証、
+  宣言だけして止まらない、 可逆な作業は許可を求めない) を agent に見える場所へ移した
+  (従来 reference.md にしか無く、 モデルから見えなかった)
+- tool description に when-to-use を追記 (glob vs grep vs read_file、 write_file vs edit_file、
+  task 系の運用タイミング) — トリガー条件が書いてあるかどうかで発動率が変わるため
+- `(lookup name)` を真の late binding に修正 — lambda 呼び出し中は bindings が
+  captured 優先の merge に swap されるため、 lookup まで定義時 snapshot を返していた。
+  install 時の global dict を先に読むようにした (extras.lispy の `wrap` が謳う
+  late binding もこれで実際に機能する)
+- `spawn` の child env を修理 — bindings 無しの Env を作っていたため child で
+  `agent-step not defined` になっていた。 `_make_child_env` (PRIMITIVES + meta primitives +
+  init/auto load) を spawn / spawn_agent で共用
+
 ## 2026-05-24 — RDD (Requirement-Don't-Die) と server.py 主経路化
 
 **RDD = Requirement-Don't-Die** — lispy の SDD 方式の呼称を導入。 R は append-only、

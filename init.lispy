@@ -17,20 +17,49 @@
 ;; --- agent loop の本体 — lispy の核 ---
 ;; REPL の平文入力は Python の eval_ から (agent-step env input) として呼ばれる。
 ;; この binding を書き換えれば、 走行中の評価規則そのものが変わる。
+;;
+;; 旧版からの変更 (どれも長い自走で効く):
+;;   - tool round の継続は自己呼び出しでなく recur — 深度 100 制限を消費しない
+;;   - 継続時に空の user turn "" を積まない — 文脈汚染を防ぐ
+;;   - tool round 上限 40 — 到達したら「tool を呼ばずまとめろ」 reminder を挟んで 1 回だけ呼ぶ
+;;   - S 式応答の auto-eval — 応答が ( で始まる S 式なら agent-eval (origin="agent") で評価し、
+;;     結果を <eval-result> として見せて続行。 保護 binding への define は define-gate の審査を通る
+;;   - round 開始時に (context-over?) なら condense-context — token 閾値の auto-compaction
+;;     (overflow の緊急網は Python 側 _emergency_compact が別に張っている)
+;;   - tool 実行は dispatch-tools — batch が全部 read-only なら並列、 副作用があれば直列
+;;   - 平文で終わろうとしたら stop-hook — .lispy-hooks.json の停止条件を満たすまで戻される
 (define agent-step
   (lambda (env input)
-    (let ((env2 (append-turn env (make-turn "user" input))))
-      (let ((response (llm-call env2)))
-        (let ((env3 (append-turn env2 response)))
-          (if (has-tool-calls? response)
-              (agent-step
-                (fold (lambda (e tc)
-                        (append-turn e
-                          (make-turn "tool"
-                            (dispatch-tool (tool-call-name tc)
-                                           (tool-call-args tc))
-                            (tool-call-id tc))))
-                      env3
-                      (tool-calls response))
-                "")
-              response))))))
+    ((lambda (input rounds)
+       (begin
+         (if (context-over?) (condense-context) #f)
+         (let ((env2 (if (eq? input "") env (append-turn env (make-turn "user" input)))))
+           (let ((response (llm-call env2)))
+             (let ((env3 (append-turn env2 response)))
+               (if (has-tool-calls? response)
+                   (begin
+                     (fold (lambda (e t) (append-turn e t))
+                           env3
+                           (dispatch-tools (tool-calls response)))
+                     (if (>= rounds 40)
+                         (let ((final (llm-call (append-turn env3
+                                        (make-turn "user"
+                                          "<system-reminder>tool round の上限 (40) に達した。これ以上 tool を呼ばず、ここまでの結果と未完了の作業を平文でまとめること。</system-reminder>")))))
+                           (begin (append-turn env3 final) final))
+                         (recur "" (+ rounds 1))))
+                   (let ((evaled (agent-eval (turn-content response))))
+                     (if (eq? evaled #f)
+                         (let ((nag (stop-hook (turn-content response))))
+                           (if (eq? nag "")
+                               response
+                               (begin
+                                 (append-turn env3 (make-turn "user" nag))
+                                 (recur "" (+ rounds 1)))))
+                         (if (>= rounds 40)
+                             response
+                             (begin
+                               (append-turn env3
+                                 (make-turn "user"
+                                   (string-append "<eval-result>" evaled "</eval-result>")))
+                               (recur "" (+ rounds 1))))))))))))
+     input 0)))

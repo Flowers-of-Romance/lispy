@@ -43,6 +43,8 @@ lispy/
 ├── server.py       # lispy を HTTP で叩ける常駐プロセス (lispy sidecar)
 ├── lispy.SYSTEM_PROMPT.md   # system prompt 本体 (Python 外で編集)
 ├── init.lispy      # 起動時 auto-load: agent-step / compose (言語の seed)
+├── auto.lispy      # 起動時 auto-load: 自走レイヤ (auto-step / judge-done / auto-renew)
+├── brainwash.py    # 洗脳 — 生層 (turns) → 蒸留層 (data/memory/) の consolidation
 ├── extras.lispy    # 派生 idiom 集 (list ops, control macros, combinators, match...)  (load で取り込む)
 ├── ds4.lispy       # ds4-server 固有機能 (directional steering / thinking)  (ds4 接続時のみ load)
 ├── host.db         # SQLite (sessions, turns, FTS5, meta_events, tasks)
@@ -69,6 +71,16 @@ cp .env.example .env             # provider を選んで API key / model / base 
 `.env` には **LLM_API_KEY / LLM_BASE_URL / LLM_MODEL** の 3 つを必ず書く (default は持たない設計)。
 未設定で LLM を呼ぶと起動時ではなく **初回 LLM 呼び出し時** に明示エラーで止まる。
 `host list` / `search` / `dump` 等の DB CLI と、 lispy の **pure Lisp 評価** は .env 無しでも動く。
+
+任意の呼び出し default (`.env`):
+- `LLM_MAX_TOKENS` — `apply_` / `llm-call` / `prompt` の max_tokens default (未設定なら 4096)
+- `LLM_THINK` — thinking mode の default (`1`/`true` で on。 ds4 / DeepSeek 系が解釈、 他 provider は無視)
+- `JUDGE_MODEL` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MAX_TOKENS` — 審査者 LLM。
+  define-gate の install 審査・auto.lispy の judge-done・洗脳 (brainwash) が使う。
+  未設定なら executor に fallback
+- `LISPY_GATE` — `off` で define-gate を無効化 (default on。 gate は agent 由来の評価にだけ効く)
+- `LISPY_MEMORY_DIR` / `BRAINWASH_MAX_TOKENS` / `BRAINWASH_MAX_SESSIONS` / `BRAINWASH_INDEX_MAX_LINES`
+  — 洗脳の蒸留層と各上限 (default: `data/memory/` / 8192 / 10 / 100)
 
 ## CLI: `host`
 
@@ -510,8 +522,188 @@ main> (eval (read-sexp "(+ 1 2 3)"))
 ```lisp
 (spawn "tell me about X")     ; child env を作って task を任せる、結果を返す
 ```
-- 親 env の system, tools, schema を継承した独立 env を作る
+- 親 env の system, tools, schema を継承した独立 env を作る (bindings は PRIMITIVES + init/auto をフル装備)
 - depth 制限 3
+
+#### spawn_agent (tool_call 版 subagent — Claude Code の Task tool 相当)
+
+spawn が user 向けの S 式なのに対し、 **agent 自身が tool_call として** subagent を呼べる。
+`{task, system?}` を受けて隔離 child env で agent loop を回し、 最終テキストだけ tool result で返す。
+
+- 使い所は description に明記済み: (a) 大量探索の文脈隔離 (b) 成果物の独立検証 (system に検証者 persona)
+  (c) 脇道調査。 1-2 tool call で済む作業には使わない
+- child は親の会話履歴を見ない — task は自己完結で書く (対象パス・期待する出力形式まで)
+- depth 制限 3 を継承 (subagent が subagent を呼ぶ連鎖は 3 段で止まる)
+
+#### auto-step (自走の外側ループ — auto.lispy)
+
+agent-step が「1 タスクを完遂する内側のループ」 なのに対し、 auto-step は
+「goal を保持し、 検証し、 続行/終了を決める外側のループ」。 `auto.lispy` に S 式で定義されていて
+起動時 auto-load される (ファイルを消せば従来どおり)。
+
+```lisp
+(auto-step env "goal 文" [max-rounds] [renew-at])   ; default 12 rounds / 80 turns で renew
+```
+
+round ごとに:
+1. `((lookup "agent-step") env input)` で作業 — lookup 経由なので走行中の redefine が効く
+2. `(judge-done env goal)` — fork-env した検証専用 env で判定。 自己申告を信用せず
+   tool 実行結果の証拠で判断する persona。 `DONE` / `NEXT: 次の一手` を返す
+3. DONE なら終了。 未達成なら判定を `<system-reminder>` にして次 round の入力に
+4. `(turn-count)` が閾値超えなら `(auto-renew goal)` — 作業ログを LLM 要約して `(renew ...)`
+   (compaction 相当。 renew なので DB session 境界も切れる点は注意)
+
+`judge-done` / `auto-renew` / `done-verdict?` も普通の binding なので、
+`(define judge-done ...)` で判定基準ごと live に書き換えられる (人間の REPL からは自由。
+agent 由来の書き換えは次節の define-gate を通る)。
+
+#### define-gate (自己書き換えの installer 層)
+
+agent の S 式応答は `agent-eval` で auto-eval される — つまり agent は `(define agent-step ...)`
+を出力して自分の loop 規則を書き換えられる。 このとき書き換えを実行しているのは今の loop 自身
+なので、 壊れた規則を無検証で install すると自己修復能力ごと失う。 define-gate は install の
+判定を loop の外 (Python の不変層 + judge LLM) に置く。
+
+**gate が効くのは `env.eval_origin == "agent"` (= auto-eval 経由) のときだけ。**
+人間の REPL 入力・HTTP `/eval` は従来どおり自由 (Recipe 3/4 はそのまま動く)。
+
+| 層 | 対象 | 扱い |
+|---|---|---|
+| 層 1 | Python 由来 binding 全部 (primitive / bridge / `judge-call` / `agent-eval` — seed load 前の binding 名を機械的に記録) | define / set! を一律 deny (審査なし)。 shadow する正当な理由が無い |
+| 層 2 | loop 到達可能な 6 binding: `agent-step` `auto-step` `judge-done` `judge-system` `done-verdict?` `auto-renew` | 構造チェック → judge LLM 審査 → 承認で install + 自動 commit-S (rationale "gate-approved") |
+| 自由層 | それ以外 (作業用 λ / macro) | 無審査・ノーレイテンシ |
+
+判定者の連鎖 (`judge-done` / `judge-system` / `done-verdict?`) を層 2 に含めるのが要点 —
+判定者を書き換えられたら gate は無傷のまま骨抜きになる。
+
+迂回路の封鎖:
+- **set!** — define と同じ書き込み経路なので同じ審査
+- **defmacro** — evaluate はマクロを special form より先に引くため、 `define` という名のマクロは
+  gate を丸ごと迂回する。 special form / meta form と衝突する名前は origin を問わず deny、
+  保護 binding 名の macro shadow は agent 由来のみ deny
+- **restore-S** — gate 承認時に自動 commit された snapshot (rationale "gate-approved") は
+  即時復元 (rollback は緊急時に速くあるべき)。 agent が手動 commit-S した snapshot の復元は
+  deny — 毒入り body を commit → restore で install する迂回を塞ぐ
+- **保護 body 内の lookup** — リテラルな保護名への lookup のみ許可。 無保護名への late binding は
+  「承認後に中身だけ差し替える」 迂回になるため構造チェックで deny。 直接 symbol 参照は
+  定義時に captured で凍結されるので安全 (承認時点の実体に固定される)
+
+審査の中身: judge には **現行定義と提案の S 式だけ** を渡す (agent の売り込み文は渡さない —
+prompt injection の経路を作らない)。 1 行目 APPROVE / REJECT + 理由。 judge 不達は fail-closed
+(= REJECT)。 却下理由は `<eval-result>` として agent に返り、 修正して再提案できる。
+
+executor / judge のモデル分離は `.env` (上記 JUDGE_*)。 `(judge-call env ...)` primitive は
+llm-call と同形だが judge client に投げ、 tools を渡さない。
+
+#### 洗脳 / brainwash (セッション横断の長期記憶)
+
+二層ストア:
+
+| 層 | 実体 | 役割 |
+|---|---|---|
+| 生層 | host.db の turns (role 付き、 append-only) | 検索も編集もしない。 検証の土台・再構築の材料 |
+| 蒸留層 | `data/memory/*.md` + `index.md` | 読みの対象。 生層からいつでも作り直せる派生物 |
+
+**読み側は検索しない (index-first)。** agent は着手前に `index.md` (1 事実 1 行、 行数上限
+default 100) を read_file で読み、 足りなければリンク先ファイルだけ開く。 index が context に
+収まるうちは 「index 全行を読む = 一段目 recall 100% + LLM 選別」 で、 埋め込み検索の
+出番がない。 検索は index が context に収まらなくなった regime の最後の手段として保留
+(→ そこに来たら mrprompt-vector の R@1 実験が意味を持つ)。
+
+**書き側 = 洗脳。** `(洗脳)` / `(brainwash)` (REPL) / `host brainwash` (CLI、 cron 向き)。
+省略時は前回の洗脳以降に turn が増えた session を増分で洗う。 3 手:
+
+1. VERIFY — assistant の主張を tool turn (実行結果) / user turn (明示発言) という一次資料に照合。
+   裏づけの無い主張は落とし、 **dropped_claims として数える** (何を信用しなかったかが残る)
+2. ORGANIZE — 検証済み事実を 1 トピック 1 ファイルに書き直し、 既存の蒸留層とマージ
+3. ENRICH — 相互リンク + index.md を書く
+
+洗うのは judge LLM (JUDGE_*)。 fail-safe: judge 不達 / JSON parse 不能 / index.md 欠落は
+蒸留層に触らない。 path traversal は skip。 結果は meta_events kind="brainwash" に記録され
+`host events --kind brainwash` で振り返れる。
+
+覚えさせたいことは会話で明示的に述べる — 発言が生層に落ち、 洗脳が裏どりして昇格させる。
+このため `append-turn` は tool turn / tool_calls 付き assistant turn / `<eval-result>` を
+DB にも記録する (生層の完全化 — VERIFY の照合材料)。
+
+#### ハーネス機能 (中断 / compaction / resume / hooks / 並列 / undo)
+
+**中断。** env.interrupt (threading.Event) を llm-call / dispatch-tool が step 境界でチェックし、
+set されていれば `LispError('interrupt)` で安全に止まる (tool の実行途中では切らない)。
+set する側: REPL の Ctrl-C (1 回目 = flag、 2 回目 = 強制 KeyboardInterrupt)、 server の
+`POST /interrupt` (`_LOCK` を取らないので /eval 走行中に外から叩ける)。 fork / spawn の
+child は Event を共有 — 止めるときは subagent ごと止まる。
+
+**auto-compaction (二段構え)。** llm-call が usage.prompt_tokens を env.last_prompt_tokens に
+捕捉し、 `(context-tokens)` / `(context-limit)` (= LISPY_CTX_WINDOW) / `(context-over?)` で
+観測できる。 agent-step は round 開始時に 8 割超えで `(condense-context)` (LLM 要約 + renew、
+auto.lispy)。 それでも overflow の API エラーが出たら Python 側の緊急網 _emergency_compact が
+古い半分の turns を archive に退避して 1 回だけ retry する (LLM 要約なし — overflow 中は
+呼べないため)。
+
+**resume。** `--resume` (`--session <prefix>` で特定、 省略時は直近 session)。 会話は DB から
+transcript 形式の system turn 1 つに畳んで復元 (DB は tool_call_id を持たないので role 構造の
+生 replay は API に弾かれる)。 その session で commit-S された λ は最新 snapshot から自動
+restore — 「λ は session を跨いで残らない」 の運用面の答えは commit-S + resume になった。
+
+**hooks (`LISPY_HOOKS=<path>` で明示 opt-in。 cwd 上方の `.lispy-hooks.json` は検出案内のみ
+— repo 同梱設定による任意コマンド実行を防ぐ、 MCP と同じ規律)。**
+
+```json
+{"pre-tool":  [{"match": "shell", "cmd": "my-guard.sh"}],
+ "post-tool": [{"match": "write_file|edit_file", "cmd": "ruff check ."}],
+ "stop":      [{"cmd": "test -f data/receipt.md"}]}
+```
+
+- pre-tool: 非ゼロ exit でその tool 呼び出しをブロック (出力が理由として agent に返る)
+- post-tool: 出力を tool result に添付 (lint / typecheck のフィードバック)
+- stop: agent が平文で終わろうとしたとき実行。 非ゼロ exit なら止まれず、 出力が
+  system-reminder として次 round に入る。 1 入力 2 回まで (hook 故障で無限拘束しない)
+- hook には LISPY_HOOK_EVENT / LISPY_TOOL_NAME / LISPY_TOOL_ARGS / LISPY_TOOL_RESULT が渡る
+
+**post-edit check。** write_file / edit_file の直後に LISPY_CHECK_CMD (コマンド文字列) か
+LISPY_CHECK_FILE (そのファイルの 1 行目、 `{file}` 置換可) を自動実行し、 結果を tool result に
+添付する。 opencode の LSP diagnostics の軽量版。 cwd 上方の `.lispy-check` は検出案内のみ
+(明示 opt-in が必要)。
+
+**undo。** `(undo [n])` / `(undo-list)` — write-file / edit-file / append-file の変更前内容を
+スタックに積んで巻き戻す (新規作成は削除)。 shell 経由の副作用は対象外 — Claude Code の
+/rewind と同じ制約 (opencode は毎 step git snapshot なので網羅性が上)。
+
+**並列 tool 実行。** `(dispatch-tools tcs)` — batch が全部 read-only (READONLY_TOOLS) なら
+ThreadPool で並列、 副作用系が 1 つでも混ざれば発行順の直列。 返り値は tool Turn の list
+(常に入力順)。 agent-step はこれに配線済み。
+
+**background shell。** `shell_bg` (起動して id、 出力は data/bg/*.log) / `shell_out` (状態 +
+末尾 n 行) / `shell_kill`。 dev server・watch・長いビルドを「待つ」 のでなく都度読む。
+
+**プロジェクト文脈。** build_default_env が cwd から上方に AGENTS.md / CLAUDE.md を探し、
+最初に見つかったものを system prompt に注入する (20k 字上限)。
+
+**MCP (stdio)。** `LISPY_MCP=<設定ファイル>` で **明示 opt-in** (cwd 上方の `.lispy-mcp.json` は
+検出して案内するだけで自動起動しない — repo 同梱設定による任意コマンド実行を防ぐ):
+
+```json
+{"servers": {"fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]}}}
+```
+
+各 server の tool は `mcp__<server>__<tool>` として tool layer に載る — agent からは他の
+tool と同じ tool_call で、 pre/post hook・中断も同じ経路。 server プロセスは module cache で
+env を跨いで共有、 接続失敗は warn して skip。 `(mcp-list)` で状態確認。
+LISPY_MCP_TIMEOUT で request timeout (default 60s)。 SSE / HTTP transport は未対応。
+
+**skills。** `.lispy/skills/<name>/SKILL.md` (プロジェクト、 cwd 上方) と lispy 本体の
+`skills/`。 SKILL.md 先頭の `name:` / `description:` を拾って 1 skill 1 行の一覧を
+system prompt に常駐させ、 本文はタスクに合致したとき agent が read_file で読む
+(progressive disclosure — 蒸留層の index-first と同じ規律)。
+
+**skill の自己更新 (審査つき)。** agent は詰まったとき・手順が現実とずれていたとき、
+SKILL.md を write_file / edit_file で更新するよう促される (凍結させない)。 ただし
+SKILL.md は自然言語の loop 規則なので、 tool_call 経由の書き込みは judge の審査を通る:
+検証手順を弱める変更 (stop 条件の緩和、 チェックの削除) は REJECT され、 理由が agent に
+返る。 shell 経由の編集は名指しで拒否 (審査の迂回になるため)。 人間の REPL primitive /
+editor 直編集は対象外。 更新は meta_events kind="skill" に記録され rk-log で辿れる —
+S lineage の自然言語版。
 
 ### 状態確認
 
@@ -528,6 +720,9 @@ env                         ; 現 env オブジェクトそのもの (fork-env /
 (turn <id>)                 ; id 指定で取得 (env.turns / archive / quoted を検索)
 (turn "user" N)             ; user turn 列の N 番目 ((-1)=直近 user、-2=その前 …)
 (turn "assistant" N)        ; assistant turn 列の N 番目
+(turn-count)                ; 現 env.turns の件数 (auto-renew の閾値判定用)
+(transcript)                ; 直近 20 turn の全文を "role: content" で ((turns) は 80 字プレビュー)
+(transcript 60)             ; 直近 60 turn — 要約素材や judge への作業ログ渡しに
 (archive)                   ; archive 一覧 (id, turn 数)
 (lambdas)                   ; 登録済み λ 一覧 (params, kind, body プレビュー)
 (quoted)                    ; (quote-turn ...) で保管された turn 一覧
