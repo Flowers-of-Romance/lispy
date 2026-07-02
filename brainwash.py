@@ -158,13 +158,16 @@ def _memory_prompt_text(memory: dict[str, str]) -> str:
         return "(まだ記憶なし)"
     parts: list[str] = []
     used = 0
+    omitted = 0
     for path, content in memory.items():
         block = f"### {path}\n{content}"
         if used + len(block) > MEMORY_MAX_CHARS:
-            parts.append(f"### {path}\n(memory budget 超過 — 省略。次回の洗脳で圧縮すること)")
+            omitted += 1  # per-file の省略 marker を積むと file 数に比例して伸びる — 数だけ数える
             continue
         parts.append(block)
         used += len(block)
+    if omitted:
+        parts.append(f"(他 {omitted} files は memory budget 超過で省略 — 次回の洗脳で圧縮すること)")
     return "\n\n".join(parts)
 
 
@@ -186,7 +189,12 @@ def _safe_rel_path(path: str) -> Path | None:
 def brainwash(db, sessions: list[str] | None = None) -> str:
     """洗脳を 1 回走らせ、 結果 summary を返す。 judge 不達・出力不正のときは
     蒸留層に触らず message を返す (fail-safe: 壊れた出力で記憶を消さない)。"""
-    sids = _pick_sessions(db, sessions)
+    try:
+        sids = _pick_sessions(db, sessions)
+    except (SystemExit, Exception) as e:
+        # resolve_session は不存在/曖昧 prefix で SystemExit を投げる — agent の tool 経路から
+        # 呼ばれたとき Exception ハンドラを素通りして harness ごと落ちるので、 ここで message 化する
+        return f"(brainwash: session 解決失敗 — {e})"
     if not sids:
         return "(brainwash: 前回の洗脳以降に新しい turn が無い — 洗うものがない)"
 

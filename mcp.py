@@ -23,6 +23,7 @@ import atexit
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -213,6 +214,11 @@ def connect_all() -> dict[str, MCPServer]:
     return servers
 
 
+def _safe_name(s: str) -> str:
+    """server / tool 名を function name の許可文字 (ASCII 英数字 / _ / -) に正規化。"""
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", s) or "_"
+
+
 def tool_layer() -> tuple[dict[str, Any], list[dict]]:
     """lispy の _build_tool_layer に merge する (tools, schema)。
     handler は (args, env) -> str — 他の tool と同じ signature。"""
@@ -224,7 +230,9 @@ def tool_layer() -> tuple[dict[str, Any], list[dict]]:
             tname = str(t.get("name", ""))
             if not tname:
                 continue
-            fq = f"mcp__{sname}__{tname}"
+            # OpenAI 互換 API の function name 制約 (^[a-zA-Z0-9_-]{1,64}$) に正規化。
+            # 正規化で潰れた衝突 (a.b vs a_b) は下の seen + hash suffix が一意化する
+            fq = f"mcp__{_safe_name(sname)}__{_safe_name(tname)}"
             if len(fq) > 64 or fq in seen:
                 # 長い名前の切り詰めで衝突すると handler が上書きされ schema に重複が残る —
                 # 安定 hash を付けて一意化する
