@@ -44,7 +44,13 @@ from urllib.parse import urlsplit, parse_qs
 
 import lispy
 import host
-import view
+
+# View 層は optional — view.py を消しても server core (/eval 等) は動く
+# (lispy.py / edit.py の optional import と同じ規約)。 無ければ /view 系は 503。
+try:
+    import view
+except ImportError:
+    view = None  # type: ignore[assignment]
 
 _HERE = Path(__file__).resolve().parent
 _LOCK = threading.Lock()
@@ -420,6 +426,9 @@ def make_handler(env_box: list[lispy.Env]):
             url = urlsplit(self.path)
             path = url.path
             env = env_box[0]
+            if path.startswith("/view") and view is None:
+                self._send_json(503, {"ok": False, "error": "view 層なし (view.py が無い)"})
+                return
             if path in ("/", "/healthz"):
                 self._send_json(200, {
                     "ok": True,
@@ -518,6 +527,8 @@ def make_handler(env_box: list[lispy.Env]):
                 self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
+            # SSE 接続中 = ブラウザが見ている = gate の答え手がいる、 を registry に知らせる
+            view.GATES.watcher_add()
             try:
                 sid = view.resolve_sid(db, scope, env_box[0].record_sid)
                 gate_v = view.GATES.version
@@ -552,6 +563,7 @@ def make_handler(env_box: list[lispy.Env]):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass  # client 切断
             finally:
+                view.GATES.watcher_remove()
                 db.close()
 
         # ----- POST -----
@@ -559,6 +571,9 @@ def make_handler(env_box: list[lispy.Env]):
             url = urlsplit(self.path)
             path = url.path
             env = env_box[0]
+            if path.startswith("/view") and view is None:
+                self._send_json(503, {"ok": False, "error": "view 層なし (view.py が無い)"})
+                return
             if path in ("/", "/eval"):
                 src = self._read_body()
                 if not src.strip():
@@ -659,12 +674,16 @@ def _stdin_repl(env_box: list[lispy.Env]) -> None:
             if not line.strip():
                 continue
             # pending gate への terminal 回答 (ブラウザとの先着採用)。
+            # 裸の y/n は「pending 1 件 + 最後に告知した gate」のときだけ効き、
+            # 複数 pending 時は `y <id>` / `n <id>` で対象を指定する (誤射防止)。
             # 注意: この REPL スレッド自身が評価した eval の確認には答えられない
             # (スレッドが eval 内で block 中) — その場合はブラウザが出口。
-            if line.strip().lower() in ("y", "yes", "n", "no") and view.GATES.has_pending():
-                ok = view.GATES.resolve_oldest(
-                    "approve" if line.strip().lower() in ("y", "yes") else "deny", "terminal")
-                print("  (gate: resolved)" if ok else "  (gate: 先着済み)")
+            m = re.match(r"^(y|yes|n|no)(?:\s+(\d+))?$", line.strip().lower())
+            if m and view is not None and view.GATES.has_pending():
+                gid = int(m.group(2)) if m.group(2) else None
+                msg = view.GATES.resolve_from_terminal(
+                    gid, "approve" if m.group(1) in ("y", "yes") else "deny")
+                print(f"  {msg}")
                 continue
             buf = [line]
             while not lispy._parens_balanced("\n".join(buf)):
@@ -723,8 +742,11 @@ def main() -> None:
 
     # View 層 (フェーズ 2): server では y/N 確認を pending gate に載せる —
     # ブラウザ (/view) と terminal (y/n) の先着採用。 --yolo では確認自体が skip される。
-    view.GATES.remote = True
-    view.GATES.sid_provider = lambda: env_box[0].record_sid
+    # 答え手 (SSE watcher / stdin REPL) がいなければ gate は登録されず即 fail-closed。
+    if view is not None:
+        view.GATES.remote = True
+        view.GATES.sid_provider = lambda: env_box[0].record_sid
+        view.GATES.terminal_answerer = bool(args.stdin and sys.stdin.isatty())
 
     sid_note = f"resumed {env.record_sid[:12]}" if sid else f"new session {env.record_sid[:12]}"
     print(f"lispy-server on http://{args.host}:{args.port}  ({sid_note})")

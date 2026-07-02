@@ -22,6 +22,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -100,8 +101,9 @@ def _confirm(prompt: str, *, kind: str = "confirm", title: str = "",
     if _view is not None and _view.GATES.remote:
         approved, source = _view.GATES.ask(
             kind, title or prompt.strip(), detail=detail, diff=diff)
+        # stderr へ — /eval の redirect_stdout に飲まれず server の terminal に届く
         print(f"  [gate] {(title or prompt.strip())[:80]} → "
-              f"{'approve' if approved else 'deny'} ({source})", flush=True)
+              f"{'approve' if approved else 'deny'} ({source})", file=sys.stderr, flush=True)
         return approved
     try:
         ans = input(prompt).strip().lower()
@@ -272,20 +274,44 @@ def _backup(path: Path) -> None:
         bak.write_bytes(path.read_bytes())
 
 
+# これより大きいファイルは確認 diff を計算しない — difflib (SequenceMatcher) は
+# O(N*M) で、 _LOCK を握ったまま数分固まる事故を防ぐ。 diff なしでも確認自体は出る。
+_DIFF_MAX_CHARS = 200_000
+
+
+def _confirm_diff(current: str, proposed: str) -> list | None:
+    """確認 gate 用の diff。 remote mode でだけ使われるので、 それ以外では計算しない。"""
+    if _view is None or not _view.GATES.remote:
+        return None
+    if len(current) > _DIFF_MAX_CHARS or len(proposed) > _DIFF_MAX_CHARS:
+        return [{"op": "@", "text": f"(diff 省略: ファイルが大きい — {len(current)} → {len(proposed)} chars)"}]
+    try:
+        return _view.diff_lines(current, proposed)
+    except Exception:
+        return None
+
+
+def _read_or_none(p: Path) -> str | None:
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return None  # binary 等
+
+
 def write_file(path: Any, text: Any, *, yolo: bool = False) -> str:
     """ファイル overwrite。 既存があれば .bak に backup。"""
     p = Path(str(path)).expanduser()
     s = str(text)
     if p.exists() and not (yolo or _RUNTIME_YOLO):
-        diff = None
-        if _view is not None:
-            try:
-                diff = _view.diff_lines(p.read_text(encoding="utf-8"), s)
-            except Exception:
-                diff = None  # binary 等 — diff なしで確認に回す
+        current = _read_or_none(p)
         if not _confirm(f"  [edit.write-file] '{p}' を上書きしますか? [y/N]: ",
-                        kind="write-file", title=f"write-file: {p}", diff=diff):
+                        kind="write-file", title=f"write-file: {p}",
+                        diff=_confirm_diff(current or "", s) if current is not None else None):
             return f"(skipped: {p})"
+        # 承認待ちの間に対象が変わっていたら、 人間に見せた diff は嘘になっている —
+        # 書かずに戻す (中間の変更を黙って巻き戻さない)
+        if current is not None and _read_or_none(p) != current:
+            return f"(aborted: {p} は承認待ちの間に変更された — 現状を読み直して再提案すること)"
     _push_undo(p, "write-file")
     _backup(p)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -309,17 +335,15 @@ def edit_file(path: Any, old: Any, new: Any, *, yolo: bool = False) -> str:
     if not (yolo or _RUNTIME_YOLO):
         preview_old = old_s[:60].replace("\n", "\\n")
         preview_new = str(new)[:60].replace("\n", "\\n")
-        diff = None
-        if _view is not None:
-            try:
-                diff = _view.diff_lines(content, proposed)
-            except Exception:
-                diff = None
         if not _confirm(
             f"  [edit.edit-file] '{p}' の '{preview_old}' を '{preview_new}' に? [y/N]: ",
-            kind="edit-file", title=f"edit-file: {p}", diff=diff,
+            kind="edit-file", title=f"edit-file: {p}", diff=_confirm_diff(content, proposed),
         ):
             return f"(skipped: {p})"
+        # 承認待ちの間に対象が変わっていたら書かない — gate 前の snapshot (proposed) を
+        # そのまま書くと中間の変更を黙って巻き戻すため
+        if _read_or_none(p) != content:
+            return f"(aborted: {p} は承認待ちの間に変更された — 現状を読み直して再提案すること)"
     _push_undo(p, "edit-file")
     _backup(p)
     p.write_text(proposed, encoding="utf-8")
