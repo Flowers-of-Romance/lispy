@@ -1003,6 +1003,21 @@ def _gate_call_judge(env: Env, name: str, value: Any) -> tuple[bool, str]:
     return first.startswith("APPROVE"), out
 
 
+def _gate_log_bind(env: Env, name: str, approved: bool, why: str) -> None:
+    """bind gate の判定結果を ledger (kind=gate) に残す — /view のタイムライン表示用。
+    ledger 書き込みの成否は gate の判定に影響しない (ベストエフォート)。"""
+    if env.db_conn is None or not env.record_sid:
+        return
+    try:
+        host.log_meta(env.db_conn, "gate", sid=env.record_sid, payload=json.dumps({
+            "name": name,
+            "approved": approved,
+            "why": why.split("\n", 1)[-1].strip()[:200],
+        }, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def gate_check_bind(env: Env, name: str, value: Any) -> tuple[str, str] | None:
     """define / set! の共通入口。 None = gate 対象外 (通常 bind)。
     ("deny", 理由)  = bind しない。  ("approve", judge の理由) = bind + 自動 commit-S。"""
@@ -1010,12 +1025,15 @@ def gate_check_bind(env: Env, name: str, value: Any) -> tuple[str, str] | None:
         return None
     gate = env.gate
     if name in gate.protected_py:
+        _gate_log_bind(env, name, False, "python primitive の shadow は禁止")
         return ("deny", f"(gate: {name} は Python primitive — shadow は禁止。 別名で define すること)")
     if name in gate.protected_loop:
         reason = _gate_structural_check(gate, value)
         if reason:
+            _gate_log_bind(env, name, False, f"structural check: {reason}")
             return ("deny", f"(gate: {name} rejected by structural check — {reason})")
         approved, why = _gate_call_judge(env, name, value)
+        _gate_log_bind(env, name, approved, why)
         if not approved:
             return ("deny", f"(gate: {name} rejected by judge —\n{why})")
         return ("approve", why)
@@ -3442,6 +3460,64 @@ def _install_meta_primitives(env: Env) -> None:
     try:
         import mcp as _mcp_info
         env.bindings["mcp-list"] = _mcp_info.info
+    except ImportError:
+        pass
+    # View 層 (view.py) — agent がデータで画面を組む (レイアウト語彙、 フェーズ 3)。
+    # コードは送れない: S 式 → view.py の語彙で検証された JSON 木のみ。 語彙外はエラー。
+    # button の押下は POST /view/action で action 記号が返るだけ — 解釈はこちらの loop。
+    # optional import: view.py を消しても core は動く。
+    try:
+        import view as _viewmod
+
+        def _view_plainify(v: Any) -> Any:
+            """Symbol → name 文字列、 Value → text。 view.py に lispy の型を持ち込まない。"""
+            if isinstance(v, Symbol):
+                return v.name
+            if isinstance(v, Value):
+                return v.text
+            if isinstance(v, list):
+                return [_view_plainify(x) for x in v]
+            return v
+
+        def _show_view(tree: Any, _env: Env = env) -> str:
+            """(show-view '(column (text "...") (form (input :name "x") (button :label "OK" :action ok))))"""
+            try:
+                root, n_nodes = _viewmod.sexp_to_view(_view_plainify(tree))
+            except _viewmod.ViewError as e:
+                return f"(show-view: {e})"
+            _viewmod.CURRENT_VIEW.set(root)
+            if _env.db_conn is not None and _env.record_sid:
+                try:
+                    host.log_meta(_env.db_conn, "view", sid=_env.record_sid, payload=json.dumps(
+                        {"nodes": n_nodes, "root_tag": root["tag"]}, ensure_ascii=False))
+                except Exception:
+                    pass
+            return f"(view shown: {n_nodes} nodes — ブラウザの /view に表示)"
+
+        def _clear_view() -> str:
+            _viewmod.CURRENT_VIEW.set(None)
+            return "(view cleared)"
+
+        def _view_next_action() -> str:
+            """queue の先頭 action を JSON 文字列で返す。 無ければ ""。"""
+            a = _viewmod.ACTIONS.pop()
+            return json.dumps(a, ensure_ascii=False) if a else ""
+
+        def _await_view_action(timeout: Any = 600, _env: Env = env) -> str:
+            """action が来るまで block (0.2s poll、 interrupt で中断可)。 timeout で ""。"""
+            deadline = time.time() + float(timeout)
+            while time.time() < deadline:
+                a = _viewmod.ACTIONS.pop()
+                if a:
+                    return json.dumps(a, ensure_ascii=False)
+                _check_interrupt(_env)
+                time.sleep(0.2)
+            return ""
+
+        env.bindings["show-view"]         = _show_view
+        env.bindings["clear-view"]        = _clear_view
+        env.bindings["view-next-action"]  = _view_next_action
+        env.bindings["await-view-action"] = _await_view_action
     except ImportError:
         pass
     # 旧 API (互換のため残す): env-messages / env-add-turn! は (env-messages env) / (env-add-turn! env t) でも使える

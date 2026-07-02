@@ -26,6 +26,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+# View 層 (view.py) — server 起動時 (remote mode) は y/N 確認をブラウザの
+# pending gate に載せる。 optional import: view.py が無くても edit は動く。
+try:
+    import view as _view
+except ImportError:
+    _view = None
+
 _HERE = Path(__file__).resolve().parent
 
 
@@ -84,8 +91,18 @@ def _is_shell_allowed(cmd: str) -> bool:
     return any(c in SHELL_ALLOWED_PREFIXES for c in candidates)
 
 
-def _confirm(prompt: str) -> bool:
-    """REPL 内での y/N 確認。 input() が失敗 (non-tty 等) なら False (skip 扱い)。"""
+def _confirm(prompt: str, *, kind: str = "confirm", title: str = "",
+             detail: str = "", diff: list | None = None) -> bool:
+    """y/N 確認。 server (view.GATES.remote) では pending gate に載せ、
+    ブラウザの承認ボタンと terminal の y/n の先着を採用する。
+    それ以外 (単体 REPL) は従来どおり input() — 挙動は変えない。
+    input() が失敗 (non-tty 等) なら False (skip 扱い)。"""
+    if _view is not None and _view.GATES.remote:
+        approved, source = _view.GATES.ask(
+            kind, title or prompt.strip(), detail=detail, diff=diff)
+        print(f"  [gate] {(title or prompt.strip())[:80]} → "
+              f"{'approve' if approved else 'deny'} ({source})", flush=True)
+        return approved
     try:
         ans = input(prompt).strip().lower()
         return ans in ("y", "yes")
@@ -105,7 +122,8 @@ def shell(cmd: Any, *, yolo: bool = False, cwd: str | None = None) -> str:
     """
     cmd = str(cmd)
     if not _is_shell_allowed(cmd) and not (yolo or _RUNTIME_YOLO):
-        if not _confirm(f"  [edit.shell] '{cmd[:80]}' を実行しますか? [y/N]: "):
+        if not _confirm(f"  [edit.shell] '{cmd[:80]}' を実行しますか? [y/N]: ",
+                        kind="shell", title=f"shell: {cmd[:120]}", detail=cmd[:2000]):
             return f"(skipped: {cmd[:80]})"
     try:
         result = subprocess.run(
@@ -257,13 +275,20 @@ def _backup(path: Path) -> None:
 def write_file(path: Any, text: Any, *, yolo: bool = False) -> str:
     """ファイル overwrite。 既存があれば .bak に backup。"""
     p = Path(str(path)).expanduser()
+    s = str(text)
     if p.exists() and not (yolo or _RUNTIME_YOLO):
-        if not _confirm(f"  [edit.write-file] '{p}' を上書きしますか? [y/N]: "):
+        diff = None
+        if _view is not None:
+            try:
+                diff = _view.diff_lines(p.read_text(encoding="utf-8"), s)
+            except Exception:
+                diff = None  # binary 等 — diff なしで確認に回す
+        if not _confirm(f"  [edit.write-file] '{p}' を上書きしますか? [y/N]: ",
+                        kind="write-file", title=f"write-file: {p}", diff=diff):
             return f"(skipped: {p})"
     _push_undo(p, "write-file")
     _backup(p)
     p.parent.mkdir(parents=True, exist_ok=True)
-    s = str(text)
     p.write_text(s, encoding="utf-8")
     return f"(wrote {len(s)} bytes to {p})" + _post_edit_check(p)
 
@@ -280,16 +305,24 @@ def edit_file(path: Any, old: Any, new: Any, *, yolo: bool = False) -> str:
         return f"(no match for old in {p})"
     if count > 1:
         return f"({count} matches in {p}, specify more context to make unique)"
+    proposed = content.replace(old_s, str(new))
     if not (yolo or _RUNTIME_YOLO):
         preview_old = old_s[:60].replace("\n", "\\n")
         preview_new = str(new)[:60].replace("\n", "\\n")
+        diff = None
+        if _view is not None:
+            try:
+                diff = _view.diff_lines(content, proposed)
+            except Exception:
+                diff = None
         if not _confirm(
-            f"  [edit.edit-file] '{p}' の '{preview_old}' を '{preview_new}' に? [y/N]: "
+            f"  [edit.edit-file] '{p}' の '{preview_old}' を '{preview_new}' に? [y/N]: ",
+            kind="edit-file", title=f"edit-file: {p}", diff=diff,
         ):
             return f"(skipped: {p})"
     _push_undo(p, "edit-file")
     _backup(p)
-    p.write_text(content.replace(old_s, str(new)), encoding="utf-8")
+    p.write_text(proposed, encoding="utf-8")
     return f"(edited {p})" + _post_edit_check(p)
 
 
@@ -319,7 +352,8 @@ def shell_bg(cmd: Any, *, yolo: bool = False, cwd: str | None = None) -> str:
     確認ポリシーは shell と同じ (allow-list / y/N / yolo)。"""
     cmd = str(cmd)
     if not _is_shell_allowed(cmd) and not (yolo or _RUNTIME_YOLO):
-        if not _confirm(f"  [edit.shell-bg] '{cmd[:80]}' をバックグラウンド起動しますか? [y/N]: "):
+        if not _confirm(f"  [edit.shell-bg] '{cmd[:80]}' をバックグラウンド起動しますか? [y/N]: ",
+                        kind="shell-bg", title=f"shell-bg: {cmd[:120]}", detail=cmd[:2000]):
             return f"(skipped: {cmd[:80]})"
     BG_DIR.mkdir(parents=True, exist_ok=True)
     _BG_SEQ[0] += 1
