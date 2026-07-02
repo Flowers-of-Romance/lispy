@@ -144,6 +144,10 @@ class Env:
     last_prompt_tokens: int = 0
     # stop-hook の残り発火回数 (eval_ ごとに reset)。 hook が失敗し続けても無限に止められないように。
     stop_hook_budget: int = 0
+    # plan phase フラグ (auto-step の計画フェーズ)。 True の間は副作用 tool を
+    # _execute_tool が一律ブロックし、 READONLY_TOOLS と純粋 eval だけ通す。
+    # eval_origin / input_mode と同列の「モード軸」。 fork / spawn の child も継承。
+    plan_phase: bool = False
 
     def to_messages(self) -> list[dict]:
         msgs: list[dict] = []
@@ -1397,6 +1401,11 @@ def _execute_tool(env: Env, name: Any, args_json: Any = "{}") -> str:
     handler = env.tools.get(name)
     if handler is None:
         return f"(unknown tool: {name})"
+    # plan phase — 計画フェーズ中は副作用 tool を一律ブロック (調査のみ)。
+    # READONLY_TOOLS を許可 set として流用。 spawn_agent / shell / write 系は set 外。
+    if env.plan_phase and name not in READONLY_TOOLS:
+        return (f"(plan-phase: {name} は計画フェーズでは実行不可 — 今は調査のみ。 "
+                f"副作用を伴う作業は (propose-plan ...) のステップに書き、 承認後の実行フェーズで行う)")
     # skill 更新 gate (SKILL.md への書き込みは judge 審査、 shell 経由は名指しで拒否)
     skill_reject = _gate_check_skill_write(env, name, args)
     if skill_reject is not None:
@@ -2373,6 +2382,309 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
     }
 
 
+def _prim_plan_factory(env: Env) -> dict[str, Callable[..., Any]]:
+    """plan mode の primitive 群 — 計画を ledger の一級市民として扱う。
+
+    kind=plan          {"steps": [{"what", "why"}...], "goal", "replaces": int|None}
+    kind=plan-approval {"plan_id", "approved", "source", "why"}
+    kind=plan-progress {"plan_id", "step" (1-based), "note"}
+
+    状態は常に ledger から導出する (in-memory の計画状態を持たない) — renew で
+    session が切れても server を再起動しても、 最新の計画が同じ規則で見える。
+    /view の計画パネルも同じ導出規則 (view.py 側) で表示する。
+
+    Claude Code の plan mode との違い (設計判断): 計画は凍結契約ではなく lineage を
+    持つ生きた文書。 初版の承認は人間の同期ゲート (不在なら judge fallback)、
+    実行中の改版 (revise-plan) は judge 審査 — 長時間の無人 run が改版のたびに
+    人間で止まらない。 逸脱の検出は judge-done が current-plan を契約として行う。
+    """
+
+    def _no_db(name: str) -> str:
+        return f"({name}: no db — record=True で session を開く必要あり)"
+
+    def _s(v: Any) -> str:
+        if isinstance(v, Symbol):
+            return v.name
+        if isinstance(v, Value):
+            return v.text
+        return v if isinstance(v, str) else _to_lisp_string(v)
+
+    # ----- ledger からの導出 -----
+
+    def _latest_plan() -> dict | None:
+        row = env.db_conn.execute(
+            "SELECT id, payload FROM meta_events WHERE kind = 'plan' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        if row is None:
+            return None
+        try:
+            p = json.loads(row[1] or "")
+        except Exception:
+            return None
+        p["id"] = row[0]
+        return p
+
+    def _approval_of(plan_id: int) -> dict | None:
+        rows = env.db_conn.execute(
+            "SELECT payload FROM meta_events WHERE kind = 'plan-approval' "
+            "ORDER BY id DESC LIMIT 30").fetchall()
+        for (payload,) in rows:
+            try:
+                p = json.loads(payload or "")
+            except Exception:
+                continue
+            if p.get("plan_id") == plan_id:
+                return p
+        return None
+
+    def _done_steps(plan_id: int) -> set[int]:
+        rows = env.db_conn.execute(
+            "SELECT payload FROM meta_events WHERE kind = 'plan-progress' "
+            "ORDER BY id DESC LIMIT 200").fetchall()
+        done: set[int] = set()
+        for (payload,) in rows:
+            try:
+                p = json.loads(payload or "")
+            except Exception:
+                continue
+            if p.get("plan_id") == plan_id and isinstance(p.get("step"), int):
+                done.add(p["step"])
+        return done
+
+    def _plan_text(plan: dict) -> str:
+        appr = _approval_of(plan["id"])
+        if appr is None:
+            status = "proposed"
+        elif appr.get("approved"):
+            status = f"approved by {appr.get('source', '?')}"
+        else:
+            status = f"rejected by {appr.get('source', '?')}"
+        done = _done_steps(plan["id"])
+        steps = plan.get("steps") or []
+        lines = [f"plan #{plan['id']} [{status}] goal: {plan.get('goal', '?')}"]
+        for i, st in enumerate(steps, 1):
+            mark = "x" if i in done else " "
+            lines.append(f"  {i}. [{mark}] {st.get('what', '?')} — {st.get('why', '?')}")
+        lines.append(f"  ({len(done & set(range(1, len(steps) + 1)))}/{len(steps)} done)")
+        return "\n".join(lines)
+
+    def _judge_plan(kind_label: str, body: str) -> tuple[bool, str]:
+        """judge LLM に計画を審査させる。 失敗は fail-closed (= REJECT)。"""
+        prompt_text = (
+            f"あなたは審査者。 agent が提案した{kind_label}を審査する。\n"
+            "判定基準: (1) goal の達成に向かう具体的なステップか "
+            "(2) 不可逆な外部作用 (削除・公開・送信) が無根拠に含まれていないか "
+            "(3) 各ステップの why がステップを正当化しているか。\n"
+            "出力: 1 行目に APPROVE または REJECT のみ。 2 行目以降に理由を 3 行以内で。\n\n"
+            + body
+        )
+        try:
+            client = host.get_judge_client()
+            resp = client.chat.completions.create(
+                model=host.judge_model(),
+                messages=[{"role": "user", "content": prompt_text}],
+                max_tokens=512,
+            )
+            out = (resp.choices[0].message.content or "").strip()
+        except (Exception, SystemExit) as e:
+            # SystemExit も拾う — host.get_client は LLM_* 未設定で SystemExit を
+            # 投げるため、 except Exception だけだと eval ごと落ちて fail-closed にならない
+            return False, f"judge unreachable ({type(e).__name__}: {e}) — fail-closed で REJECT"
+        first = out.split("\n", 1)[0].strip().upper()
+        return first.startswith("APPROVE"), out
+
+    def _record_approval(plan_id: int, approved: bool, source: str, why: str) -> None:
+        host.log_meta(env.db_conn, "plan-approval", sid=env.record_sid, payload=json.dumps({
+            "plan_id": plan_id, "approved": approved,
+            "source": source, "why": why.replace("\n", " ")[:300],
+        }, ensure_ascii=False))
+
+    # ----- primitives -----
+
+    def _propose_plan(goal: Any, steps: Any) -> str:
+        """(propose-plan "goal" '((what why) ...)) — 計画を kind=plan で ledger に刻む。
+        承認は別 (approve-plan / auto-step 側)。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db("propose-plan")
+        if not isinstance(steps, list) or not steps:
+            return "(propose-plan: steps は ((what why) ...) の空でない list)"
+        if len(steps) > 30:
+            return "(propose-plan: steps は 30 個まで — 粒度を上げること)"
+        norm: list[dict] = []
+        for st in steps:
+            if not (isinstance(st, list) and len(st) == 2):
+                return "(propose-plan: 各 step は (what why) の 2 要素 list — why (根拠) は省略不可)"
+            what, why = _s(st[0]).strip(), _s(st[1]).strip()
+            if not what or not why:
+                return "(propose-plan: what / why は空にできない)"
+            norm.append({"what": what[:500], "why": why[:500]})
+        host.log_meta(env.db_conn, "plan", sid=env.record_sid, payload=json.dumps({
+            "goal": _s(goal)[:500], "steps": norm, "replaces": None,
+        }, ensure_ascii=False))
+        plan = _latest_plan()
+        return f"(plan #{plan['id']} proposed: {len(norm)} steps — 承認待ち)"
+
+    def _plan_status() -> str:
+        """(plan-status) → "none" | "proposed" | "approved" | "rejected"。"""
+        if env.db_conn is None:
+            return "none"
+        plan = _latest_plan()
+        if plan is None:
+            return "none"
+        appr = _approval_of(plan["id"])
+        if appr is None:
+            return "proposed"
+        return "approved" if appr.get("approved") else "rejected"
+
+    def _plan_id() -> int:
+        """(plan-id) — 最新の計画の ledger id。 無ければ 0。
+        auto-step が「この run で提案された計画か」 を見分けるのに使う
+        (前の run の stale な proposed を誤って承認しない)。"""
+        if env.db_conn is None:
+            return 0
+        plan = _latest_plan()
+        return plan["id"] if plan else 0
+
+    def _current_plan() -> str:
+        """(current-plan) — 最新の計画をチェックリスト文字列で返す。 judge-done の契約材料。"""
+        if env.db_conn is None:
+            return "(no plan)"
+        plan = _latest_plan()
+        if plan is None:
+            return "(no plan)"
+        return _plan_text(plan)
+
+    def _plan_step_done(n: Any, *note: Any) -> str:
+        """(plan-step-done N [note]) — ステップ N (1-based) の完了を kind=plan-progress で刻む。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db("plan-step-done")
+        plan = _latest_plan()
+        if plan is None:
+            return "(plan-step-done: 計画がない)"
+        try:
+            step = int(n)
+        except (TypeError, ValueError):
+            return "(plan-step-done: N は整数)"
+        n_steps = len(plan.get("steps") or [])
+        if not 1 <= step <= n_steps:
+            return f"(plan-step-done: N は 1..{n_steps})"
+        host.log_meta(env.db_conn, "plan-progress", sid=env.record_sid, payload=json.dumps({
+            "plan_id": plan["id"], "step": step,
+            "note": _s(note[0])[:300] if note else "",
+        }, ensure_ascii=False))
+        done = _done_steps(plan["id"])
+        return f"(plan #{plan['id']}: step {step} done — {len(done)}/{n_steps})"
+
+    def _approve_plan() -> str:
+        """(approve-plan) — 最新の proposed 計画を承認に回す。
+        人間の答え手がいれば同期ゲート、 いなければ judge fallback (無人でも run が始まる)。
+        agent 由来では呼べない — 承認は起動側 (auto-step) の仕事。"""
+        if env.eval_origin == "agent":
+            return "(approve-plan: agent からは呼べない — 承認は auto-step / 人間側が行う)"
+        if env.db_conn is None or not env.record_sid:
+            return _no_db("approve-plan")
+        plan = _latest_plan()
+        if plan is None:
+            return "(approve-plan: 計画がない — 先に propose-plan)"
+        if _approval_of(plan["id"]) is not None:
+            return f"(approve-plan: plan #{plan['id']} は判定済み — {_plan_status()})"
+        text = _plan_text(plan)
+        goal = plan.get("goal", "?")
+
+        # 人間の同期ゲート — server (remote) では GATES の答え手判定を使う。
+        # timeout / 不在は「人間に届かなかった」 として judge fallback に落とす。
+        try:
+            import view as _view_mod
+        except ImportError:
+            _view_mod = None
+        if _view_mod is not None and _view_mod.GATES.remote:
+            if _view_mod.GATES.can_answer():
+                approved, source = _view_mod.GATES.ask(
+                    "plan", f"計画の承認: {goal[:80]}", detail=text)
+                if source not in ("timeout", "no-answerer", "answerer-lost"):
+                    _record_approval(plan["id"], approved, "human", source)
+                    return (f"(plan #{plan['id']} approved by human)" if approved
+                            else f"(plan #{plan['id']} rejected by human)")
+        elif sys.stdin.isatty():
+            # 単体 REPL — auto-step を打った本人がそこにいる
+            try:
+                import edit as _edit_mod
+                approved = _edit_mod._confirm(
+                    f"  [plan] 計画を承認しますか?\n{text}\n  [y/N]: ",
+                    kind="plan", title=f"計画の承認: {goal[:80]}", detail=text)
+                _record_approval(plan["id"], approved, "human", "terminal")
+                return (f"(plan #{plan['id']} approved by human)" if approved
+                        else f"(plan #{plan['id']} rejected by human)")
+            except ImportError:
+                pass
+
+        # judge fallback — 人間不在でも run を始められる。 judge も否なら安全側で止まる
+        approved, why = _judge_plan("実行計画", f"goal: {goal}\n\n{text}")
+        _record_approval(plan["id"], approved, "judge", why)
+        return (f"(plan #{plan['id']} approved by judge — 人間不在 fallback)" if approved
+                else f"(plan #{plan['id']} rejected by judge —\n{why})")
+
+    def _revise_plan(steps: Any, rationale: Any) -> str:
+        """(revise-plan '((what why) ...) rationale) — 実行中の計画改版。
+        judge 審査を通れば replaces lineage 付きで新しい計画になる (人間は非同期に
+        ledger / /view で知る)。 R の commit と同型 — 計画は凍結契約ではない。"""
+        if env.db_conn is None or not env.record_sid:
+            return _no_db("revise-plan")
+        prev = _latest_plan()
+        if prev is None:
+            return "(revise-plan: 既存の計画がない — propose-plan を使う)"
+        why_text = _s(rationale).strip()
+        if not why_text:
+            return "(revise-plan: rationale は省略不可 — なぜ改版が必要かを書く)"
+        if not isinstance(steps, list) or not steps or len(steps) > 30:
+            return "(revise-plan: steps は ((what why) ...) の 1..30 個の list)"
+        norm: list[dict] = []
+        for st in steps:
+            if not (isinstance(st, list) and len(st) == 2):
+                return "(revise-plan: 各 step は (what why) の 2 要素 list)"
+            what, why = _s(st[0]).strip(), _s(st[1]).strip()
+            if not what or not why:
+                return "(revise-plan: what / why は空にできない)"
+            norm.append({"what": what[:500], "why": why[:500]})
+        goal = prev.get("goal", "?")
+        body = (f"goal: {goal}\n\n現行の計画:\n{_plan_text(prev)}\n\n"
+                f"改版の rationale: {why_text}\n\n提案 (置き換え後の全ステップ):\n"
+                + "\n".join(f"  {i}. {st['what']} — {st['why']}" for i, st in enumerate(norm, 1)))
+        approved, why = _judge_plan("計画の改版", body)
+        if not approved:
+            return f"(revise-plan rejected by judge —\n{why}\n理由に応じて修正して再提案すること)"
+        host.log_meta(env.db_conn, "plan", sid=env.record_sid, payload=json.dumps({
+            "goal": goal, "steps": norm, "replaces": prev["id"],
+            "rationale": why_text[:300],
+        }, ensure_ascii=False))
+        new_plan = _latest_plan()
+        _record_approval(new_plan["id"], True, "judge", why)
+        return f"(plan #{new_plan['id']} revised (replaces #{prev['id']}) — approved by judge)"
+
+    def _plan_phase_bang(env_arg: Any, flag: Any = None) -> str:
+        """(plan-phase! env #t/#f) — 計画フェーズの on/off。
+        off (実行フェーズへの移行) は agent 由来では拒否 — 承認前に自走で
+        実行フェーズへ移れないようにする (承認の権限は常に人間/judge 側)。"""
+        if not isinstance(env_arg, Env):
+            env_arg, flag = env, env_arg
+        on = bool(flag)
+        if not on and env.eval_origin == "agent":
+            return "(plan-phase!: agent からは off にできない — 承認後に auto-step が行う)"
+        env_arg.plan_phase = on
+        return f"(plan-phase: {'on — 副作用 tool はブロック中' if on else 'off — 実行フェーズ'})"
+
+    return {
+        "propose-plan":   _propose_plan,
+        "plan-status":    _plan_status,
+        "plan-id":        _plan_id,
+        "current-plan":   _current_plan,
+        "plan-step-done": _plan_step_done,
+        "approve-plan":   _approve_plan,
+        "revise-plan":    _revise_plan,
+        "plan-phase!":    _plan_phase_bang,
+    }
+
+
 def _prim_load_factory(env: Env) -> Callable[..., Any]:
     """(load "path.lispy") — ファイル内の全 S 式を順に evaluate。
 
@@ -3300,6 +3612,7 @@ def _prim_fork_env(env_arg: Any, *opts: Any) -> "Env":
         gate=env_arg.gate,
         interrupt=env_arg.interrupt,
         last_prompt_tokens=env_arg.last_prompt_tokens,
+        plan_phase=env_arg.plan_phase,
     )
     return new_env
 
@@ -3322,6 +3635,7 @@ def _make_child_env(env: Env, system: str = "", name_suffix: str = "spawn") -> E
         record_sid=env.record_sid,
     )
     child.interrupt = env.interrupt  # 中断は親子共有 — 止めるときは subagent ごと止まる
+    child.plan_phase = env.plan_phase  # 計画フェーズは subagent にも及ぶ (迂回封鎖)
     _install_meta_primitives(child)
     return child
 
@@ -3485,6 +3799,8 @@ def _install_meta_primitives(env: Env) -> None:
     env.bindings["label"] = _prim_label_factory(env)
     # R/K 発見運動の primitive 群 (session-intent / commit-R / commit-K / commit-artifact / rk-log)
     env.bindings.update(_prim_rk_factory(env))
+    # plan mode の primitive 群 (propose-plan / approve-plan / plan-step-done / revise-plan ...)
+    env.bindings.update(_prim_plan_factory(env))
     env.bindings["archive-turns"] = _prim_archive_turns_factory(env)
     env.bindings["set-mode"] = _prim_set_mode_factory(env)
     env.bindings["clear-mode"] = _prim_clear_mode_factory(env)

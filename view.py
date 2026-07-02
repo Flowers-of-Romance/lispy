@@ -521,6 +521,34 @@ def _meta_to_event(rid: int, ts: float, sid: str | None, kind: str, payload: str
             return ev
         except Exception:
             pass
+    elif kind == "plan":
+        try:
+            p = json.loads(payload)
+            rep = f" (replaces #{p['replaces']})" if p.get("replaces") else ""
+            ev["head"] = _head(
+                f"plan proposed: {p.get('goal', '?')} ({len(p.get('steps') or [])} steps){rep}")
+            return ev
+        except Exception:
+            pass
+    elif kind == "plan-approval":
+        try:
+            p = json.loads(payload)
+            approved = bool(p.get("approved"))
+            ev["head"] = (f"plan #{p.get('plan_id', '?')} — "
+                          f"{'APPROVE' if approved else 'REJECT'} ({p.get('source', '?')})")
+            ev["rejected"] = not approved
+            ev["why"] = _head(p.get("why") or "")
+            return ev
+        except Exception:
+            pass
+    elif kind == "plan-progress":
+        try:
+            p = json.loads(payload)
+            note = f" — {p['note']}" if p.get("note") else ""
+            ev["head"] = _head(f"plan #{p.get('plan_id', '?')}: step {p.get('step', '?')} done{note}")
+            return ev
+        except Exception:
+            pass
     ev["head"] = _head(payload.split("\n", 1)[0])
     return ev
 
@@ -633,6 +661,54 @@ def _timeline(db: sqlite3.Connection, sid: str | None, limit: int = TIMELINE_LIM
     return events[-limit:]
 
 
+def plan_state(db: sqlite3.Connection) -> dict | None:
+    """最新の計画 (kind=plan) + 承認 (kind=plan-approval) + 進捗 (kind=plan-progress)
+    をチェックリストに畳む。 lispy.py の _prim_plan_factory と同じ導出規則 —
+    ledger が唯一の真実で、 ここはその投影。 scope に依らず最新 1 件 (計画は run 単位)。"""
+    row = db.execute(
+        "SELECT id, payload FROM meta_events WHERE kind = 'plan' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return None
+    try:
+        p = json.loads(row[1] or "")
+    except Exception:
+        return None
+    plan_id = row[0]
+    status, source = "proposed", ""
+    for (payload,) in db.execute(
+        "SELECT payload FROM meta_events WHERE kind = 'plan-approval' "
+        "ORDER BY id DESC LIMIT 30").fetchall():
+        try:
+            a = json.loads(payload or "")
+        except Exception:
+            continue
+        if a.get("plan_id") == plan_id:
+            status = "approved" if a.get("approved") else "rejected"
+            source = a.get("source", "")
+            break
+    done: set[int] = set()
+    for (payload,) in db.execute(
+        "SELECT payload FROM meta_events WHERE kind = 'plan-progress' "
+        "ORDER BY id DESC LIMIT 200").fetchall():
+        try:
+            g = json.loads(payload or "")
+        except Exception:
+            continue
+        if g.get("plan_id") == plan_id and isinstance(g.get("step"), int):
+            done.add(g["step"])
+    steps = [
+        {"what": _head(s.get("what", "")), "why": _head(s.get("why", "")), "done": i in done}
+        for i, s in enumerate(p.get("steps") or [], 1)
+    ]
+    return {
+        "id": plan_id, "goal": _head(p.get("goal", "")),
+        "status": status, "source": source, "replaces": p.get("replaces"),
+        "steps": steps,
+        "done": sum(1 for s in steps if s["done"]), "total": len(steps),
+    }
+
+
 def summary_24h(db: sqlite3.Connection) -> dict:
     """最上段の要約 (要約ファースト)。 直近 24 時間・全 session の活動量 —
     抜き取り検査の一枚目なので、 scope に依らず箱全体を集計する。
@@ -677,6 +753,7 @@ def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
         "ok": True,
         "scope": scope,
         "session_id": sid,
+        "plan": plan_state(db),
         "gates": [
             _meta_to_event(*row)
             for row in _recent_kind_rows(db, sid, ("gate", "skill", "confirm"), 20)
@@ -779,6 +856,13 @@ VIEW_HTML = """<!doctype html>
   .replaced{text-decoration:line-through;color:#999}
   li.tag-confirm{background:#e8f5e9}
   li.tag-view,li.tag-view-action{background:#ede7f6}
+  li.tag-plan,li.tag-plan-approval,li.tag-plan-progress{background:#e0f2f1}
+  #plan-list{list-style:none;margin:0;padding:.4em .6em;border:1px solid #ddd;
+             border-radius:4px;background:#fff;font-size:.9em}
+  #plan-list li{margin:.25em 0}
+  #plan-list li.done .what{color:#2a2}
+  #plan-list .mark{font-family:ui-monospace,monospace;margin-right:.3em}
+  .plan-why{color:#888;font-size:.85em;margin-left:1.7em}
   .gate{border:2px solid #c70;border-radius:4px;padding:.5em .7em;margin:.5em 0;background:#fff8e6}
   .gate-head{font-weight:bold}
   .gate-detail{font-size:.85em;color:#555;margin:.3em 0;white-space:pre-wrap}
@@ -820,10 +904,15 @@ VIEW_HTML = """<!doctype html>
   <a class="stat" id="stat-rejects" href="#gates-wrap"><b id="st-rejects">0</b><span>REJECT (24h)</span></a>
   <a class="stat" id="stat-skill" href="#gates-wrap"><b id="st-skill">0</b><span>SKILL.md 書換 (24h)</span></a>
   <a class="stat" id="stat-pending" href="#pending-wrap"><b id="st-pending">0</b><span>承認待ち</span></a>
+  <a class="stat" id="stat-plan" href="#plan-wrap"><b id="st-plan">—</b><span>plan</span></a>
 </div>
 <div id="pending-wrap" style="display:none">
   <h2>承認待ち gate</h2>
   <div id="pending"></div>
+</div>
+<div id="plan-wrap" style="display:none">
+  <h2>plan <span class="note" id="plan-meta"></span></h2>
+  <ol id="plan-list"></ol>
 </div>
 <div class="panels">
   <div class="panel"><h2>R</h2><ul id="panel-R"></ul></div>
@@ -884,6 +973,29 @@ function renderSummary(st) {
     "stat" + ((s.rejects || 0) > 0 ? " alert" : "");
   document.getElementById("stat-pending").className =
     "stat" + (nPending > 0 ? " attn" : "");
+  const p = st.plan;
+  document.getElementById("st-plan").textContent =
+    p ? (p.status === "approved" ? p.done + "/" + p.total : p.status) : "—";
+  document.getElementById("stat-plan").className =
+    "stat" + (p && p.status === "rejected" ? " alert"
+            : p && p.status === "proposed" ? " attn" : "");
+}
+
+function renderPlan(p) {
+  const wrap = document.getElementById("plan-wrap");
+  const list = document.getElementById("plan-list");
+  list.replaceChildren();
+  if (!p) { wrap.style.display = "none"; return; }
+  wrap.style.display = "";
+  document.getElementById("plan-meta").textContent =
+    "#" + p.id + " [" + p.status + (p.source ? " by " + p.source : "") + "]" +
+    (p.replaces ? " (replaces #" + p.replaces + ")" : "") + " — " + (p.goal || "");
+  for (const s of p.steps || []) {
+    const li = el("li", s.done ? "done" : "");
+    li.append(el("span", "mark", s.done ? "☑" : "☐"), el("span", "what", s.what || ""));
+    if (s.why) li.append(el("div", "plan-why", s.why));
+    list.append(li);
+  }
 }
 
 function bumpSummary(id) {
@@ -934,6 +1046,7 @@ function renderPanels(st) {
   for (const g of (st.gates || [])) G.append(evLi(g));
 
   renderPending(st.pending || []);
+  renderPlan(st.plan || null);
   renderAgentView(st.view || null);
 }
 
@@ -1100,7 +1213,8 @@ function connect(cur) {
     // 要約カウンタの即時更新 (真値は refreshPanels の再取得で揃う)
     if (ev.src === "turn" && ev.tag === "assistant") bumpSummary("st-steps");
     if (ev.src === "turn" && ev.tag === "tool") bumpSummary("st-tools");
-    if (["R", "K", "S", "gate", "skill", "confirm", "intent"].includes(ev.tag)) refreshPanels();
+    if (["R", "K", "S", "gate", "skill", "confirm", "intent",
+         "plan", "plan-approval", "plan-progress"].includes(ev.tag)) refreshPanels();
   };
   es.onerror = scheduleRetry;
 }
