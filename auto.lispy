@@ -1,0 +1,100 @@
+;; auto.lispy — 自走レイヤ (goal-driven outer loop)
+;;
+;; agent-step が「1 タスクを完遂する内側のループ」 (tool_calls が尽きたら終了) なのに対し、
+;; ここに置くのは「goal を保持し、 検証し、 続行/終了を決める外側のループ」。
+;; init.lispy 同様に起動時 auto-load される (ファイルを消せば従来どおり)。
+;;
+;; 使い方:
+;;   main> (auto-step env "リポジトリの TODO を洗い出して docs/todo.md にまとめる")
+;;   main> (auto-step env "..." 20)      ; max-rounds を 20 に
+;;   main> (auto-step env "..." 20 120)  ; renew 閾値も 120 turns に
+;;
+;; 設計:
+;;   - 判定は fork-env した検証専用 env (judge) で行う — 自己採点より独立採点
+;;   - agent-step / judge-done / auto-renew は (lookup ...) で late-bind —
+;;     走行中に (define agent-step ...) で書き換えれば auto-step も即それを使う
+;;   - turns が伸びすぎたら要約して (renew ...) — Claude Code の auto-compaction 相当
+
+;; --- 判定者の persona ---
+;; 会話履歴 = 作業ログを丸ごと見せて、 goal との照合だけをさせる。
+;; agent の自己申告を信用しない、 という一文が実質の本体。
+(define judge-system
+  "あなたは検証者。会話履歴は agent の作業ログである。与えられた goal と作業ログを照合し、goal が本当に達成されたかだけを判定する。agent の自己申告 (「完了しました」等) は信用せず、tool の実行結果という証拠があるかで判断する。tool は呼ばない。達成済みなら DONE とだけ書く。未達成なら NEXT: に続けて、次にやるべき最も具体的な一手を 1-3 文で書く。")
+
+;; --- (judge-done env goal) → "DONE" | "NEXT: ..." ---
+;; judge-call に投げる: .env の JUDGE_* が設定されていれば executor と別のモデルが判定する
+;; (訓練も盲点も違うモデルによる独立採点)。 未設定なら executor に fallback
+;; (= fork-env による別文脈・同重みの弱い独立性)。 tools は渡らない (審査者は判定のみ)。
+(define judge-done
+  (lambda (env goal)
+    (let ((j (fork-env env 'system judge-system 'name "judge")))
+      (let ((r (judge-call (append-turn j (make-turn "user"
+                 (string-append "goal: " goal
+                   "\nここまでの作業ログ (上の会話履歴) を証拠として、この goal は達成済みか?")))
+                 'max-tokens 512)))
+        (let ((v (string-trim (turn-content r))))
+          (if (eq? v "")
+              "NEXT: (検証者の応答が空だった。作業を続け、完了したと考えるなら根拠となる tool 実行結果を明示すること)"
+              v))))))
+
+;; 判定文字列が DONE か。 prefix 一致のみ ("DONE." "**DONE**" は許容)。
+;; 文中に DONE を含むだけの応答 (「まだ DONE ではない」等) を誤って完了扱いしない —
+;; 誤検出は早期終了 (実害大)、 見逃しは 1 round 余計に回るだけ (実害小)。
+(define done-verdict?
+  (lambda (v)
+    (or (string-prefix? v "DONE")
+        (string-prefix? v "**DONE"))))
+
+;; --- (condense-context) — token 閾値の auto-compaction ---
+;; agent-step が round 開始時に (context-over?) で呼ぶ。 goal なし版の圧縮:
+;; 直近の作業ログを LLM 要約して (renew ...)。 auto-renew (goal あり、 auto-step 用) の対。
+;; overflow で LLM 自体が呼べない場合の緊急網は Python 側 (_emergency_compact) にある。
+(define condense-context
+  (lambda ()
+    (renew (string-append
+      "[auto-compaction] context が上限の 8 割に達したため圧縮した。直前までの作業要約:\n"
+      (prompt (string-append
+        "以下は agent の作業ログ。次の 3 項目を箇条書きで、合計 15 行以内に要約せよ: "
+        "(1) 確定した事実 (2) 完了した作業 (3) 未完了の作業と次の一手。\n\n"
+        (transcript 60)))))))
+
+;; --- (auto-renew goal) — 文脈の自動圧縮 (compaction 相当) ---
+;; 直近の作業ログを LLM で要約し、 goal + 要約だけを carry して (renew ...)。
+;; 注意: renew は DB session の境界も切る (ledger は session 単位で分かれる)。
+(define auto-renew
+  (lambda (goal)
+    (renew (string-append
+      "goal: " goal
+      "\n直前までの作業要約:\n"
+      (prompt (string-append
+        "以下は agent の作業ログ。次の 3 項目を箇条書きで、合計 15 行以内に要約せよ: "
+        "(1) 確定した事実 (2) 完了した作業 (3) 未完了の作業と次の一手。\n\n"
+        (transcript 60)))))))
+
+;; --- (auto-step env goal [max-rounds] [renew-at]) — 自走の外側ループ ---
+;; round ごとに: agent-step で作業 → judge-done で検証 →
+;; DONE なら終了、 未達成なら判定の NEXT を system-reminder として次の入力に。
+;; turns が renew-at を超えたら auto-renew で文脈を切り直してから続行。
+(define auto-step
+  (lambda (env goal &rest opts)
+    (let ((max-rounds (if (null? opts) 12 (car opts)))
+          (renew-at   (if (or (null? opts) (null? (cdr opts))) 80 (car (cdr opts)))))
+      (begin
+        (session-intent goal)
+        ((lambda (input n)
+           (let ((r ((lookup "agent-step") env input)))
+             (if (>= n max-rounds)
+                 r
+                 (let ((verdict ((lookup "judge-done") env goal)))
+                   (if (done-verdict? verdict)
+                       r
+                       (begin
+                         (if (> (turn-count) renew-at)
+                             ((lookup "auto-renew") goal)
+                             #f)
+                         (recur (string-append
+                                  "<system-reminder>検証者の判定 (round " n "/" max-rounds "): "
+                                  verdict
+                                  "\n未達成。NEXT の指示に従って作業を続けること。完了したと判断したら、根拠となる tool の実行結果を明示すること。</system-reminder>")
+                                (+ n 1))))))))
+         goal 0)))))

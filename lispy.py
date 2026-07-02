@@ -54,9 +54,13 @@ import operator
 import os
 import random as _random
 import re as _re
+import signal
+import subprocess
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from functools import reduce
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,6 +131,19 @@ class Env:
     input_mode: Any = None
     # マクロ定義 (defmacro)。bindings とは分離: 展開は evaluate 前、引数は非評価で渡る。
     macros: dict[str, "Lambda"] = field(default_factory=dict)
+    # 今の評価が誰由来か: "user" (REPL / HTTP) or "agent" (LLM 応答の auto-eval)。
+    # define-gate は "agent" 由来にだけ効く — 人間の REPL 作業 (Recipe 3/4) は自由のまま。
+    eval_origin: str = "user"
+    # define-gate (Gate instance)。 None なら gate なし (従来動作)。
+    gate: Any = None
+    # 中断フラグ (threading.Event)。 REPL の Ctrl-C / server の POST /interrupt が set し、
+    # llm-call / dispatch-tool が step 境界でチェックして LispError('interrupt) を上げる。
+    # fork / spawn の child とも共有する — 止めるときは全部止まる。
+    interrupt: Any = None
+    # 直近の llm-call が消費した prompt tokens (usage.prompt_tokens)。 auto-compaction の判定材料。
+    last_prompt_tokens: int = 0
+    # stop-hook の残り発火回数 (eval_ ごとに reset)。 hook が失敗し続けても無限に止められないように。
+    stop_hook_budget: int = 0
 
     def to_messages(self) -> list[dict]:
         msgs: list[dict] = []
@@ -327,31 +344,44 @@ BODY_SYSTEM = (
 
 
 def _load_system_prompt() -> str:
-    """lispy.SYSTEM_PROMPT.md を読む。 system prompt 本体 (Python 外で編集可)。"""
+    """lispy.SYSTEM_PROMPT.md を読む。 system prompt 本体 (Python 外で編集可)。
+
+    末尾に蒸留層 index の実パスを動的に注入する (LISPY_MEMORY_DIR に依存するため
+    静的 md には書けない)。"""
     p = _HERE / "lispy.SYSTEM_PROMPT.md"
     if not p.exists():
         # 起動を止めない最小 fallback。 ファイルを消すと agent としては機能しないが
         # pure Lisp 評価は動く。
         return "lispy mode. (lispy.SYSTEM_PROMPT.md missing — agent prompt degraded)"
-    return p.read_text(encoding="utf-8")
+    text = p.read_text(encoding="utf-8")
+    try:
+        import brainwash as _bw
+        text += (
+            f"\n長期記憶の index は {_bw.MEMORY_DIR / 'index.md'} にある"
+            " (無ければまだ記憶が無いだけ — 気にせず進む)。\n"
+        )
+    except ImportError:
+        pass
+    return text
 
 
 SYSTEM_PROMPT = _load_system_prompt()
 
 
-def apply_(env: Env, max_tokens: int = 2048) -> Turn:
+def apply_(env: Env, max_tokens: int = 0) -> Turn:
     """env を 1 回評価して、新しい assistant turn を返す。
 
     Lisp の `(apply lambda args)` に相当。env が λ の閉包、
     モデルが λ の body の評価器。
+    max_tokens=0 (default) は .env の LLM_MAX_TOKENS に従う。
     """
     client = host.get_client()
     resp = client.chat.completions.create(
         model=host.MODEL,
         messages=env.to_messages(),
         tools=env.tool_schema or None,
-        max_tokens=max_tokens,
-        extra_body={"think": False},
+        max_tokens=max_tokens or host.MAX_TOKENS,
+        extra_body={"think": host.THINK},
     )
     msg = resp.choices[0].message
     content = msg.content or ""
@@ -397,6 +427,7 @@ def eval_(env: Env, user_input: str, *, max_iters: int = 10) -> Value:
     if not isinstance(agent_step, Lambda):
         return Value(text="(agent-step not defined — env initialization issue)")
 
+    env.stop_hook_budget = 2  # stop-hook は 1 入力につき最大 2 回まで停止を差し戻せる
     turns_before = len(env.turns)
     try:
         result = _apply_callable(agent_step, [env, user_input], env)
@@ -838,6 +869,351 @@ _SEXP_DISPATCH: dict[str, Callable[[Env, list], Value]] = {
 
 
 # ---------------------------------------------------------------------------
+# define-gate — self-modifying を「提案 → 審査 → install」の二層に開く不変層
+#
+# エージェント (LLM) が自分の loop 規則を書き換えるとき、 書き換えを実行しているのは
+# 今の loop 自身なので、 壊れた規則を無検証で install すると自己修復能力ごと失う。
+# そこで install の判定を loop の外 (Python の不変層 + 別 LLM の審査) に置く。
+#
+#   層 1 (protected_py):   Python 側が install した binding (primitive / bridge / env)。
+#                          shadow する正当な理由が無いので一律 deny (審査なし)。
+#   層 2 (protected_loop): loop に到達可能な S 式 binding。 構造チェック (決定的な床)
+#                          → judge LLM (JUDGE_* 未設定なら executor に fallback) の審査
+#                          → 承認なら install + commit-S (rationale "gate-approved")。
+#
+# gate が効くのは env.eval_origin == "agent" (= LLM 応答の auto-eval 経由) のときだけ。
+# 人間の REPL 入力・HTTP /eval は従来どおり自由 (Recipe 3/4 の walkthrough を壊さない)。
+# LISPY_GATE=off で全体を無効化できる (開発・実験用)。
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Gate:
+    protected_py: set
+    protected_loop: set
+    enabled: bool = True
+
+
+# 層 2 の保護対象。 judge の連鎖 (judge-done / judge-system / done-verdict?) を必ず含める —
+# 判定者を書き換えられたら gate は無傷のまま骨抜きになるため。
+PROTECTED_LOOP_BINDINGS = {
+    "agent-step", "auto-step", "judge-done", "judge-system", "done-verdict?", "auto-renew",
+    "condense-context",
+}
+
+
+GATE_JUDGE_SYSTEM = (
+    "あなたは self-modifying agent ハーネスの installer に組み込まれた審査者。"
+    "実行エージェントが提案した loop 規則の書き換えを、 install してよいか判定する。"
+    "エージェントの説明や意図は入力に含めていない — コードだけで判断する。"
+    "判定基準: "
+    "(1) 検証・round 上限・確認などの安全機構を除去または弱体化していないか "
+    "(2) judge の判定 (judge-done / judge-system / done-verdict?) を無効化・迂回する変更でないか "
+    "(3) 副作用 tool (shell / write_file / edit_file) の使い方が dispatch-tool 経由の通常形から逸脱していないか "
+    "(4) 名目上の変更に対して過剰な挙動 (無関係な binding の書き換え、 隠れた無限 loop) を含まないか。 "
+    "出力: 1 行目に APPROVE または REJECT のみ。 2 行目以降に理由を 3 行以内で。"
+)
+
+
+def _gate_active(env: Env) -> bool:
+    return (
+        getattr(env, "gate", None) is not None
+        and env.gate.enabled
+        and env.eval_origin == "agent"
+    )
+
+
+def _gate_body_text(value: Any) -> str:
+    """binding 値を審査用のテキスト表現に。 Lambda は S 式 (round-trip 可能形)、 他は Lisp 表記。"""
+    if isinstance(value, Lambda):
+        if isinstance(value.body, str):
+            return f'(lambda ({" ".join(value.params)}) "{value.body}")'
+        body = "\n".join(_serialize_sexp(f) for f in value.body)
+        return f'(lambda ({" ".join(value.params)})\n{body})'
+    if isinstance(value, str):
+        return f'"{value}"'
+    return _to_lisp_string(value)
+
+
+def _gate_structural_check(gate: "Gate", value: Any) -> str | None:
+    """決定的な床。 通れば None、 弾くなら理由の文字列。
+
+    保護 body 内の (lookup X) は、 X がリテラルな保護名のときだけ許可する。
+    直接 symbol 参照は定義時に captured で凍結されるので安全 (後から差し替えても効かない) が、
+    lookup は意図的な late binding なので、 無保護名に向けると「承認後に中身だけ差し替える」
+    迂回路になる。 動的に組んだ名前 (変数・式) も同じ理由で deny。
+    """
+    if not isinstance(value, Lambda) or isinstance(value.body, str):
+        return None  # 文字列 binding (judge-system 等) / LLM lambda は judge の意味審査に委ねる
+
+    protected = gate.protected_py | gate.protected_loop
+
+    def _walk(t: Any) -> str | None:
+        if not isinstance(t, list) or not t:
+            return None
+        head = t[0]
+        if isinstance(head, Symbol) and head.name == "lookup":
+            target = None
+            if len(t) == 2:
+                a = t[1]
+                if isinstance(a, str):
+                    target = a
+                elif (isinstance(a, list) and len(a) == 2
+                        and isinstance(a[0], Symbol) and a[0].name == "quote"
+                        and isinstance(a[1], Symbol)):
+                    target = a[1].name
+            if target is None:
+                return "(lookup <動的な名前>) は保護 body で禁止 — リテラルな保護名のみ"
+            if target not in protected:
+                return f'(lookup "{target}") — 無保護名への late binding は承認後の差し替え迂回になるため禁止'
+        for c in t:
+            r = _walk(c)
+            if r:
+                return r
+        return None
+
+    for form in value.body:
+        r = _walk(form)
+        if r:
+            return r
+    return None
+
+
+def _gate_call_judge(env: Env, name: str, value: Any) -> tuple[bool, str]:
+    """judge LLM に現行定義と提案を見せて APPROVE / REJECT を取る。 失敗は fail-closed (= REJECT)。"""
+    current = env.bindings.get(name)
+    cur_text = _gate_body_text(current) if current is not None else "(未定義)"
+    cand_text = _gate_body_text(value)
+    user_content = (
+        f"対象 binding: {name}\n\n現行定義:\n{cur_text}\n\n提案 (展開済み S 式):\n{cand_text}"
+    )
+    try:
+        client = host.get_judge_client()
+        resp = client.chat.completions.create(
+            model=host.judge_model(),
+            messages=[
+                {"role": "system", "content": GATE_JUDGE_SYSTEM},
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=host.JUDGE_MAX_TOKENS,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return False, f"judge unreachable ({type(e).__name__}: {e}) — fail-closed で REJECT"
+    first = out.split("\n", 1)[0].strip().upper()
+    return first.startswith("APPROVE"), out
+
+
+def gate_check_bind(env: Env, name: str, value: Any) -> tuple[str, str] | None:
+    """define / set! の共通入口。 None = gate 対象外 (通常 bind)。
+    ("deny", 理由)  = bind しない。  ("approve", judge の理由) = bind + 自動 commit-S。"""
+    if not _gate_active(env):
+        return None
+    gate = env.gate
+    if name in gate.protected_py:
+        return ("deny", f"(gate: {name} は Python primitive — shadow は禁止。 別名で define すること)")
+    if name in gate.protected_loop:
+        reason = _gate_structural_check(gate, value)
+        if reason:
+            return ("deny", f"(gate: {name} rejected by structural check — {reason})")
+        approved, why = _gate_call_judge(env, name, value)
+        if not approved:
+            return ("deny", f"(gate: {name} rejected by judge —\n{why})")
+        return ("approve", why)
+    return None
+
+
+def gate_check_macro(env: Env, name: str) -> str | None:
+    """defmacro の名前チェック。 evaluate() はマクロを special form より先に引くので、
+    define / set! 等と衝突する名前のマクロは gate そのものを迂回する — origin に関係なく deny。
+    保護 binding 名のマクロ shadow (llm-call 等は関数位置で macro が先に効く) は agent 由来のみ deny。"""
+    if name in _SPECIAL_FORM_NOEVAL or name in _SEXP_DISPATCH:
+        return f"(defmacro: {name} は special form と衝突 — 評価器を迂回するため禁止)"
+    if _gate_active(env):
+        gate = env.gate
+        if name in gate.protected_py or name in gate.protected_loop:
+            return f"(gate: macro {name} は保護 binding を shadow する — 禁止)"
+    return None
+
+
+def _gate_autocommit(env: Env, name: str, why: str) -> None:
+    """承認された install の rollback 点を自動確保。 commit-S の rationale を
+    "gate-approved" で始めることで、 restore-S の承認済み fast-path が判定できる。"""
+    commit_s = env.bindings.get("commit-S")
+    if not callable(commit_s):
+        return
+    head = why.split("\n", 1)[-1].strip().replace("\n", " ")[:80]
+    try:
+        commit_s(Symbol(name), f"gate-approved: {head}")
+    except Exception:
+        pass  # DB 無し等 — snapshot はベストエフォート
+
+
+# ---------------------------------------------------------------------------
+# 中断 — REPL の Ctrl-C / server の POST /interrupt が env.interrupt (Event) を set し、
+# llm-call / dispatch-tool が step 境界で拾って LispError('interrupt) を上げる。
+# tool の実行途中では切らない (安全な境界でだけ止まる)。
+# ---------------------------------------------------------------------------
+
+def _check_interrupt(env: Env) -> None:
+    ev = getattr(env, "interrupt", None)
+    if ev is not None and ev.is_set():
+        raise LispError("interrupted by user — step 境界で停止した", "interrupt")
+
+
+# ---------------------------------------------------------------------------
+# hooks — プロジェクト設定の shell コマンドを agent loop の決定的な点に差し込む
+# (Claude Code の PreToolUse / PostToolUse / Stop hook 相当)
+#
+# 設定: cwd から上方探索した .lispy-hooks.json (LISPY_HOOKS で明示指定も可)。 形式:
+#   {"pre-tool":  [{"match": "write_file|edit_file", "cmd": "..."}],
+#    "post-tool": [{"match": "edit_file", "cmd": "ruff check ."}],
+#    "stop":      [{"cmd": "test -f data/receipt.md"}]}
+# hook には環境変数 LISPY_HOOK_EVENT / LISPY_TOOL_NAME / LISPY_TOOL_ARGS / LISPY_TOOL_RESULT が渡る。
+#   pre-tool:  非ゼロ exit → その tool 呼び出しをブロック (出力が理由として agent に返る)
+#   post-tool: 出力が tool result に添付される (lint / typecheck のフィードバック)
+#   stop:      非ゼロ exit → agent は止まれず、 出力が system-reminder として次 round に入る
+# ---------------------------------------------------------------------------
+
+_HOOKS_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _hooks_config() -> dict:
+    explicit = os.environ.get("LISPY_HOOKS", "").strip()
+    path: Path | None = None
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p.exists():
+            path = p
+    else:
+        d = Path(os.getcwd())
+        for parent in [d, *d.parents]:
+            f = parent / ".lispy-hooks.json"
+            if f.exists():
+                path = f
+                break
+    if path is None:
+        return {}
+    key = str(path)
+    mtime = path.stat().st_mtime
+    cached = _HOOKS_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception as e:
+        print(f"  (hooks parse error: {path}: {e})", file=sys.stderr)
+        cfg = {}
+    _HOOKS_CACHE[key] = (mtime, cfg)
+    return cfg
+
+
+def _run_hook_cmds(event: str, tool_name: str, args_text: str, result_text: str = "") -> list[tuple[str, int, str]]:
+    """該当 event の hook を順に実行。 (cmd, exit_code, output) の list を返す。"""
+    hooks = _hooks_config().get(event) or []
+    out: list[tuple[str, int, str]] = []
+    for h in hooks:
+        if not isinstance(h, dict):
+            continue
+        cmd = str(h.get("cmd", "")).strip()
+        if not cmd:
+            continue
+        pat = str(h.get("match", ""))
+        if pat and tool_name and not _re.search(pat, tool_name):
+            continue
+        hook_env = {
+            **os.environ,
+            "LISPY_HOOK_EVENT": event,
+            "LISPY_TOOL_NAME": tool_name,
+            "LISPY_TOOL_ARGS": args_text[:4000],
+            "LISPY_TOOL_RESULT": result_text[:4000],
+        }
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                               timeout=60, env=hook_env)
+            output = ((r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")).strip()
+            out.append((cmd, r.returncode, output))
+        except subprocess.TimeoutExpired:
+            out.append((cmd, -1, "(hook timeout 60s)"))
+        except Exception as e:
+            out.append((cmd, -1, f"(hook error: {e})"))
+    return out
+
+
+def _run_pre_tool_hooks(name: str, args_text: str) -> str | None:
+    """非ゼロ exit の hook があればブロック理由を返す。 全部通れば None。"""
+    for cmd, code, output in _run_hook_cmds("pre-tool", name, args_text):
+        if code != 0:
+            return f"`{cmd[:60]}` → {output[:500] or f'exit {code}'}"
+    return None
+
+
+def _run_post_tool_hooks(name: str, args_text: str, result: str) -> str:
+    parts = []
+    for cmd, code, output in _run_hook_cmds("post-tool", name, args_text, result):
+        if output or code != 0:
+            status = "ok" if code == 0 else f"exit {code}"
+            parts.append(f"\n[hook `{cmd[:60]}` → {status}]" + (f"\n{output[:2000]}" if output else ""))
+    return "".join(parts)
+
+
+def _prim_stop_hook_factory(env: Env) -> Callable[..., Any]:
+    """(stop-hook final-text) — stop hooks を走らせる。 全部 exit 0 (または未設定) なら ""、
+    非ゼロがあれば続行を促す system-reminder を返す (agent-step が turn を積んで recur する)。
+    eval_ ごとに budget 2 回 — hook が失敗し続けても無限には止められない (round 上限が最終防波堤)。"""
+    def _stop(text: Any = "") -> str:
+        if env.stop_hook_budget <= 0:
+            return ""
+        results = _run_hook_cmds("stop", "", "", str(text))
+        msgs = [f"`{c[:60]}` → {o[:500] or f'exit {code}'}" for c, code, o in results if code != 0]
+        if not msgs:
+            return ""
+        env.stop_hook_budget -= 1
+        return ("<system-reminder>[stop-hook] 停止条件を満たしていない: "
+                + " / ".join(msgs)
+                + " — 解消してから完了報告すること。</system-reminder>")
+    return _stop
+
+
+# ---------------------------------------------------------------------------
+# tool 実行の共通経路 (dispatch-tool / dispatch-tools が使う)
+# ---------------------------------------------------------------------------
+
+# 並列実行してよい read-only tool。 副作用系が 1 つでも混ざった batch は直列 (順序保存)。
+READONLY_TOOLS = {
+    "current_time", "list_dir", "read_file", "glob", "grep",
+    "recall", "recall_session", "web_fetch", "web_search", "task_list",
+    "shell_out",
+}
+
+
+def _execute_tool(env: Env, name: Any, args_json: Any = "{}") -> str:
+    """1 つの tool call を実行: pre-tool hook → handler → post-tool hook。"""
+    name = str(name)
+    if isinstance(args_json, dict):
+        args = args_json
+        args_text = json.dumps(args_json, ensure_ascii=False)
+    else:
+        args_text = str(args_json) or "{}"
+        try:
+            args = json.loads(args_text)
+        except json.JSONDecodeError:
+            args = {}
+    handler = env.tools.get(name)
+    if handler is None:
+        return f"(unknown tool: {name})"
+    blocked = _run_pre_tool_hooks(name, args_text)
+    if blocked is not None:
+        return f"(hook blocked {name}: {blocked})"
+    try:
+        result = handler(args, env)
+    except Exception as e:
+        return f"(error: {e})"
+    return result + _run_post_tool_hooks(name, args_text, result)
+
+
+# ---------------------------------------------------------------------------
 # Lisp core: evaluate, special forms, primitives
 # ---------------------------------------------------------------------------
 
@@ -880,6 +1256,10 @@ def _sf_define(env: Env, args: list) -> Any:
     if not isinstance(name_node, Symbol):
         raise ValueError("define: name must be a symbol")
     value = _unwrap_value(evaluate(args[1], env))
+    # define-gate: agent 由来の保護 binding 書き換えは審査を通す (deny なら bind しない)
+    gate_result = gate_check_bind(env, name_node.name, value)
+    if gate_result is not None and gate_result[0] == "deny":
+        return gate_result[1]
     env.bindings[name_node.name] = value
     # 自己再帰サポート: lambda の captured に自分自身を入れて、本体内で自己参照できるようにする。
     # 例) (define fact (lambda (n) (if ... (fact ...))))
@@ -888,6 +1268,9 @@ def _sf_define(env: Env, args: list) -> Any:
         # 匿名 λ (sexp_lambda が name="anon" でつけたやつ) を define で名前付け
         if value.name == "anon":
             value.name = name_node.name
+    # gate 承認済み install は rollback 点として自動 snapshot (restore-S の承認済み fast-path 用)
+    if gate_result is not None and gate_result[0] == "approve":
+        _gate_autocommit(env, name_node.name, gate_result[1])
     return value
 
 
@@ -984,7 +1367,13 @@ def _sf_set_bang(env: Env, args: list) -> Any:
     if name_node.name not in env.bindings:
         raise ValueError(f"set!: undefined symbol: {name_node.name}")
     value = _unwrap_value(evaluate(args[1], env))
+    # define-gate: set! は define と同じ書き込み経路なので同じ審査を通す
+    gate_result = gate_check_bind(env, name_node.name, value)
+    if gate_result is not None and gate_result[0] == "deny":
+        return gate_result[1]
     env.bindings[name_node.name] = value
+    if gate_result is not None and gate_result[0] == "approve":
+        _gate_autocommit(env, name_node.name, gate_result[1])
     return value
 
 
@@ -1041,6 +1430,11 @@ def _sf_defmacro(env: Env, args: list) -> Any:
     params_node = args[1]
     if not isinstance(name_node, Symbol):
         raise ValueError("defmacro: name must be a symbol")
+    # evaluate() はマクロを special form より先に引く — define という名のマクロは gate を丸ごと迂回する。
+    # special form / meta form との衝突は origin を問わず deny、 保護 binding の shadow は agent 由来のみ deny。
+    macro_reject = gate_check_macro(env, name_node.name)
+    if macro_reject is not None:
+        return macro_reject
     if not isinstance(params_node, list):
         raise ValueError("defmacro: params must be a list")
     params: list[str] = []
@@ -1178,8 +1572,8 @@ def _prim_prompt_call(text: str) -> str:
             {"role": "system", "content": _PROMPT_SYSTEM},
             {"role": "user", "content": text},
         ],
-        max_tokens=2048,
-        extra_body={"think": False},
+        max_tokens=host.MAX_TOKENS,
+        extra_body={"think": host.THINK},
     )
     return resp.choices[0].message.content or ""
 
@@ -1651,6 +2045,17 @@ def _prim_rk_factory(env: Env) -> dict[str, Callable[..., Any]]:
             return f"(restore-S: payload parse error: {e})"
         if p.get("name") != name:
             return f"(restore-S: #{row_id} is for {p.get('name')!r}, not {name!r})"
+        # define-gate: agent 由来の restore は「gate 承認時に自動 commit された snapshot」 のみ即時許可
+        # (= rollback は緊急時に速くあるべき)。 それ以外の snapshot は define での提案に回させる —
+        # agent が自分で commit-S した毒入り body を restore-S で install する迂回を塞ぐ。
+        if _gate_active(env) and (
+            name in env.gate.protected_loop or name in env.gate.protected_py
+        ):
+            if not str(p.get("rationale", "")).startswith("gate-approved"):
+                return (
+                    f"(gate: restore-S {name} — 承認済み (gate-approved) snapshot 以外の復元は deny。"
+                    f" 変更は define で提案すること)"
+                )
         kind = p.get("kind", "llm")
         body_text = p.get("body", "")
         if kind == "lisp":
@@ -1797,19 +2202,73 @@ def _prim_load_factory(env: Env) -> Callable[..., Any]:
 
 
 def _prim_lookup_factory(env: Env) -> Callable[..., Any]:
-    """(lookup name) — env.bindings[name] の値をそのまま返す (Lambda はオブジェクトとして)。
+    """(lookup name) — global 束縛の **現在値** を返す (Lambda はオブジェクトとして)。
 
     `(lambdas)` が info 文字列を返すのに対し、これは λ 本体を取り出せる。
     mutate / wrap で既存 λ を decorator で包む用途。
+
+    late binding 保証: lambda 呼び出し中は env.bindings が {saved, captured, params} の
+    merge に swap され captured (定義時 snapshot) が勝つが、 lookup はここで捕まえた
+    global dict (swap されない実体) を先に読む。 これにより lambda body の中の
+    (lookup "agent-step") は、 走行中の (define agent-step ...) を正しく拾う。
     """
+    global_bindings = env.bindings  # install 時点の global 束縛 dict。 top-level define はここに書かれる
     def _lookup(name: Any) -> Any:
         if isinstance(name, Symbol):
             name = name.name
         name = str(name)
-        if name not in env.bindings:
-            raise ValueError(f"lookup: not bound: {name}")
-        return env.bindings[name]
+        if name in global_bindings:
+            return global_bindings[name]
+        # global に無ければ現在の (swap 済みかもしれない) bindings — 局所束縛も引けるように
+        if name in env.bindings:
+            return env.bindings[name]
+        raise ValueError(f"lookup: not bound: {name}")
     return _lookup
+
+
+_CTX_OVERFLOW_RE = _re.compile(
+    r"context.{0,40}(length|window|limit)|maximum context|too many tokens"
+    r"|prompt is too long|input.{0,20}too long|exceeds.{0,30}token",
+    _re.IGNORECASE,
+)
+
+
+def _looks_like_context_overflow(e: Exception) -> bool:
+    return bool(_CTX_OVERFLOW_RE.search(str(e)))
+
+
+def _emergency_compact(env: Env) -> bool:
+    """context overflow の緊急退避: 古い半分の turns を archive に落とし、 退避した旨の
+    system turn を先頭に置く。 LLM 要約は使わない (overflow 中は呼べないため)。
+    丁寧な圧縮 (要約つき) は auto.lispy の condense-context が閾値で先回りする — これは最後の網。"""
+    n = len(env.turns)
+    if n < 4:
+        return False
+    cut = n // 2
+    archive_id = uuid.uuid4().hex[:8]
+    archived = env.turns[:cut]
+    kept = env.turns[cut:]
+    # tool turn が先頭に残ると対応する assistant tool_calls を失って API が弾く — 一緒に退避
+    while kept and kept[0].role == "tool":
+        archived.append(kept.pop(0))
+    if not kept:
+        return False
+    env.archive[archive_id] = archived
+    env.turns = [Turn(
+        role="system",
+        content=(f"[context overflow — 古い {len(archived)} turns を archive {archive_id} に退避した。"
+                 f" 失われた文脈が必要なら recall で辿れる]"),
+    )] + kept
+    return True
+
+
+def _capture_usage(env_arg: Env, resp: Any) -> None:
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        try:
+            env_arg.last_prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            pass
 
 
 def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
@@ -1817,10 +2276,10 @@ def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
 
     option は plist 形式で渡す (defmacro / fork-env と同じ慣習):
       'temperature 1.5     — sampling 温度
-      'max-tokens 4096     — token 上限 (default 2048)
+      'max-tokens 4096     — token 上限 (default .env の LLM_MAX_TOKENS、 未設定なら 4096)
       'logprobs #t         — 各 token の logprob を Turn.logprobs に詰める
       'top-logprobs 5      — 各 token に対して上位 N 候補も取る (要 'logprobs #t)
-      'think #t            — DeepSeek の thinking モード (default off)
+      'think #t            — thinking モード (default .env の LLM_THINK)
       'extra (list k v...) — 任意の追加 field を OpenAI SDK の extra_body に流す。
                              kebab-case の key は snake_case に変換される。
                              ds4 拡張 (dir-steering-ffn 等) はここから通す。
@@ -1830,6 +2289,7 @@ def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
     """
     if not isinstance(env_arg, Env):
         raise ValueError(f"llm-call: expected env, got {type(env_arg).__name__}")
+    _check_interrupt(env_arg)
     if len(opts) % 2 != 0:
         raise ValueError("llm-call: options must be paired (key value ...)")
     opts_dict: dict[str, Any] = {}
@@ -1844,8 +2304,8 @@ def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
         kwargs["logprobs"] = True
         if "top-logprobs" in opts_dict:
             kwargs["top_logprobs"] = int(opts_dict["top-logprobs"])
-    max_tok = int(opts_dict.get("max-tokens", 2048))
-    extra = {"think": bool(_truthy(opts_dict.get("think", False)))}
+    max_tok = int(opts_dict.get("max-tokens", host.MAX_TOKENS))
+    extra = {"think": bool(_truthy(opts_dict.get("think", host.THINK)))}
     if "extra" in opts_dict:
         # 'extra (list 'dir-steering-ffn -1.0 'dir-steering-attn 0.5) のような plist。
         # ds4 拡張など、 lispy.py を再び触らずに provider 固有 field を流すための窓口。
@@ -1859,14 +2319,26 @@ def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
             extra[ek.replace("-", "_")] = extra_arg[i + 1]
 
     client = host.get_client()
-    resp = client.chat.completions.create(
-        model=host.MODEL,
-        messages=env_arg.to_messages(),
-        tools=env_arg.tool_schema or None,
-        max_tokens=max_tok,
-        extra_body=extra,
-        **kwargs,
-    )
+
+    def _create() -> Any:
+        return client.chat.completions.create(
+            model=host.MODEL,
+            messages=env_arg.to_messages(),
+            tools=env_arg.tool_schema or None,
+            max_tokens=max_tok,
+            extra_body=extra,
+            **kwargs,
+        )
+
+    try:
+        resp = _create()
+    except Exception as e:
+        # context overflow の緊急回復: 古い turns を退避して 1 回だけ retry
+        if _looks_like_context_overflow(e) and _emergency_compact(env_arg):
+            resp = _create()
+        else:
+            raise
+    _capture_usage(env_arg, resp)
     msg = resp.choices[0].message
     content = msg.content or ""
     tool_calls_raw = getattr(msg, "tool_calls", None) or []
@@ -1894,38 +2366,140 @@ def _prim_llm_call(env_arg: Any, *opts: Any) -> Turn:
     )
 
 
+def _prim_judge_call(env_arg: Any, *opts: Any) -> Turn:
+    """(judge-call env [k v ...]) — 審査者 LLM に env.to_messages() を投げ、 assistant Turn を返す。
+
+    llm-call と同形だが 3 点違う:
+      - client / model は .env の JUDGE_* (未設定なら executor の LLM_* に fallback —
+        その場合「別モデルの独立審査」 ではなく 「同じ重みの別文脈審査」 に弱まる)
+      - tools を渡さない — 審査者は tool を呼ばない (判定のみ)
+      - max-tokens default は JUDGE_MAX_TOKENS
+
+    auto.lispy の judge-done と define-gate がこれを使う。 どの判定をどちらのモデルに
+    投げるかを S 式側で選べるようにするための primitive (層 1 保護対象)。
+    """
+    if not isinstance(env_arg, Env):
+        raise ValueError(f"judge-call: expected env, got {type(env_arg).__name__}")
+    _check_interrupt(env_arg)
+    if len(opts) % 2 != 0:
+        raise ValueError("judge-call: options must be paired (key value ...)")
+    opts_dict: dict[str, Any] = {}
+    for i in range(0, len(opts), 2):
+        k = opts[i].name if isinstance(opts[i], Symbol) else str(opts[i])
+        opts_dict[k] = opts[i + 1]
+    kwargs: dict[str, Any] = {}
+    if "temperature" in opts_dict:
+        kwargs["temperature"] = float(opts_dict["temperature"])
+    max_tok = int(opts_dict.get("max-tokens", host.JUDGE_MAX_TOKENS))
+
+    client = host.get_judge_client()
+    resp = client.chat.completions.create(
+        model=host.judge_model(),
+        messages=env_arg.to_messages(),
+        max_tokens=max_tok,
+        **kwargs,
+    )
+    msg = resp.choices[0].message
+    return Turn(role="assistant", content=msg.content or "")
+
+
+def _prim_agent_eval_factory(env: Env) -> Callable[..., Any]:
+    """(agent-eval text) — text が S 式なら **agent 由来として** 評価し、 結果テキストを返す。
+    S 式でなければ #f。
+
+    LLM 応答の auto-eval 経路 (init.lispy の agent-step が呼ぶ)。 eval_origin を "agent" に
+    立てて評価するので、 保護 binding への define / set! は define-gate の審査を通る。
+    人間の REPL 入力 (origin "user") とはここで区別される。
+    """
+    def _agent_eval(text: Any) -> Any:
+        tree = _try_read_sexp(str(text))
+        if tree is None:
+            return False
+        prev = env.eval_origin
+        env.eval_origin = "agent"
+        try:
+            v = eval_sexp(tree, env)
+        finally:
+            env.eval_origin = prev
+        return v.text
+    return _agent_eval
+
+
 def _prim_append_turn(env_arg: Any, turn: Any) -> Any:
     """(append-turn env turn) — env.turns に turn を append、env を返す。
 
     内部は mutation だが、user's draft の functional style と整合させるため env を return。
     `(let ((env2 (append-turn env t1))) ...)` のように env2 = env として使える。
+
+    生層の完全化: tool の実行結果・tool_calls 付き assistant turn・<eval-result> は
+    ここで host DB にも記録する (REPL の _record は user 入力と最終応答しか書かないため、
+    従来は brainwash の VERIFY が照合すべき一次資料 = tool 結果が生層から欠けていた)。
     """
     if not isinstance(env_arg, Env):
         raise ValueError(f"append-turn: expected env, got {type(env_arg).__name__}")
     if isinstance(turn, Turn):
         env_arg.turns.append(turn)
+        if env_arg.record_sid and env_arg.db_conn is not None:
+            try:
+                if turn.role == "tool":
+                    host.append_turn(env_arg.db_conn, env_arg.record_sid, "tool",
+                                     turn.content or "", cwd=os.getcwd())
+                elif turn.role == "assistant" and turn.tool_calls:
+                    names = ", ".join(
+                        tc.get("function", {}).get("name", "?") for tc in turn.tool_calls
+                    )
+                    summary = ((turn.content + " ") if turn.content else "") + f"(tool_calls: {names})"
+                    host.append_turn(env_arg.db_conn, env_arg.record_sid, "assistant",
+                                     summary, cwd=os.getcwd())
+                elif turn.role == "user" and (turn.content or "").startswith("<eval-result>"):
+                    host.append_turn(env_arg.db_conn, env_arg.record_sid, "user",
+                                     turn.content, cwd=os.getcwd())
+            except Exception:
+                pass  # 記録失敗で loop は止めない
     return env_arg
 
 
 def _prim_dispatch_tool_factory(env: Env) -> Callable[..., Any]:
-    """(dispatch-tool name args-json-string) — env.tools[name] を引数 dict で呼ぶ。"""
+    """(dispatch-tool name args-json-string) — env.tools[name] を引数 dict で呼ぶ。
+    pre-tool / post-tool hook と中断チェックはこの経路に入っている。"""
     def _dispatch(name: Any, args_json: Any = "{}") -> str:
-        name = str(name)
-        if isinstance(args_json, dict):
-            args = args_json
-        else:
-            try:
-                args = json.loads(str(args_json) or "{}")
-            except json.JSONDecodeError:
-                args = {}
-        handler = env.tools.get(name)
-        if handler is None:
-            return f"(unknown tool: {name})"
-        try:
-            return handler(args, env)
-        except Exception as e:
-            return f"(error: {e})"
+        _check_interrupt(env)
+        return _execute_tool(env, name, args_json)
     return _dispatch
+
+
+def _prim_dispatch_tools_factory(env: Env) -> Callable[..., Any]:
+    """(dispatch-tools tcs) — tool_call dict の list を実行し、 tool Turn の list を返す。
+
+    batch が全部 read-only (READONLY_TOOLS) なら ThreadPool で並列、 副作用系が 1 つでも
+    混ざれば発行順の直列 (順序に意味があるため)。 返る Turn の順序は常に入力順。
+    agent-step はこれを fold (append-turn) するだけ — 並列化の判断は Python 側の床。
+    """
+    def _dispatch_all(tcs: Any) -> list:
+        if not isinstance(tcs, list):
+            raise ValueError(f"dispatch-tools: list of tool_calls expected, got {type(tcs).__name__}")
+        _check_interrupt(env)
+        items: list[tuple[str, str, str]] = []
+        for tc in tcs:
+            if isinstance(tc, dict):
+                items.append((
+                    tc.get("id", ""),
+                    tc.get("function", {}).get("name", ""),
+                    tc.get("function", {}).get("arguments", "{}"),
+                ))
+        if all(n in READONLY_TOOLS for _tid, n, _a in items) and len(items) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
+                results = list(ex.map(lambda it: _execute_tool(env, it[1], it[2]), items))
+        else:
+            results = []
+            for it in items:
+                _check_interrupt(env)
+                results.append(_execute_tool(env, it[1], it[2]))
+        return [
+            Turn(role="tool", content=r, tool_call_id=tid)
+            for (tid, _n, _a), r in zip(items, results)
+        ]
+    return _dispatch_all
 
 
 def _prim_env_messages_factory(env: Env) -> Callable[..., Any]:
@@ -2171,13 +2745,36 @@ def _meta_factory(env: Env) -> dict[str, Callable[..., Any]]:
             out.append(f"[{qid}] {preview}")
         return "\n".join(out)
 
+    def transcript(n: Any = 20) -> str:
+        """(transcript [n]) — 直近 n turn の全文を "role: content" 形式で返す。
+
+        turns_info (= (turns)) が 80 字 preview なのに対し、 こちらは全文。
+        auto-renew の要約素材や、 judge に作業ログを渡す用途。
+        """
+        out = []
+        for t in env.turns[-int(n):]:
+            c = t.content or ""
+            if t.tool_calls:
+                names = ", ".join(
+                    tc.get("function", {}).get("name", "?") for tc in t.tool_calls
+                )
+                c = (c + " " if c else "") + f"(tool_calls: {names})"
+            out.append(f"{t.role}: {c}")
+        return "\n".join(out) or "(empty)"
+
     return {
         "env": env_info,
         "turn": turn_content,
         "turns": turns_info,
+        "turn-count": lambda: len(env.turns),
+        "transcript": transcript,
         "archive": archive_info,
         "lambdas": lambdas_info,
         "quoted": quoted_info,
+        # context 観測 — agent-step の auto-compaction 判定と REPL での確認用
+        "context-tokens": lambda: env.last_prompt_tokens,
+        "context-limit": lambda: host.CTX_WINDOW,
+        "context-over?": lambda: env.last_prompt_tokens > int(host.CTX_WINDOW * 0.8),
     }
 
 
@@ -2501,8 +3098,34 @@ def _prim_fork_env(env_arg: Any, *opts: Any) -> "Env":
         lambda_call_depth=0,
         input_mode=env_arg.input_mode,
         macros=dict(env_arg.macros),
+        eval_origin=env_arg.eval_origin,
+        gate=env_arg.gate,
+        interrupt=env_arg.interrupt,
+        last_prompt_tokens=env_arg.last_prompt_tokens,
     )
     return new_env
+
+
+def _make_child_env(env: Env, system: str = "", name_suffix: str = "spawn") -> Env:
+    """subagent 用の child env を組む。
+
+    親から tools / tool_schema / db_conn / record_sid を継承し、 bindings は
+    PRIMITIVES + _install_meta_primitives でフル装備にする (init.lispy の agent-step 込み)。
+    turns は空 — subagent は親の会話履歴を見ない。 task は自己完結で書く前提。
+    """
+    child = Env(
+        system=system or env.system,
+        tools=env.tools,
+        tool_schema=env.tool_schema,
+        bindings=dict(PRIMITIVES),
+        name=f"{env.name}/{name_suffix}",
+        depth=env.depth + 1,
+        db_conn=env.db_conn,
+        record_sid=env.record_sid,
+    )
+    child.interrupt = env.interrupt  # 中断は親子共有 — 止めるときは subagent ごと止まる
+    _install_meta_primitives(child)
+    return child
 
 
 def _form_spawn(env: Env, task: str) -> Value:
@@ -2512,13 +3135,7 @@ def _form_spawn(env: Env, task: str) -> Value:
     """
     if env.depth >= 3:
         return Value(text=f":spawn → depth limit ({env.depth}) reached")
-    child = Env(
-        system=env.system,
-        tools=env.tools,
-        tool_schema=env.tool_schema,
-        name=f"{env.name}/spawn",
-        depth=env.depth + 1,
-    )
+    child = _make_child_env(env, name_suffix="spawn")
     sub_value = eval_(child, task)
     return Value(
         text=f":spawn[{child.name}] → {sub_value.text}",
@@ -2555,6 +3172,58 @@ LISPY_PRIMITIVES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# spawn_agent — subagent を tool_call として呼ぶ (Claude Code の Task tool 相当)
+# ---------------------------------------------------------------------------
+
+SPAWN_AGENT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "spawn_agent",
+        "description": (
+            "独立した subtask を subagent (隔離された child env) に任せて、 最終結果だけ受け取る。 "
+            "呼ぶのは: (a) 大量のファイル探索・調査で中間結果が本筋の文脈を汚すとき、 "
+            "(b) 自分の成果物を独立した目で検証させたいとき (system で検証者 persona を指定)、 "
+            "(c) 本筋と無関係な脇道の調査。 "
+            "1-2 回の tool 呼び出しで済む作業には使わない (直接やる方が速い)。 "
+            "subagent は親の会話履歴を一切見ないので、 task には必要な文脈・対象パス・"
+            "期待する出力形式を全部書くこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "subagent への指示。 自己完結で書く (subagent は親の履歴を見ない)。",
+                },
+                "system": {
+                    "type": "string",
+                    "description": "subagent の system prompt を差し替える (任意)。 検証者・批評者などの persona 指定に使う。 省略時は親と同じ。",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+
+def _spawn_agent_tool(args: dict, env: Env) -> str:
+    """spawn_agent の tool handler。 child env で agent loop を回し、 最終テキストを返す。"""
+    task = str(args.get("task", "")).strip()
+    if not task:
+        return "(spawn_agent: task が空。 自己完結の指示を書くこと)"
+    if env.depth >= 3:
+        return f"(spawn_agent: depth 制限 ({env.depth}) に達している。 subagent を使わず直接作業すること)"
+    system = str(args.get("system", "") or "").strip()
+    child = _make_child_env(env, system=system, name_suffix=f"agent{env.depth + 1}")
+    try:
+        result = eval_(child, task)
+    except Exception as e:
+        return f"(spawn_agent error: {type(e).__name__}: {e})"
+    text = (result.text or "").strip() or "(subagent returned empty)"
+    return f"[subagent {child.name} done]\n{text}"
+
+
 def _wrap_edit_tool(name: str, dispatch: dict) -> Callable[[dict, Env], str]:
     """edit.EDIT_TOOL_DISPATCH 用 wrapper。 host と違い _TOOL_CTX を触らない (副作用は edit.py 内で自己完結)。"""
     fn = dispatch[name]
@@ -2584,6 +3253,18 @@ def _build_tool_layer() -> tuple[dict[str, Callable[[dict, Env], str]], list[dic
                 continue
             tools[name] = _wrap_edit_tool(name, _edit.EDIT_TOOL_DISPATCH)
             schema.append(s)
+    except ImportError:
+        pass
+    # subagent (Claude Code の Task tool 相当)。 handler は env を受け取り depth を継承する。
+    tools["spawn_agent"] = _spawn_agent_tool
+    schema.append(SPAWN_AGENT_SCHEMA)
+    # MCP server の tool 群 (.lispy-mcp.json)。 optional import — mcp.py を消しても core は動く。
+    # server プロセスは mcp module 側で cache されるので、 env (spawn child 含む) を跨いで共有。
+    try:
+        import mcp as _mcp
+        mcp_tools, mcp_schema = _mcp.tool_layer()
+        tools.update(mcp_tools)
+        schema.extend(mcp_schema)
     except ImportError:
         pass
     return tools, schema
@@ -2621,6 +3302,31 @@ def _install_meta_primitives(env: Env) -> None:
     env.bindings["llm-call"]      = _prim_llm_call
     env.bindings["append-turn"]   = _prim_append_turn
     env.bindings["dispatch-tool"] = _prim_dispatch_tool_factory(env)
+    env.bindings["dispatch-tools"] = _prim_dispatch_tools_factory(env)
+    env.bindings["stop-hook"]     = _prim_stop_hook_factory(env)
+    # 審査者 LLM (JUDGE_*、 未設定なら executor に fallback)。 judge-done と define-gate が使う。
+    env.bindings["judge-call"]    = _prim_judge_call
+    # LLM 応答の auto-eval 経路 (origin="agent" で評価 → define-gate が効く)
+    env.bindings["agent-eval"]    = _prim_agent_eval_factory(env)
+    # 洗脳 — 生層 (host.db turns) から蒸留層 (data/memory/) を作り直す consolidation。
+    # 洗うのは judge LLM。 optional import: ファイルを消しても core は動く。
+    try:
+        import brainwash as _bw
+        def _run_brainwash(*args: Any, _env: Env = env) -> str:
+            if _env.db_conn is None:
+                return "(brainwash: no db — record=True で session を開く必要あり)"
+            sessions = [a.name if isinstance(a, Symbol) else str(a) for a in args]
+            return _bw.brainwash(_env.db_conn, sessions=sessions or None)
+        env.bindings["brainwash"] = _run_brainwash
+        env.bindings["洗脳"]      = _run_brainwash
+    except ImportError:
+        pass
+    # MCP の接続状態確認 (optional import)
+    try:
+        import mcp as _mcp_info
+        env.bindings["mcp-list"] = _mcp_info.info
+    except ImportError:
+        pass
     # 旧 API (互換のため残す): env-messages / env-add-turn! は (env-messages env) / (env-add-turn! env t) でも使える
     env.bindings["env-messages"]  = lambda e=env: e.to_messages() if isinstance(e, Env) else env.to_messages()
     env.bindings["env-add-turn!"] = lambda e, t=None: _prim_append_turn(e, t) if t is not None else _prim_append_turn(env, e)
@@ -2644,16 +3350,32 @@ def _install_meta_primitives(env: Env) -> None:
     except ImportError:
         pass
 
+    # 層 1 の保護対象 = seed load 前に Python 側が install した binding 名。
+    # (primitive / host bridge / edit tool / meta / judge-call / agent-eval / env そのもの)
+    py_installed = set(env.bindings.keys())
+
     # --- Lisp seed を init.lispy から load ---
     # compose と agent-step は「言語の核」 なので Python に文字列で埋めず、 init.lispy に置く。
     # 「核は S 式」 という宣言と実装を一致させる狙い。 走行中の (define agent-step ...) で上書き可能。
-    init_path = _HERE / "init.lispy"
-    if init_path.exists():
-        try:
-            for form in read_all_sexp(init_path.read_text(encoding="utf-8")):
-                evaluate(form, env)
-        except Exception as e:
-            print(f"  (warning: init.lispy load failed: {e})", file=sys.stderr)
+    # auto.lispy は自走レイヤ (auto-step / judge-done / auto-renew)。 init 同様 auto-load するが、
+    # ファイルを消せば従来どおり seed のみで動く。
+    # この時点では env.gate = None なので、 seed 自身の define は gate を通らない (bootstrap)。
+    for fname in ("init.lispy", "auto.lispy"):
+        fpath = _HERE / fname
+        if fpath.exists():
+            try:
+                for form in read_all_sexp(fpath.read_text(encoding="utf-8")):
+                    evaluate(form, env)
+            except Exception as e:
+                print(f"  (warning: {fname} load failed: {e})", file=sys.stderr)
+
+    # --- define-gate を有効化 ---
+    # agent 由来 (agent-eval 経由) の評価にだけ効く。 LISPY_GATE=off で無効化 (開発・実験用)。
+    env.gate = Gate(
+        protected_py=py_installed,
+        protected_loop=set(PROTECTED_LOOP_BINDINGS),
+        enabled=os.environ.get("LISPY_GATE", "on").strip().lower() not in ("off", "0", "false", "no"),
+    )
 
 
 def _open_recording(env: Env, sid: str = "") -> None:
@@ -2673,18 +3395,138 @@ def _open_recording(env: Env, sid: str = "") -> None:
         env.record_sid = ""
 
 
-def build_default_env(record: bool = True, sid: str = "") -> Env:
+def _skill_inventory() -> str:
+    """skill の一覧を system prompt 用に作る (progressive disclosure)。
+
+    探索先: (a) cwd から上方の .lispy/skills/ (プロジェクト skill)、 (b) lispy 本体の skills/。
+    各 skill は <dir>/SKILL.md — 先頭付近の `name:` / `description:` 行を拾う。
+    常駐するのは一覧 (1 skill 1 行) だけで、 本文はタスクに合致したとき agent が
+    read_file で読む — 蒸留層の index-first と同じ規律。"""
+    dirs: list[Path] = []
+    d = Path(os.getcwd())
+    for parent in [d, *d.parents]:
+        cand = parent / ".lispy" / "skills"
+        if cand.is_dir():
+            dirs.append(cand)
+            break
+    builtin = _HERE / "skills"
+    if builtin.is_dir() and builtin not in dirs:
+        dirs.append(builtin)
+    entries: list[str] = []
+    for base in dirs:
+        for md in sorted(base.glob("*/SKILL.md")):
+            name, desc = md.parent.name, ""
+            try:
+                head = md.read_text(encoding="utf-8")[:2000]
+            except Exception:
+                continue
+            for ln in head.splitlines():
+                low = ln.strip().lower()
+                if low.startswith("name:"):
+                    name = ln.split(":", 1)[1].strip() or name
+                elif low.startswith("description:"):
+                    desc = ln.split(":", 1)[1].strip()
+                    break
+            entries.append(f"- {name}: {desc or '(no description)'} → {md}")
+    if not entries:
+        return ""
+    return (
+        "\n\n## skills\n"
+        "タスクが以下のどれかに合致するなら、着手前にその SKILL.md を read_file で全文読み、手順に従う"
+        " (合致しなければ読まない):\n" + "\n".join(entries) + "\n"
+    )
+
+
+def _project_instructions() -> str:
+    """cwd から上方に AGENTS.md / CLAUDE.md を探し、 最初に見つかったものを返す
+    (Claude Code の CLAUDE.md / opencode の AGENTS.md 相当。 リポジトリの規約・
+    ビルド方法を system prompt に注入する)。 無ければ空。"""
+    d = Path(os.getcwd())
+    for parent in [d, *d.parents]:
+        for fname in ("AGENTS.md", "CLAUDE.md"):
+            f = parent / fname
+            if f.exists():
+                try:
+                    text = f.read_text(encoding="utf-8")[:20000]
+                except Exception:
+                    return ""
+                return f"\n\n## project instructions ({f})\n{text}\n"
+    return ""
+
+
+def _last_session_id(db: Any) -> str:
+    row = db.execute("SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1").fetchone()
+    return row[0] if row else ""
+
+
+def _resume_context(env: Env, max_turns: int = 80, max_chars: int = 24000) -> None:
+    """--resume: 同 session の過去会話を DB から text で復元して system turn として注入し、
+    その session で commit-S された λ を最新 snapshot から restore する。
+
+    role 構造の完全復元はしない (DB は tool_call_id を持たないので、 turn をそのまま
+    messages に戻すと API に弾かれる)。 transcript 形式の 1 turn に畳むのが安全。"""
+    if env.db_conn is None or not env.record_sid:
+        return
+    rows = env.db_conn.execute(
+        "SELECT role, content FROM turns WHERE session_id = ? ORDER BY ts DESC LIMIT ?",
+        (env.record_sid, max_turns),
+    ).fetchall()
+    if rows:
+        lines: list[str] = []
+        used = 0
+        for role, content in rows:  # 新しい順に取って、 予算内で古い方向へ
+            c = (content or "").strip()
+            if len(c) > 1200:
+                c = c[:1200] + " …"
+            if used + len(c) > max_chars:
+                break
+            lines.append(f"{role}: {c}")
+            used += len(c)
+        lines.reverse()
+        env.turns.append(Turn(
+            role="system",
+            content="[resume] 同 session の前回までの会話 (DB から復元):\n" + "\n".join(lines),
+        ))
+    # λ の復元 — この session で commit-S された名前を集めて restore-S (最新 snapshot)
+    restore = env.bindings.get("restore-S")
+    if callable(restore):
+        try:
+            srows = env.db_conn.execute(
+                "SELECT payload FROM meta_events WHERE kind = 'S' AND session_id = ? ORDER BY ts ASC",
+                (env.record_sid,),
+            ).fetchall()
+            names: list[str] = []
+            for (payload,) in srows:
+                try:
+                    nm = json.loads(payload).get("name")
+                    if nm and nm not in names:
+                        names.append(nm)
+                except Exception:
+                    pass
+            for nm in names:
+                try:
+                    restore(Symbol(nm))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def build_default_env(record: bool = True, sid: str = "", resume: bool = False) -> Env:
     tools, schema = _build_tool_layer()
     env = Env(
-        system=SYSTEM_PROMPT,
+        system=SYSTEM_PROMPT + _project_instructions() + _skill_inventory(),
         tools=tools,
         tool_schema=schema,
         bindings=dict(PRIMITIVES),
         name="main",
     )
+    env.interrupt = threading.Event()
     _install_meta_primitives(env)
     if record:
         _open_recording(env, sid=sid)
+    if resume:
+        _resume_context(env)
     return env
 
 
@@ -2739,7 +3581,7 @@ def _parens_balanced(s: str) -> bool:
     return depth == 0
 
 
-def repl() -> None:
+def repl(sid: str = "", resume: bool = False) -> None:
     print("lispy REPL  (Ctrl+D to exit)")
     try:
         import edit as _edit_banner
@@ -2772,11 +3614,22 @@ def repl() -> None:
     print("            (rk-log)  — meta_events に記録、 session_id 単位で検索可能")
     print("Higher:     (set-mode <lambda>)  (clear-mode)  — 平文入力を λ 経由に")
     print("            (eval-turn-pure id)  — env を汚さず再評価 (probe 用素材)")
+    print("Auto:       (auto-step env \"goal\" [rounds])  — 作業→検証→継続の自走ループ (auto.lispy)")
+    print("            (turn-count) (transcript n)  — 文脈量の観測 / 作業ログ全文")
+    print("Gate:       agent 由来の loop 書き換えは define-gate が審査 (judge は .env の JUDGE_*、")
+    print("            未設定なら executor に fallback。 LISPY_GATE=off で無効。 人間の REPL 入力は自由)")
+    print("Memory:     (洗脳) / (brainwash)  — 生層 (turns) を裏どりして蒸留層 data/memory/ を書き直す")
+    print("            読みは index-first: agent は data/memory/index.md を read_file (検索しない)")
+    print("Harness:    Ctrl-C = step 境界で中断 (2 回で強制) / (undo n) = file 編集の巻き戻し")
+    print("            (context-tokens) (context-over?) — 8 割超えで auto-compaction")
+    print("            .lispy-hooks.json (pre-tool/post-tool/stop) / .lispy-check (編集後チェック)")
+    print("            --resume で前回 session の会話 + commit-S 済み λ を復元")
     print("REPL meta:  !env !archive !quoted !lambdas !turns !reset")
     print("plain text → model. S-expr input → direct evaluation.")
-    env = build_default_env()
+    env = build_default_env(sid=sid, resume=resume)
     if env.record_sid:
-        print(f"(recording to session {env.record_sid[:12]})")
+        note = " (resumed)" if resume and sid else ""
+        print(f"(recording to session {env.record_sid[:12]}{note})")
 
     try:
         while True:
@@ -2827,12 +3680,28 @@ def repl() -> None:
                     print(f"  mode error: {e}", file=sys.stderr)
                     continue
             else:
-                # 通常の式評価
+                # 通常の式評価。 評価中の Ctrl-C は「即死」 ではなく interrupt flag を立て、
+                # llm-call / dispatch-tool が step 境界で拾って安全に止まる (2 回目で強制中断)。
+                def _on_sigint(signum: Any, frame: Any) -> None:
+                    if env.interrupt is not None and not env.interrupt.is_set():
+                        env.interrupt.set()
+                        print("\n  (interrupt — 現在の step 境界で停止します。 もう一度 Ctrl-C で強制中断)",
+                              file=sys.stderr)
+                    else:
+                        raise KeyboardInterrupt
+                prev_handler = signal.signal(signal.SIGINT, _on_sigint)
                 try:
                     value = eval_(env, line)
+                except KeyboardInterrupt:
+                    print("  (force interrupted)", file=sys.stderr)
+                    continue
                 except Exception as e:
                     print(f"  eval error: {e}", file=sys.stderr)
                     continue
+                finally:
+                    signal.signal(signal.SIGINT, prev_handler)
+                    if env.interrupt is not None:
+                        env.interrupt.clear()
 
             print(value.text)
             if value.directive:
@@ -3043,6 +3912,11 @@ def main() -> None:
         help="副作用 tool (shell / write-file / edit-file) の y/N 確認を全 skip。 "
              "session 中は (set-yolo #t/#f) で切り替え可。",
     )
+    p.add_argument("--session", default="",
+                   help="既存 session id (prefix 一致) を引き継ぐ")
+    p.add_argument("--resume", action="store_true",
+                   help="session の会話を DB から復元 + commit-S 済み λ を restore。 "
+                        "--session 省略時は直近の session を対象にする")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("repl", help="interactive REPL (default)")
     sub.add_parser("demo", help="run a minimal demo (renew + eval-turn)")
@@ -3068,7 +3942,18 @@ def main() -> None:
     elif cmd == "demo-compare":
         demo_compare()
     else:
-        repl()
+        sid = ""
+        if args.session or args.resume:
+            try:
+                db = host.init_db(host.DB_PATH)
+                try:
+                    sid = (host.resolve_session(db, args.session)
+                           if args.session else _last_session_id(db))
+                finally:
+                    db.close()
+            except Exception as e:
+                print(f"  (session resolve failed: {e})", file=sys.stderr)
+        repl(sid=sid, resume=args.resume and bool(sid))
 
 
 if __name__ == "__main__":
