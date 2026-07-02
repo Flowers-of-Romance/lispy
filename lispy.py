@@ -1003,19 +1003,74 @@ def _gate_call_judge(env: Env, name: str, value: Any) -> tuple[bool, str]:
     return first.startswith("APPROVE"), out
 
 
+# エスカレーション分類 step (escalation-class、 extras.lispy 定義) — どのイベントを
+# 人間に見せるかの規則。 この binding の agent による変更だけは judge に委ねず、
+# 常に人間の同期ゲート (y/N or ブラウザ承認) を通す。 再帰の底は人間が握る —
+# この不変条件は step 側でなくここ (lispy 本体) でハードコードする (V2 設計)。
+GATE_HUMAN_SYNC = frozenset({"escalation-class"})
+
+
+def _gate_human_confirm(env: Env, name: str, value: Any) -> tuple[str, str]:
+    """人間の同期ゲート。 server では /view の承認ボタン、 単体 REPL では y/N。
+    edit/view 層が無い環境では fail-closed (deny)。"""
+    current = env.bindings.get(name)
+    cur_text = _gate_body_text(current) if current is not None else "(未定義)"
+    cand_text = _gate_body_text(value)
+    try:
+        import edit as _edit_mod
+    except ImportError:
+        return ("deny", f"(gate: {name} の変更には人間の承認が必要だが edit 層が無い — fail-closed)")
+    # _confirm_diff は remote mode のときだけ・サイズ上限つきで diff を計算する —
+    # 巨大 body で _LOCK を握ったまま difflib が固まる事故を edit.py 側と同じ規約で防ぐ
+    try:
+        diff = _edit_mod._confirm_diff(cur_text, cand_text)
+    except Exception:
+        diff = None
+    approved = _edit_mod._confirm(
+        f"  [gate] {name} (エスカレーション分類 step) を書き換えますか?\n"
+        f"    現行: {cur_text[:120]}\n    提案: {cand_text[:120]}\n  [y/N]: ",
+        kind="escalation", title=f"escalation step の再定義: {name}",
+        detail=f"現行:\n{cur_text[:1000]}\n\n提案:\n{cand_text[:1000]}", diff=diff)
+    if approved:
+        return ("approve", "human-approved: エスカレーション分類 step の変更")
+    return ("deny", f"(gate: {name} は人間の同期ゲートで却下された — 分類規則の変更は人間の承認が必須)")
+
+
+def _gate_log_bind(env: Env, name: str, approved: bool, why: str) -> None:
+    """bind gate の判定結果を ledger (kind=gate) に残す — /view のタイムライン表示用。
+    ledger 書き込みの成否は gate の判定に影響しない (ベストエフォート)。"""
+    if env.db_conn is None or not env.record_sid:
+        return
+    try:
+        host.log_meta(env.db_conn, "gate", sid=env.record_sid, payload=json.dumps({
+            "name": name,
+            "approved": approved,
+            "why": why.split("\n", 1)[-1].strip()[:200],
+        }, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def gate_check_bind(env: Env, name: str, value: Any) -> tuple[str, str] | None:
     """define / set! の共通入口。 None = gate 対象外 (通常 bind)。
     ("deny", 理由)  = bind しない。  ("approve", judge の理由) = bind + 自動 commit-S。"""
     if not _gate_active(env):
         return None
     gate = env.gate
+    if name in GATE_HUMAN_SYNC:
+        result = _gate_human_confirm(env, name, value)
+        _gate_log_bind(env, name, result[0] == "approve", result[1])
+        return result
     if name in gate.protected_py:
+        _gate_log_bind(env, name, False, "python primitive の shadow は禁止")
         return ("deny", f"(gate: {name} は Python primitive — shadow は禁止。 別名で define すること)")
     if name in gate.protected_loop:
         reason = _gate_structural_check(gate, value)
         if reason:
+            _gate_log_bind(env, name, False, f"structural check: {reason}")
             return ("deny", f"(gate: {name} rejected by structural check — {reason})")
         approved, why = _gate_call_judge(env, name, value)
+        _gate_log_bind(env, name, approved, why)
         if not approved:
             return ("deny", f"(gate: {name} rejected by judge —\n{why})")
         return ("approve", why)
@@ -1030,7 +1085,7 @@ def gate_check_macro(env: Env, name: str) -> str | None:
         return f"(defmacro: {name} は special form と衝突 — 評価器を迂回するため禁止)"
     if _gate_active(env):
         gate = env.gate
-        if name in gate.protected_py or name in gate.protected_loop:
+        if name in gate.protected_py or name in gate.protected_loop or name in GATE_HUMAN_SYNC:
             return f"(gate: macro {name} は保護 binding を shadow する — 禁止)"
     return None
 
@@ -1215,6 +1270,22 @@ def _is_skill_path(path_str: str) -> bool:
     return p.name == "SKILL.md" and "skills" in p.parts
 
 
+# View 層のファイル — agent の自己修正の対象外 (V2 設計の不変条件)。
+# 自己修正で書き換わってよいのは「どんなデータを送るか」の側だけで、
+# ブラウザで走るコードとレンダラーには及ばない。 judge 審査にも回さず一律 deny。
+_VIEW_LAYER_FILES = frozenset({"view.py"})
+
+
+def _is_view_layer_path(path_str: str) -> bool:
+    if not path_str:
+        return False
+    try:
+        p = Path(str(path_str)).expanduser().resolve()
+    except OSError:
+        return False
+    return p.name in _VIEW_LAYER_FILES and p.parent == Path(__file__).resolve().parent
+
+
 def _gate_judge_skill(env: Env, path: str, current: str, proposed: str) -> tuple[bool, str]:
     """judge LLM に現行と提案の SKILL.md を見せて APPROVE / REJECT。 fail-closed。"""
     user_content = (
@@ -1257,13 +1328,23 @@ def _gate_check_skill_write(env: Env, name: str, args: dict) -> str | None:
     if gate is None or not gate.enabled:
         return None
     if name in ("shell", "shell_bg"):
-        if "SKILL.md" in str(args.get("cmd", "")):
+        cmd = str(args.get("cmd", ""))
+        if "SKILL.md" in cmd:
             return ("(gate: SKILL.md を shell で触るのは禁止 — 読むなら read_file、"
                     " 更新は write_file / edit_file で提案すること (審査を通すため))")
+        # 単語境界つきで照合 — 素朴な部分文字列だと preview.py / review.py 等の
+        # 無関係なファイル名まで巻き込んで deny してしまう
+        if any(_re.search(rf"(?<![\w.-]){_re.escape(f)}(?![\w-])", cmd)
+               for f in _VIEW_LAYER_FILES):
+            return ("(gate: View 層のファイルを shell で触るのは禁止 — "
+                    "View 層は自己修正の対象外。 読むなら read_file)")
         return None
     if name not in ("write_file", "edit_file", "append_file"):
         return None
     path = str(args.get("path", ""))
+    if _is_view_layer_path(path):
+        return ("(gate: View 層のファイルは自己修正の対象外 — 書き換え不可。 "
+                "画面はデータで組む: (show-view ...) を使うこと)")
     if not _is_skill_path(path):
         return None
     p = Path(path).expanduser()
@@ -3442,6 +3523,66 @@ def _install_meta_primitives(env: Env) -> None:
     try:
         import mcp as _mcp_info
         env.bindings["mcp-list"] = _mcp_info.info
+    except ImportError:
+        pass
+    # View 層 (view.py) — agent がデータで画面を組む (レイアウト語彙、 フェーズ 3)。
+    # コードは送れない: S 式 → view.py の語彙で検証された JSON 木のみ。 語彙外はエラー。
+    # button の押下は POST /view/action で action 記号が返るだけ — 解釈はこちらの loop。
+    # optional import: view.py を消しても core は動く。
+    try:
+        import view as _viewmod
+
+        def _view_plainify(v: Any) -> Any:
+            """Symbol → {"sym": name} marker、 Value → text。 view.py に lispy の型を
+            持ち込まない。 marker にするのは、 ":" で始まるただの文字列と keyword
+            (attr キー) を view 側で区別できるようにするため。"""
+            if isinstance(v, Symbol):
+                return {"sym": v.name}
+            if isinstance(v, Value):
+                return v.text
+            if isinstance(v, list):
+                return [_view_plainify(x) for x in v]
+            return v
+
+        def _show_view(tree: Any, _env: Env = env) -> str:
+            """(show-view '(column (text "...") (form (input :name "x") (button :label "OK" :action ok))))"""
+            try:
+                root, n_nodes = _viewmod.sexp_to_view(_view_plainify(tree))
+            except _viewmod.ViewError as e:
+                return f"(show-view: {e})"
+            _viewmod.CURRENT_VIEW.set(root)
+            if _env.db_conn is not None and _env.record_sid:
+                try:
+                    host.log_meta(_env.db_conn, "view", sid=_env.record_sid, payload=json.dumps(
+                        {"nodes": n_nodes, "root_tag": root["tag"]}, ensure_ascii=False))
+                except Exception:
+                    pass
+            return f"(view shown: {n_nodes} nodes — ブラウザの /view に表示)"
+
+        def _clear_view() -> str:
+            _viewmod.CURRENT_VIEW.set(None)
+            return "(view cleared)"
+
+        def _view_next_action() -> str:
+            """queue の先頭 action を JSON 文字列で返す。 無ければ ""。"""
+            a = _viewmod.ACTIONS.pop()
+            return json.dumps(a, ensure_ascii=False) if a else ""
+
+        def _await_view_action(timeout: Any = 600, _env: Env = env) -> str:
+            """action が来るまで block (0.2s poll、 interrupt で中断可)。 timeout で ""。"""
+            deadline = time.time() + float(timeout)
+            while time.time() < deadline:
+                a = _viewmod.ACTIONS.pop()
+                if a:
+                    return json.dumps(a, ensure_ascii=False)
+                _check_interrupt(_env)
+                time.sleep(0.2)
+            return ""
+
+        env.bindings["show-view"]         = _show_view
+        env.bindings["clear-view"]        = _clear_view
+        env.bindings["view-next-action"]  = _view_next_action
+        env.bindings["await-view-action"] = _await_view_action
     except ImportError:
         pass
     # 旧 API (互換のため残す): env-messages / env-add-turn! は (env-messages env) / (env-add-turn! env t) でも使える
