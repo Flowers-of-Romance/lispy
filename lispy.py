@@ -1332,7 +1332,10 @@ def _gate_check_skill_write(env: Env, name: str, args: dict) -> str | None:
         if "SKILL.md" in cmd:
             return ("(gate: SKILL.md を shell で触るのは禁止 — 読むなら read_file、"
                     " 更新は write_file / edit_file で提案すること (審査を通すため))")
-        if any(f in cmd for f in _VIEW_LAYER_FILES):
+        # 単語境界つきで照合 — 素朴な部分文字列だと preview.py / review.py 等の
+        # 無関係なファイル名まで巻き込んで deny してしまう
+        if any(_re.search(rf"(?<![\w.-]){_re.escape(f)}(?![\w-])", cmd)
+               for f in _VIEW_LAYER_FILES):
             return ("(gate: View 層のファイルを shell で触るのは禁止 — "
                     "View 層は自己修正の対象外。 読むなら read_file)")
         return None
@@ -3530,9 +3533,11 @@ def _install_meta_primitives(env: Env) -> None:
         import view as _viewmod
 
         def _view_plainify(v: Any) -> Any:
-            """Symbol → name 文字列、 Value → text。 view.py に lispy の型を持ち込まない。"""
+            """Symbol → {"sym": name} marker、 Value → text。 view.py に lispy の型を
+            持ち込まない。 marker にするのは、 ":" で始まるただの文字列と keyword
+            (attr キー) を view 側で区別できるようにするため。"""
             if isinstance(v, Symbol):
-                return v.name
+                return {"sym": v.name}
             if isinstance(v, Value):
                 return v.text
             if isinstance(v, list):

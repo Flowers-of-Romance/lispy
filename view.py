@@ -19,6 +19,7 @@ import difflib
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 from typing import Any
@@ -63,6 +64,25 @@ class GateRegistry:
         self.version = 0          # 登録 / 解決で ++ (SSE の変化検知用)
         self.remote = False       # True = _confirm がここを使う。 server が起動時に立てる
         self.sid_provider: Any = None  # () -> record_sid。 server が env_box を差す
+        # 「答え手」の把握 — 誰も見ていない gate は登録せず即 fail-closed (旧 _confirm の
+        # 「non-tty なら即 skip」の保存)。 watchers = /view の SSE 接続数、
+        # terminal_answerer = server の stdin REPL が tty で動いているか。
+        self.watchers = 0
+        self.terminal_answerer = False
+        # 最後に terminal へ告知した gate id — 裸の y/n はこの gate にだけ効く
+        self.last_announced = 0
+
+    def watcher_add(self) -> None:
+        with self._cond:
+            self.watchers += 1
+
+    def watcher_remove(self) -> None:
+        with self._cond:
+            self.watchers = max(0, self.watchers - 1)
+
+    def can_answer(self) -> bool:
+        with self._cond:
+            return self.watchers > 0 or self.terminal_answerer
 
     def has_pending(self) -> bool:
         with self._cond:
@@ -88,15 +108,25 @@ class GateRegistry:
                 timeout = float(os.environ.get("LISPY_CONFIRM_TIMEOUT", "600"))
             except ValueError:
                 timeout = 600.0
+        sid = ""
+        if self.sid_provider is not None:
+            try:
+                sid = self.sid_provider() or ""
+            except Exception:
+                pass
+        # 答え手がいなければ登録せず即 fail-closed — 旧 _confirm (input() が non-tty で
+        # 即 False) の性質を保存する。 headless 運用で eval が timeout ぶん止まらない。
+        if not self.can_answer():
+            print(f"  [gate] no answerer (browser/terminal とも不在) — fail-closed deny: {title[:80]}",
+                  file=sys.stderr, flush=True)
+            _log_meta_rw("confirm", sid, json.dumps({
+                "gate_id": 0, "kind": kind, "title": title[:300],
+                "decision": "deny", "source": "no-answerer",
+            }, ensure_ascii=False))
+            return False, "no-answerer"
         with self._cond:
             self._seq += 1
             gid = self._seq
-            sid = ""
-            if self.sid_provider is not None:
-                try:
-                    sid = self.sid_provider() or ""
-                except Exception:
-                    pass
             entry = {
                 "id": gid, "kind": kind, "title": title[:300], "detail": detail[:2000],
                 "diff": diff or [], "ts": time.time(), "sid": sid,
@@ -104,8 +134,11 @@ class GateRegistry:
             }
             self._pending[gid] = entry
             self.version += 1
+            self.last_announced = gid
+            # stderr へ — server の _eval_src は stdout を redirect するため、
+            # stdout に出すと terminal に届かず buffer に飲まれる
             print(f"  [gate #{gid}] pending: {entry['title'][:80]} — /view で承認/却下 (terminal: y/n)",
-                  flush=True)
+                  file=sys.stderr, flush=True)
             deadline = time.time() + timeout
             while entry["decision"] is None:
                 remaining = deadline - time.time()
@@ -133,17 +166,34 @@ class GateRegistry:
             self._cond.notify_all()
             return True
 
-    def resolve_oldest(self, decision: str, source: str) -> bool:
-        """terminal の y/n 用 — 最も古い pending を解決する。"""
+    def resolve_from_terminal(self, gid: int | None, decision: str) -> str:
+        """terminal の y/n 用。 返り値は表示用メッセージ。
+
+        誤射防止 (先着レースで別の gate に y が刺さる事故) のため:
+          - `y 3` のように id 指定なら その gate だけを解決
+          - 裸の y/n は「pending が 1 件だけ、 かつそれが最後に告知した gate」の
+            ときにだけ効く。 それ以外は id 指定を要求する
+        解決した gate のタイトルを必ずエコーする — 何を承認したかを事後即座に見せる。"""
         with self._cond:
-            for gid in sorted(self._pending):
-                entry = self._pending[gid]
-                if entry["decision"] is None:
-                    entry["decision"] = "approve" if decision == "approve" else "deny"
-                    entry["source"] = source
-                    self._cond.notify_all()
-                    return True
-            return False
+            live = [e for e in self._pending.values() if e["decision"] is None]
+            if not live:
+                return "(gate: pending なし)"
+            if gid is None:
+                if len(live) > 1:
+                    ids = " ".join(f"#{e['id']}" for e in sorted(live, key=lambda e: e["id"]))
+                    return f"(gate: 複数 pending ({ids}) — 'y <id>' / 'n <id>' で指定すること)"
+                if live[0]["id"] != self.last_announced:
+                    return (f"(gate: 告知済みの gate と pending が食い違う — "
+                            f"'y {live[0]['id']}' のように id を指定すること)")
+                gid = live[0]["id"]
+            entry = self._pending.get(gid)
+            if entry is None or entry["decision"] is not None:
+                return f"(gate: #{gid} は pending でない — 先着済み or 不明 id)"
+            entry["decision"] = "approve" if decision == "approve" else "deny"
+            entry["source"] = "terminal"
+            self._cond.notify_all()
+            verb = "approve" if entry["decision"] == "approve" else "deny"
+            return f"(gate #{gid} {verb}: {entry['title'][:80]})"
 
 
 GATES = GateRegistry()
@@ -195,8 +245,19 @@ VIEW_MAX_NODES = 2000
 VIEW_MAX_DEPTH = 32
 
 
+def _sym_name(v: Any) -> str | None:
+    """lispy 側の _view_plainify が Symbol を {"sym": name} に写した marker を読む。
+    文字列と keyword を区別するため — ":" で始まるただの文字列は attr キーにしない。"""
+    if isinstance(v, dict) and set(v.keys()) == {"sym"} and isinstance(v["sym"], str):
+        return v["sym"]
+    return None
+
+
 def _plain_value(v: Any, depth: int = 0) -> Any:
-    """属性値の JSON 化。 scalar と (入れ子の) list だけ許す — 関数や env は通さない。"""
+    """属性値の JSON 化。 scalar / symbol / (入れ子の) list だけ許す — 関数や env は通さない。"""
+    s = _sym_name(v)
+    if s is not None:
+        return s
     if isinstance(v, (str, int, float, bool)) or v is None:
         return v
     if isinstance(v, list):
@@ -207,7 +268,7 @@ def _plain_value(v: Any, depth: int = 0) -> Any:
 
 
 def sexp_to_view(node: Any, _depth: int = 0, _count: list[int] | None = None) -> tuple[dict, int]:
-    """plain 化済み S 式 (str / number / list のみ) を検証して view JSON 木へ。
+    """plain 化済み S 式 (str / number / list / symbol marker) を検証して view JSON 木へ。
     返り値は (root_node, 総 node 数)。 語彙違反は ViewError。"""
     if _count is None:
         _count = [0]
@@ -216,18 +277,24 @@ def sexp_to_view(node: Any, _depth: int = 0, _count: list[int] | None = None) ->
     _count[0] += 1
     if _count[0] > VIEW_MAX_NODES:
         raise ViewError(f"node 数が多すぎる (max {VIEW_MAX_NODES})")
-    if not (isinstance(node, list) and node and isinstance(node[0], str)):
+    if not (isinstance(node, list) and node):
         raise ViewError("node は (tag ...) のリストであること")
-    tag = node[0]
+    tag = _sym_name(node[0]) or (node[0] if isinstance(node[0], str) else None)
+    if tag is None:
+        raise ViewError("node は (tag ...) のリストであること")
     spec = VIEW_VOCAB.get(tag)
     if spec is None:
         raise ViewError(f"unknown tag: {tag} (語彙: {', '.join(sorted(VIEW_VOCAB))})")
 
-    # :key value ペアを先頭から読む → 残りが children
+    # :key value ペアを先頭から読む → 残りが children。
+    # キーは symbol のみ — ":" で始まるただの文字列は text 子要素として扱う。
     attrs: dict[str, Any] = {}
     i = 1
-    while i < len(node) and isinstance(node[i], str) and node[i].startswith(":"):
-        key = node[i][1:]
+    while i < len(node):
+        k = _sym_name(node[i])
+        if k is None or not k.startswith(":"):
+            break
+        key = k[1:]
         if key not in spec["attrs"]:
             raise ViewError(f"unknown attr :{key} for {tag}")
         if i + 1 >= len(node):
@@ -241,6 +308,9 @@ def sexp_to_view(node: Any, _depth: int = 0, _count: list[int] | None = None) ->
     if tag == "text":
         parts = [attrs.pop("content", "")] if "content" in attrs else []
         for c in rest:
+            s = _sym_name(c)
+            if s is not None:
+                c = s
             if not isinstance(c, (str, int, float)):
                 raise ViewError("text の子は文字列/数値のみ")
             parts.append(str(c))
@@ -260,6 +330,9 @@ def sexp_to_view(node: Any, _depth: int = 0, _count: list[int] | None = None) ->
 
     if spec["children"] is True:
         for c in rest:
+            s = _sym_name(c)
+            if s is not None:
+                c = s
             if isinstance(c, (str, int, float)):
                 _count[0] += 1
                 out["children"].append(
@@ -424,6 +497,25 @@ def _kind_rows(db: sqlite3.Connection, sid: str | None, kinds: tuple[str, ...]) 
     ).fetchall()
 
 
+def _recent_kind_rows(db: sqlite3.Connection, sid: str | None,
+                      kinds: tuple[str, ...], limit: int) -> list:
+    """直近 limit 件だけを SQL 側で切る (_kind_rows の全走査を避ける)。 時系列順で返す。"""
+    marks = ",".join("?" * len(kinds))
+    if sid is None:
+        rows = db.execute(
+            f"SELECT id, ts, session_id, kind, payload FROM meta_events "
+            f"WHERE kind IN ({marks}) ORDER BY id DESC LIMIT ?",
+            kinds + (limit,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            f"SELECT id, ts, session_id, kind, payload FROM meta_events "
+            f"WHERE kind IN ({marks}) AND session_id = ? ORDER BY id DESC LIMIT ?",
+            kinds + (sid, limit),
+        ).fetchall()
+    return list(reversed(rows))
+
+
 def _rks(db: sqlite3.Connection, sid: str | None) -> dict:
     """上段パネル用の R / K / S 現在値。 /spec と同じ導出規則:
     R は @replaces lineage で置換済みをマーク、 K / S は name ごとに最新。"""
@@ -532,8 +624,9 @@ def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
         "scope": scope,
         "session_id": sid,
         "gates": [
-            _meta_to_event(*row) for row in _kind_rows(db, sid, ("gate", "skill", "confirm"))
-        ][-20:],
+            _meta_to_event(*row)
+            for row in _recent_kind_rows(db, sid, ("gate", "skill", "confirm"), 20)
+        ],
         "timeline": _timeline(db, sid),
         "cursors": {"meta": meta_max, "turn": turn_max},
     }
@@ -833,12 +926,23 @@ async function decideGate(id, decision) {
   refreshPanels();
 }
 
+let aviewVersion = -1;
+
 function renderAgentView(v) {
   const wrap = document.getElementById("aview-wrap");
   const root = document.getElementById("aview");
-  root.replaceChildren();
-  if (!v || !v.root) { wrap.style.display = "none"; return; }
+  if (!v || !v.root) {
+    aviewVersion = -1;
+    root.replaceChildren();
+    wrap.style.display = "none";
+    return;
+  }
   wrap.style.display = "";
+  // 同一 version なら DOM を作り直さない — 再構築すると人間が入力中の
+  // (input ...) の値が消えるため。 agent が新しい view を示したときだけ描き直す。
+  if (v.version === aviewVersion) return;
+  aviewVersion = v.version;
+  root.replaceChildren();
   root.append(renderNode(v.root));
 }
 
