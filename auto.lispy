@@ -19,7 +19,7 @@
 ;; 会話履歴 = 作業ログを丸ごと見せて、 goal との照合だけをさせる。
 ;; agent の自己申告を信用しない、 という一文が実質の本体。
 (define judge-system
-  "あなたは検証者。会話履歴は agent の作業ログである。与えられた goal と作業ログを照合し、goal が本当に達成されたかだけを判定する。agent の自己申告 (「完了しました」等) は信用せず、tool の実行結果という証拠があるかで判断する。tool は呼ばない。達成済みなら DONE とだけ書く。未達成なら NEXT: に続けて、次にやるべき最も具体的な一手を 1-3 文で書く。")
+  "あなたは検証者。会話履歴は agent の作業ログである。与えられた goal と作業ログを照合し、goal が本当に達成されたかだけを判定する。agent の自己申告 (「完了しました」等) は信用せず、tool の実行結果という証拠があるかで判断する。承認済み計画が与えられた場合は契約として扱う: 計画にない外部作用や、未完ステップの飛ばしがあれば未達成として指摘する。計画が現実と食い違っているなら revise-plan での改版提案を促す。tool は呼ばない。達成済みなら DONE とだけ書く。未達成なら NEXT: に続けて、次にやるべき最も具体的な一手を 1-3 文で書く。")
 
 ;; --- (judge-done env goal) → "DONE" | "NEXT: ..." ---
 ;; judge-call に投げる: .env の JUDGE_* が設定されていれば executor と別のモデルが判定する
@@ -30,6 +30,7 @@
     (let ((j (fork-env env 'system judge-system 'name "judge")))
       (let ((r (judge-call (append-turn j (make-turn "user"
                  (string-append "goal: " goal
+                   "\n承認済み計画 (契約):\n" (current-plan)
                    "\nここまでの作業ログ (上の会話履歴) を証拠として、この goal は達成済みか?")))
                  'max-tokens 512)))
         (let ((v (string-trim (turn-content r))))
@@ -71,32 +72,76 @@
         "(1) 確定した事実 (2) 完了した作業 (3) 未完了の作業と次の一手。\n\n"
         (transcript 60)))))))
 
-;; --- (auto-step env goal [max-rounds] [renew-at]) — 自走の外側ループ ---
-;; round ごとに: agent-step で作業 → judge-done で検証 →
-;; DONE なら終了、 未達成なら判定の NEXT を system-reminder として次の入力に。
-;; turns が renew-at を超えたら auto-renew で文脈を切り直してから続行。
+;; --- 計画フェーズの促し (auto-step が計画フェーズの各試行で input に使う) ---
+(define plan-request
+  (lambda (goal n)
+    (string-append
+      "<system-reminder>計画フェーズ (試行 " n "/3)。まだ実行しない — 副作用 tool はブロックされている。"
+      "read 系 tool と純粋な評価で調査した上で、goal 達成の計画を propose-plan で提案すること。"
+      "形式: (propose-plan goal文字列 (quote ((手順1 根拠1) (手順2 根拠2) ...)))。"
+      "各ステップには what (何をするか) と why (なぜ必要か) を必ず対で書く。"
+      "承認されると実行フェーズに移る。</system-reminder>\n"
+      "goal: " goal)))
+
+;; --- (auto-step env goal [max-rounds] [renew-at]) — 計画 → 承認 → 実行 ---
+;; 1. 計画フェーズ: plan-phase! on (副作用 tool ブロック)。 agent に調査させ
+;;    propose-plan を出させる (最大 3 試行)。 出なければ中止。
+;; 2. 承認: approve-plan — 人間の同期ゲート、 不在なら judge fallback。
+;;    否なら中止 (安全側で止まる)。
+;; 3. 実行フェーズ: plan-phase! off。 承認済み計画を契約として従来ループ —
+;;    round ごとに agent-step → judge-done (計画つき) → DONE なら終了、
+;;    未達成なら NEXT を system-reminder として次の入力に。
+;;    turns が renew-at を超えたら auto-renew で文脈を切り直してから続行。
+;; 計画は ledger (kind=plan) の一級市民 — /view の計画パネルに進捗が出る。
 (define auto-step
   (lambda (env goal &rest opts)
     (let ((max-rounds (if (null? opts) 12 (car opts)))
-          (renew-at   (if (or (null? opts) (null? (cdr opts))) 80 (car (cdr opts)))))
+          (renew-at   (if (or (null? opts) (null? (cdr opts))) 80 (car (cdr opts))))
+          (plan0      (plan-id)))
       (begin
         (session-intent goal)
-        ;; n は今走らせた round 番号 (1-based)。 n >= max-rounds で終了 = 作業 round は
-        ;; ちょうど max-rounds 回 (0 始まりだと 1 round 余分に走る off-by-one になる)
-        ((lambda (input n)
-           (let ((r ((lookup "agent-step") env input)))
-             (if (>= n max-rounds)
-                 r
-                 (let ((verdict ((lookup "judge-done") env goal)))
-                   (if (done-verdict? verdict)
-                       r
-                       (begin
-                         (if (> (turn-count) renew-at)
-                             ((lookup "auto-renew") goal)
-                             #f)
-                         (recur (string-append
-                                  "<system-reminder>検証者の判定 (round " n "/" max-rounds "): "
-                                  verdict
-                                  "\n未達成。NEXT の指示に従って作業を続けること。完了したと判断したら、根拠となる tool の実行結果を明示すること。</system-reminder>")
-                                (+ n 1))))))))
-         goal 1)))))
+        ;; 1. 計画フェーズ。 plan0 より新しい proposed だけを「この run の計画」と認める
+        ;;    (前の run の stale な proposed を誤って承認しない)
+        (plan-phase! env #t)
+        ((lambda (n)
+           (if (and (> (plan-id) plan0) (eq? (plan-status) "proposed"))
+               #t
+               (if (> n 3)
+                   #f
+                   (begin
+                     ((lookup "agent-step") env (plan-request goal n))
+                     (recur (+ n 1))))))
+         1)
+        ;; 2. 承認 → 3. 実行
+        (let ((approval (if (and (> (plan-id) plan0) (eq? (plan-status) "proposed"))
+                            (approve-plan)
+                            "(計画が提案されなかった)")))
+          (begin
+            (plan-phase! env #f)
+            (if (eq? (plan-status) "approved")
+                ;; n は今走らせた round 番号 (1-based)。 n >= max-rounds で終了 = 作業 round は
+                ;; ちょうど max-rounds 回 (0 始まりだと 1 round 余分に走る off-by-one になる)
+                ((lambda (input n)
+                   (let ((r ((lookup "agent-step") env input)))
+                     (if (>= n max-rounds)
+                         r
+                         (let ((verdict ((lookup "judge-done") env goal)))
+                           (if (done-verdict? verdict)
+                               r
+                               (begin
+                                 (if (> (turn-count) renew-at)
+                                     ((lookup "auto-renew") goal)
+                                     #f)
+                                 (recur (string-append
+                                          "<system-reminder>検証者の判定 (round " n "/" max-rounds "): "
+                                          verdict
+                                          "\n未達成。NEXT の指示に従って作業を続けること。完了したと判断したら、根拠となる tool の実行結果を明示すること。</system-reminder>")
+                                        (+ n 1))))))))
+                 (string-append
+                   "<system-reminder>計画が承認された。実行フェーズに移る。以下の計画に従うこと。"
+                   "ステップを終えるたびに (plan-step-done N) で進捗を刻む。"
+                   "計画が現実と食い違ったら (revise-plan (quote ((手順 根拠) ...)) 改版理由) で改版を提案する (judge 審査)。</system-reminder>\n"
+                   (current-plan)
+                   "\ngoal: " goal)
+                 1)
+                (string-append "auto-step 中止 — 計画が承認されなかった: " approval))))))))
