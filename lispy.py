@@ -2707,8 +2707,9 @@ def _prim_lookup_factory(env: Env) -> Callable[..., Any]:
 
 
 _CTX_OVERFLOW_RE = _re.compile(
-    r"context.{0,40}(length|window|limit)|maximum context|too many tokens"
-    r"|prompt is too long|input.{0,20}too long|exceeds.{0,30}token",
+    r"context.{0,40}(length|window|limit|size)|maximum context|too many tokens"
+    r"|prompt is too long|input.{0,20}too long|exceeds.{0,50}token"
+    r"|exceed_context",  # llama.cpp: 'request (N tokens) exceeds the available context size (M tokens)' / type=exceed_context_size_error
     _re.IGNORECASE,
 )
 
@@ -3960,10 +3961,37 @@ def _install_meta_primitives(env: Env) -> None:
                 time.sleep(0.2)
             return ""
 
+        def _view_comments(_env: Env = env) -> str:
+            """(view-comments) — ブラウザ thread からの executor 宛コメント (未配達分) を
+            まとめて取り出し、 1 件 1 行のテキストで返す。 無ければ ""。
+            ledger への記録は POST /view/comment 側が済ませている — ここは配達だけ。"""
+            items = _viewmod.COMMENTS.drain()
+            return "\n".join(f"- {it['text']}" for it in items)
+
+        def _post_comment(author: Any, text: Any, _env: Env = env) -> str:
+            """(post-comment "judge" "...") — thread (kind=comment) に 1 コメントを刻む。
+            auto-step が executor の round 報告 / judge の verdict を人間に見せる経路。"""
+            a = author.name if isinstance(author, Symbol) else str(author)
+            a = a[:40]
+            t = str(text if not isinstance(text, Value) else text.text or "")[:4000]
+            if not t:
+                return "(post-comment: empty text — skipped)"
+            payload = json.dumps({"author": a, "to": "human", "text": t}, ensure_ascii=False)
+            if _env.db_conn is not None and _env.record_sid:
+                try:
+                    host.log_meta(_env.db_conn, "comment", sid=_env.record_sid, payload=payload)
+                    return f"(comment posted: {a})"
+                except Exception:
+                    pass
+            _viewmod._log_meta_rw("comment", _env.record_sid, payload)
+            return f"(comment posted: {a})"
+
         env.bindings["show-view"]         = _show_view
         env.bindings["clear-view"]        = _clear_view
         env.bindings["view-next-action"]  = _view_next_action
         env.bindings["await-view-action"] = _await_view_action
+        env.bindings["view-comments"]     = _view_comments
+        env.bindings["post-comment"]      = _post_comment
     except ImportError:
         pass
     # 旧 API (互換のため残す): env-messages / env-add-turn! は (env-messages env) / (env-add-turn! env t) でも使える
