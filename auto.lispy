@@ -77,8 +77,7 @@
   (lambda (goal n)
     (string-append
       "<system-reminder>計画フェーズ (試行 " n "/3)。まだ実行しない — 副作用 tool はブロックされている。"
-      "read 系 tool と純粋な評価で調査した上で、goal 達成の計画を propose-plan で提案すること。"
-      "形式: (propose-plan goal文字列 (quote ((手順1 根拠1) (手順2 根拠2) ...)))。"
+      "read 系 tool と純粋な評価で調査した上で、goal 達成の計画を propose_plan tool で提案すること。"
       "各ステップには what (何をするか) と why (なぜ必要か) を必ず対で書く。"
       "承認されると実行フェーズに移る。</system-reminder>\n"
       "goal: " goal)))
@@ -118,7 +117,9 @@
                             "(計画が提案されなかった)")))
           (begin
             (plan-phase! env #f)
-            (if (eq? (plan-status) "approved")
+            ;; plan0 より新しい plan の承認だけを認める — 前の run の stale な
+            ;; approved が残っていると、 提案失敗でもここを通ってしまう
+            (if (and (> (plan-id) plan0) (eq? (plan-status) "approved"))
                 ;; n は今走らせた round 番号 (1-based)。 n >= max-rounds で終了 = 作業 round は
                 ;; ちょうど max-rounds 回 (0 始まりだと 1 round 余分に走る off-by-one になる)
                 ((lambda (input n)
@@ -139,7 +140,7 @@
                                         (+ n 1))))))))
                  (string-append
                    "<system-reminder>計画が承認された。実行フェーズに移る。以下の計画に従うこと。"
-                   "ステップを終えるたびに (plan-step-done N) で進捗を刻む。"
+                   "ステップを終えるたびに plan_step_done tool (n=ステップ番号) で進捗を刻む。"
                    "計画が現実と食い違ったら (revise-plan (quote ((手順 根拠) ...)) 改版理由) で改版を提案する (judge 審査)。</system-reminder>\n"
                    (current-plan)
                    "\ngoal: " goal)
