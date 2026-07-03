@@ -723,6 +723,31 @@ def summary_24h(db: sqlite3.Connection) -> dict:
     return out
 
 
+def _memory_state() -> dict | None:
+    """蒸留層 (data/memory/) のスナップショット。 dir 解決は brainwash.MEMORY_DIR と同じ規則
+    (import はしない — brainwash.py を消しても view は動く)。 dir が無ければ None。"""
+    from pathlib import Path
+    mem_dir = Path(os.environ.get(
+        "LISPY_MEMORY_DIR", str(Path(__file__).resolve().parent / "data" / "memory")))
+    if not mem_dir.is_dir():
+        return None
+    files = []
+    index_text = ""
+    for p in sorted(mem_dir.rglob("*.md")):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        rel = str(p.relative_to(mem_dir))
+        files.append({"path": rel, "mtime": st.st_mtime, "size": st.st_size})
+        if rel == "index.md":
+            try:
+                index_text = p.read_text(encoding="utf-8")[:4000]
+            except OSError:
+                pass
+    return {"dir": str(mem_dir), "files": files, "index": index_text}
+
+
 def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
     """初期スナップショット。 cursors は timeline より先に読む — 隙間の行は SSE 側と
     重複して届く可能性があるが、 client が (src, id) で dedupe する (欠落よりまし)。"""
@@ -739,6 +764,7 @@ def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
         ],
         "timeline": _timeline(db, sid),
         "cursors": {"meta": meta_max, "turn": turn_max},
+        "memory": _memory_state(),
     }
     body.update(_rks(db, sid))
     return body
@@ -898,6 +924,13 @@ VIEW_HTML = """<!doctype html>
   <div class="panel"><h2>K</h2><ul id="panel-K"></ul></div>
   <div class="panel"><h2>S</h2><ul id="panel-S"></ul></div>
 </div>
+<div id="memory-wrap" style="display:none">
+  <h2>memory <span class="note" id="memory-meta"></span></h2>
+  <pre id="memory-index" style="max-height:14em;overflow-y:auto;font-size:.85em;
+       background:#fafafa;border:1px solid #ddd;border-radius:4px;padding:.5em .7em;
+       white-space:pre-wrap"></pre>
+  <ul id="memory-files" style="font-size:.85em"></ul>
+</div>
 <div id="aview-wrap" style="display:none">
   <h2>agent view <span class="note">(show-view による提示)</span></h2>
   <div id="aview"></div>
@@ -977,6 +1010,28 @@ function renderPlan(p) {
   }
 }
 
+let memDir = "";  // memory 書き込み turn の検出用 (SSE trigger)
+
+function renderMemory(m) {
+  const wrap = document.getElementById("memory-wrap");
+  if (!m) { wrap.style.display = "none"; memDir = ""; return; }
+  wrap.style.display = "";
+  memDir = m.dir || "";
+  document.getElementById("memory-meta").textContent =
+    m.dir + " — " + (m.files || []).length + " files";
+  document.getElementById("memory-index").textContent =
+    m.index || "(index.md なし)";
+  const ul = document.getElementById("memory-files");
+  ul.replaceChildren();
+  const byNew = (m.files || []).slice().sort((a, b) => b.mtime - a.mtime);
+  for (const f of byNew.slice(0, 12)) {
+    const li = el("li");
+    li.append(document.createTextNode(
+      f.path + " (" + f.size + "B, " + new Date(f.mtime * 1000).toLocaleString() + ")"));
+    ul.append(li);
+  }
+}
+
 function bumpSummary(id) {
   const b = document.getElementById(id);
   b.textContent = (parseInt(b.textContent, 10) || 0) + 1;
@@ -1027,6 +1082,7 @@ function renderPanels(st) {
   renderPending(st.pending || []);
   renderPlan(st.plan || null);
   renderAgentView(st.view || null);
+  renderMemory(st.memory || null);
 }
 
 function renderDiffLines(lines, file) {
@@ -1193,7 +1249,10 @@ function connect(cur) {
     if (ev.src === "turn" && ev.tag === "assistant") bumpSummary("st-steps");
     if (ev.src === "turn" && ev.tag === "tool") bumpSummary("st-tools");
     if (["R", "K", "S", "gate", "skill", "confirm", "intent",
-         "plan", "plan-approval", "plan-progress"].includes(ev.tag)) refreshPanels();
+         "plan", "plan-approval", "plan-progress", "brainwash"].includes(ev.tag)) refreshPanels();
+    // memory dir へのファイル書き込み (write_file 等の tool result) でも memory panel を更新
+    if (ev.src === "turn" && ev.tag === "tool" && memDir &&
+        (ev.head || "").includes(memDir)) refreshPanels();
   };
   es.onerror = scheduleRetry;
 }
