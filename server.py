@@ -736,6 +736,8 @@ def main() -> None:
                         "--session 省略時は直近の session を対象にする")
     p.add_argument("--stdin", action="store_true",
                    help="stdin からも S 式を読む REPL を server と並列で起動")
+    p.add_argument("--open", action="store_true",
+                   help="起動後にブラウザで /view を開く (agent の作業を動的に見る)")
     args = p.parse_args()
 
     if args.yolo:
@@ -772,6 +774,15 @@ def main() -> None:
     print("  endpoints: POST /eval /load /reset /interrupt  GET / /bindings /recall?q= /spec /view")
 
     server = ThreadingHTTPServer((args.host, args.port), make_handler(env_box))
+
+    if args.open:
+        if view is None:
+            print("  (--open: view 層なし (view.py が無い) — skip)", file=sys.stderr)
+        else:
+            # serve_forever が回り始めてから開く (競合してもブラウザ側が retry するが行儀として)
+            import webbrowser
+            threading.Timer(
+                0.3, webbrowser.open, (f"http://{args.host}:{args.port}/view",)).start()
 
     if args.stdin:
         t = threading.Thread(target=_stdin_repl, args=(env_box,), daemon=True)

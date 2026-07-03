@@ -1403,7 +1403,8 @@ def _execute_tool(env: Env, name: Any, args_json: Any = "{}") -> str:
         return f"(unknown tool: {name})"
     # plan phase — 計画フェーズ中は副作用 tool を一律ブロック (調査のみ)。
     # READONLY_TOOLS を許可 set として流用。 spawn_agent / shell / write 系は set 外。
-    if env.plan_phase and name not in READONLY_TOOLS:
+    # propose_plan だけは例外 — 計画フェーズの本務 (副作用は ledger への提案記録のみ)。
+    if env.plan_phase and name not in READONLY_TOOLS and name != "propose_plan":
         return (f"(plan-phase: {name} は計画フェーズでは実行不可 — 今は調査のみ。 "
                 f"副作用を伴う作業は (propose-plan ...) のステップに書き、 承認後の実行フェーズで行う)")
     # skill 更新 gate (SKILL.md への書き込みは judge 審査、 shell 経由は名指しで拒否)
@@ -3705,6 +3706,95 @@ def _spawn_agent_tool(args: dict, env: Env) -> str:
     return f"[subagent {child.name} done]\n{text}"
 
 
+PROPOSE_PLAN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "propose_plan",
+        "description": (
+            "goal 達成の実行計画を提案する (計画フェーズ用)。 承認されると実行フェーズに移る。 "
+            "各ステップは what (何をするか) と why (なぜ必要か) の対で書くこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "この計画が達成する goal",
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "実行手順 (順序どおり、 30 個まで)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "what": {"type": "string", "description": "何をするか"},
+                            "why": {"type": "string", "description": "なぜ必要か (根拠)"},
+                        },
+                        "required": ["what", "why"],
+                    },
+                },
+            },
+            "required": ["goal", "steps"],
+        },
+    },
+}
+
+
+def _propose_plan_tool(args: dict, env: Env) -> str:
+    """propose_plan の tool handler。 env closure の primitive に委譲する。
+    S 式 (propose-plan ...) は steps の入れ子 list を小型モデルが崩しやすい —
+    JSON schema で形式を API 側から強制するため tool_call でも出す。"""
+    fn = env.bindings.get("propose-plan")
+    if not callable(fn):
+        return "(propose_plan: この env に plan primitive がない)"
+    raw = args.get("steps")
+    if not isinstance(raw, list):
+        return "(propose_plan: steps は {what, why} の配列)"
+    if not all(isinstance(st, dict) for st in raw):
+        return "(propose_plan: steps の各要素は {what, why} の object — 黙って捨てると計画が縮む)"
+    steps = [[st.get("what", ""), st.get("why", "")] for st in raw]
+    return str(fn(str(args.get("goal", "")), steps))
+
+
+PLAN_STEP_DONE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "plan_step_done",
+        "description": (
+            "承認済み計画のステップ N (1-based) の完了を plan ledger に刻む。 "
+            "計画の実行フェーズでステップを終えるたびに呼ぶこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "n": {
+                    "type": "integer",
+                    "description": "完了したステップ番号 (1-based)",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "補足 (任意、 300 字まで記録)",
+                },
+            },
+            "required": ["n"],
+        },
+    },
+}
+
+
+def _plan_step_done_tool(args: dict, env: Env) -> str:
+    """plan_step_done の tool handler。 env closure の primitive に委譲する。
+    S 式 (plan-step-done N) は content が純 S 式のときしか評価されない —
+    散文に混ぜて出すモデルでも進捗が刻めるよう、 同じものを tool_call でも出す。"""
+    fn = env.bindings.get("plan-step-done")
+    if not callable(fn):
+        return "(plan_step_done: この env に plan primitive がない)"
+    note = str(args.get("note", "") or "").strip()
+    if note:
+        return str(fn(args.get("n"), note))
+    return str(fn(args.get("n")))
+
+
 def _wrap_edit_tool(name: str, dispatch: dict) -> Callable[[dict, Env], str]:
     """edit.EDIT_TOOL_DISPATCH 用 wrapper。 host と違い _TOOL_CTX を触らない (副作用は edit.py 内で自己完結)。"""
     fn = dispatch[name]
@@ -3739,6 +3829,12 @@ def _build_tool_layer() -> tuple[dict[str, Callable[[dict, Env], str]], list[dic
     # subagent (Claude Code の Task tool 相当)。 handler は env を受け取り depth を継承する。
     tools["spawn_agent"] = _spawn_agent_tool
     schema.append(SPAWN_AGENT_SCHEMA)
+    # plan mode の tool_call 版 (S 式を散文に混ぜる / 入れ子 list を崩す小型モデル対策)。
+    # propose_plan は計画フェーズの本務なので plan-phase ゲートの許可 set に入っている。
+    tools["propose_plan"] = _propose_plan_tool
+    schema.append(PROPOSE_PLAN_SCHEMA)
+    tools["plan_step_done"] = _plan_step_done_tool
+    schema.append(PLAN_STEP_DONE_SCHEMA)
     # MCP server の tool 群 (.lispy-mcp.json)。 optional import — mcp.py を消しても core は動く。
     # server プロセスは mcp module 側で cache されるので、 env (spawn child 含む) を跨いで共有。
     try:

@@ -3,6 +3,39 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-07-03 — plan mode の tool_call 化 + stale plan ガード
+
+ds4 (ローカル DeepSeek) での実機テストで発見した 3 件。 小型モデルは (a) S 式を散文に
+混ぜて出す (content が純 S 式のときしか評価されない → `(plan-step-done 1)` が取りこぼされ
+done 0/1 のまま残る)、 (b) `propose-plan` の入れ子 list 形式を崩し続ける (3 試行全部
+形式エラーで計画が提案されない)。 さらに (c) 提案失敗時に前の run の approved plan が
+plan-status に見えて実行フェーズへ進んでしまう (stale plan が契約になる)。
+
+### Added
+- **propose_plan / plan_step_done tool** — S 式 primitive の tool_call 版。 handler は
+  env closure の primitive に委譲するだけ (検証・記録は一本)。 JSON schema で
+  steps={what,why} の形式を API 側から強制する。 propose_plan は計画フェーズの本務なので
+  plan-phase ゲートの例外、 plan_step_done は他の副作用 tool と同じくブロック
+
+### Fixed
+- auto-step の実行フェーズ移行ガードに `(> (plan-id) plan0)` を追加 — この run で
+  提案された計画の承認だけを認める (前の run の stale approved で走らない)
+
+### Changed
+- auto.lispy の指示を tool 経由に変更 (計画フェーズ: propose_plan / 実行フェーズ:
+  plan_step_done)。 S 式評価経路 (純 S 式 content) も従来どおり生きている
+
+## 2026-07-03 (2) — view の自動起動 + memory panel
+
+「llm が何か作るのを動的に見る」 の残り 2 点: 起動の手間と、 蒸留層の見えなさ。
+
+### Added
+- **`lispy-server --open`** — 起動後にブラウザで /view を開く。 view.py が無ければ skip
+- **memory panel (/view)** — 蒸留層 (data/memory/) の index.md 全文 + ファイル一覧
+  (更新順、 mtime/size) を表示。 dir 解決は brainwash.MEMORY_DIR と同じ規則。
+  更新 trigger は brainwash イベントに加え、 memory dir への write 系 tool result も拾う
+  (agent が直接 write_file した場合も追従)
+
 ## 2026-07-02 (7) — レビュー指摘の修正 (安全側の締め直し 10 件)
 
 ### Changed
