@@ -267,16 +267,20 @@ def plan_approval(db: sqlite3.Connection, plan_id: int) -> dict | None:
 
 
 def plan_done_steps(db: sqlite3.Connection, plan_id: int) -> set[int]:
-    """plan_id の完了ステップ番号 (kind=plan-progress、 1-based) の集合。"""
+    """plan_id の完了ステップ番号 (kind=plan-progress、 1-based) の集合。
+    plan_id は SQL 側 (json_extract) で絞る — 直近 N 件の窓だと、 反復記録の多い
+    長い run で古いステップの完了が窓から押し出されて取りこぼすため。"""
     done: set[int] = set()
     for (payload,) in db.execute(
         "SELECT payload FROM meta_events WHERE kind = 'plan-progress' "
-        "ORDER BY id DESC LIMIT 200").fetchall():
+        "AND json_extract(payload, '$.plan_id') = ?",
+        (plan_id,),
+    ).fetchall():
         try:
             g = json.loads(payload or "")
         except Exception:
             continue
-        if g.get("plan_id") == plan_id and isinstance(g.get("step"), int):
+        if isinstance(g.get("step"), int):
             done.add(g["step"])
     return done
 
