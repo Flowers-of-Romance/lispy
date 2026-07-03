@@ -3,6 +3,40 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-07-04 — /view を三者の対話面に (issue カード + thread + 委譲)
+
+/view を「読む」ダッシュボードから human ↔ executor ↔ judge の相互作用面にした。
+issue tracker 的な語彙 (カード / thread / 委譲) で、 委譲しても owner は人間のまま。
+ledger (kind=comment) が唯一の真実で、 表示は既存の SSE がそのまま配る。
+
+### Added
+- **R issue カード** — R パネルをカード化。 commit-R の auto-judge 注釈 (@judge=b/c,
+  @judge-target, @judge-reason) と lineage から refines / contradicts / contested by /
+  refined by / replaced を導出してチップ表示。 contested な R は赤枠
+- **thread** — kind=comment の会話面。 投稿フォームは宛先を選べる:
+  executor 宛は CommentQueue に積まれ auto-step の round 境界で system-reminder として注入、
+  judge 宛は executor の loop を経由せず judge LLM が ledger (R/計画/直近 turns) を根拠に
+  別スレッドで即応答 (`POST /view/comment`)
+- **委譲** — R カードの「委譲 → executor」ボタンで その R を goal に auto-step を
+  バックグラウンド起動 (`POST /view/delegate`、 評価中なら 409)。 run の終了/失敗は
+  必ず system コメントとして thread に残る
+- primitives: `(view-comments)` (executor 宛コメントの配達)、 `(post-comment author text)`
+  (thread への投稿)。 auto.lispy: executor の round 報告と judge の verdict を自動投稿
+- **未解決コメントは close をブロック** — judge が DONE でも人間の未処理コメントが
+  残っていれば auto-step は終了せず、 対応させてから再判定する
+
+### Fixed
+- server: `_eval_src` が SystemExit を握らず HTTP handler / delegate スレッドが
+  応答なしで死んでいた (host.get_client は LLM 未設定で SystemExit を投げる)
+- context overflow の緊急網の正規表現が llama.cpp の
+  `exceeds the available context size` / `exceed_context_size_error` にマッチしなかった
+  (ローカル llama-server 運用では `LISPY_CTX_WINDOW` を `-c` に合わせること)
+
+### 検証
+実 LLM (llama-server + gemma-4-26B-A4B) で通し確認: 委譲 → 計画 gate をブラウザ相当の
+POST で人間承認 → executor 報告 / judge DONE が thread に並ぶ → 未処理コメントが
+close をブロックし 2 round 目で追記 → 再 DONE → run 終了コメント。
+
 ## 2026-07-03 (4) — サブスクの Claude を judge に使う proxy
 
 judge を executor (ローカル DeepSeek) と別モデルにしたいが、 サブスク (Pro/Max) の認証は

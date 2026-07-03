@@ -126,6 +126,19 @@ turns が伸びすぎたら auto-renew (要約して renew = compaction 相当) 
 agent 側からは `spawn_agent` tool で subagent に独立 subtask を委譲できる
 (探索の文脈隔離 / 成果物の独立検証 / 脇道調査。 child env は会話履歴を見ない)。
 
+### /view の thread — human ↔ executor ↔ judge
+
+自走中の run とは `/view` の thread でやりとりできる (ledger kind=comment が真実):
+
+- **人間 → executor**: 投稿は auto-step の round 境界で system-reminder として注入される。
+  judge が DONE と判定しても未処理コメントが残っていれば close はブロックされ、
+  対応してから再判定になる
+- **人間 → judge**: executor の loop を経由せず、 judge LLM が R / 計画 / 直近 turns を
+  根拠に即応答する (判定根拠を直接問える)
+- **executor / judge → 人間**: round ごとの作業報告と verdict が自動で thread に流れる
+- **委譲**: R カードの「委譲 → executor」で その R を goal に auto-step が起動する
+  (`POST /view/delegate`。 委譲しても owner は人間のまま — agent は代行者)
+
 ## 長期記憶 (洗脳 / brainwash)
 
 セッション横断の記憶は二層:
@@ -178,6 +191,7 @@ judge client を使う。
 | hooks | `LISPY_HOOKS=<設定>` — pre-tool (ブロック可) / post-tool (結果に添付) / stop (止まれなくする) |
 | MCP | `LISPY_MCP=<設定>` で opt-in した server (stdio) を `mcp__<server>__<tool>` として tool 化。 `(mcp-list)` で確認 |
 | skills | `.lispy/skills/<name>/SKILL.md` の一覧を system prompt に常駐、 本文は合致時に agent が read。 agent 自身が更新できる (judge 審査つき — 検証を弱める変更は却下)。 更新履歴は rk-log の [skill] |
+| thread | `/view` の human ↔ executor ↔ judge スレッド (kind=comment)。 コメント注入 / judge への直接質問 / R カードからの委譲。 上の「/view の thread」節参照 |
 
 hooks の例 (`LISPY_HOOKS=./.lispy-hooks.json` で opt-in):
 
