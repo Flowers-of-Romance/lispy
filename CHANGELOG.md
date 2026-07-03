@@ -3,6 +3,22 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-07-03 (4) — サブスクの Claude を judge に使う proxy
+
+judge を executor (ローカル DeepSeek) と別モデルにしたいが、 サブスク (Pro/Max) の認証は
+API キーでなく OAuth なので OpenAI 互換 client から直接は叩けない。 Claude Code headless
+(`claude -p`) を OpenAI 互換に変換する最小 proxy で埋めた。
+
+### Added
+- **claude_judge_proxy.py** — `POST /v1/chat/completions` を受けて `claude -p --model <model>`
+  (サブスク認証) に委譲し chat.completions 形式で返す。 標準ライブラリのみ・judge 用途
+  (単発・tool なし・非 stream) 限定。 CLI 失敗は 500 → lispy 側 fail-closed (REJECT)。
+  .env は `JUDGE_BASE_URL=http://127.0.0.1:8402/v1` / `JUDGE_MODEL=claude-opus-4-6` /
+  `JUDGE_API_KEY=subscription` (ダミー)。 実機確認: gate 審査と同型のリクエストで
+  悪意ある agent-step 書き換えを Opus 4.6 が正しく REJECT
+- 注意: 消費はサブスクの利用枠 (Claude Code と共有)。 auto-step の judge-done は round 毎に
+  呼ぶので長い自走では嵩む
+
 ## 2026-07-03 (3) — SPEC.md 新設 + 解決の階梯の明文化
 
 仕様が README / docs/reference.md / CHANGELOG / SYSTEM_PROMPT / docstring に分散して
