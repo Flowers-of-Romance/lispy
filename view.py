@@ -743,7 +743,8 @@ def _memory_state() -> dict | None:
         if rel == "index.md":
             try:
                 index_text = p.read_text(encoding="utf-8")[:4000]
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # UnicodeDecodeError は OSError でない — 逃すと /view/state 全体が 500 になる
                 pass
     return {"dir": str(mem_dir), "files": files, "index": index_text}
 
@@ -1010,13 +1011,16 @@ function renderPlan(p) {
   }
 }
 
-let memDir = "";  // memory 書き込み turn の検出用 (SSE trigger)
+// memory 書き込み turn の検出用 (SSE trigger)。 tool result のパスは絶対とも相対とも
+// 限らないので、 dir 末尾 2 セグメント (例 "data/memory") で照合する。
+// 誤発火は refreshPanels 1 回分 (冪等・軽量) なので広めに取る。
+let memTail = "";
 
 function renderMemory(m) {
   const wrap = document.getElementById("memory-wrap");
-  if (!m) { wrap.style.display = "none"; memDir = ""; return; }
+  if (!m) { wrap.style.display = "none"; memTail = ""; return; }
   wrap.style.display = "";
-  memDir = m.dir || "";
+  memTail = (m.dir || "").split("/").filter(Boolean).slice(-2).join("/");
   document.getElementById("memory-meta").textContent =
     m.dir + " — " + (m.files || []).length + " files";
   document.getElementById("memory-index").textContent =
@@ -1251,8 +1255,8 @@ function connect(cur) {
     if (["R", "K", "S", "gate", "skill", "confirm", "intent",
          "plan", "plan-approval", "plan-progress", "brainwash"].includes(ev.tag)) refreshPanels();
     // memory dir へのファイル書き込み (write_file 等の tool result) でも memory panel を更新
-    if (ev.src === "turn" && ev.tag === "tool" && memDir &&
-        (ev.head || "").includes(memDir)) refreshPanels();
+    if (ev.src === "turn" && ev.tag === "tool" && memTail &&
+        (ev.head || "").includes(memTail)) refreshPanels();
   };
   es.onerror = scheduleRetry;
 }
