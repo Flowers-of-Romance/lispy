@@ -435,8 +435,32 @@ class ActionQueue:
             return self._q.pop(0) if self._q else None
 
 
+class CommentQueue:
+    """executor 宛の人間コメントの受け皿 (POST /view/comment → auto-step の round 境界)。
+    ledger (kind=comment) が表示用の真実で、 ここは「まだ agent に渡っていない分」だけを
+    持つ配達キュー。 drain はまとめて取り出す — round 境界で一括注入するため。"""
+    MAX = 100
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._q: list[dict] = []
+
+    def push(self, text: str) -> bool:
+        with self._lock:
+            if len(self._q) >= self.MAX:
+                return False
+            self._q.append({"text": text, "ts": time.time()})
+            return True
+
+    def drain(self) -> list[dict]:
+        with self._lock:
+            out, self._q = self._q, []
+            return out
+
+
 CURRENT_VIEW = ViewSlot()
 ACTIONS = ActionQueue()
+COMMENTS = CommentQueue()
 
 
 def open_ro() -> sqlite3.Connection:
@@ -549,6 +573,16 @@ def _meta_to_event(rid: int, ts: float, sid: str | None, kind: str, payload: str
             return ev
         except Exception:
             pass
+    elif kind == "comment":
+        try:
+            p = json.loads(payload)
+            author = str(p.get("author") or "?")[:40]
+            ev["author"] = author
+            ev["text"] = str(p.get("text") or "")[:4000]
+            ev["head"] = _head(f"{author}: {ev['text']}")
+            return ev
+        except Exception:
+            pass
     ev["head"] = _head(payload.split("\n", 1)[0])
     return ev
 
@@ -594,21 +628,52 @@ def _recent_kind_rows(db: sqlite3.Connection, sid: str | None,
     return list(reversed(rows))
 
 
+def _parse_r_annotations(payload: str) -> dict:
+    """R payload の @judge= 系注釈行を読む (commit-R の auto-judge が書く形式)。"""
+    out: dict[str, Any] = {"judge": None, "target": None, "reason": None}
+    for ln in (payload or "").split("\n")[1:]:
+        if ln.startswith("@judge="):
+            out["judge"] = ln.split("=", 1)[1].strip()[:8]
+        elif ln.startswith("@judge-target="):
+            try:
+                out["target"] = int(ln.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+        elif ln.startswith("@judge-reason="):
+            out["reason"] = ln.split("=", 1)[1].strip()[:200]
+    return out
+
+
 def _rks(db: sqlite3.Connection, sid: str | None) -> dict:
     """上段パネル用の R / K / S 現在値。 /spec と同じ導出規則:
     R は @replaces lineage で置換済みをマーク、 K / S は name ごとに最新。"""
-    # R — replaced フラグ付き全件 (client 側で active を絞る)
+    # R — issue カード用に lineage / judge 注釈も添える (client 側で active を絞る)
     r_rows = _kind_rows(db, sid, ("R",))
     replaced: set[int] = set()
-    for _rid, _ts, _sid, _kind, payload in r_rows:
+    contested: dict[int, list[int]] = {}   # 対象 R id → contradicts と判定した R id 群
+    refined: dict[int, list[int]] = {}     # 対象 R id → refines と判定した R id 群
+    ann_by_id: dict[int, dict] = {}
+    for rid, _ts, _sid, _kind, payload in r_rows:
         prev = _parse_replaces(payload or "")
         if prev is not None:
             replaced.add(prev)
+        ann = _parse_r_annotations(payload or "")
+        ann_by_id[rid] = ann
+        if ann["target"] is not None:
+            if ann["judge"] == "c":
+                contested.setdefault(ann["target"], []).append(rid)
+            elif ann["judge"] == "b":
+                refined.setdefault(ann["target"], []).append(rid)
     r_list = [
         {
             "id": rid, "ts": ts,
             "head": _head((payload or "").split("\n", 1)[0]),
             "replaced": rid in replaced,
+            "judge": ann_by_id[rid]["judge"],
+            "target": ann_by_id[rid]["target"],
+            "reason": ann_by_id[rid]["reason"],
+            "contested_by": contested.get(rid, []),
+            "refined_by": refined.get(rid, []),
         }
         for rid, ts, _sid, _kind, payload in r_rows
     ]
@@ -763,6 +828,10 @@ def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
             _meta_to_event(*row)
             for row in _recent_kind_rows(db, sid, ("gate", "skill", "confirm"), 20)
         ],
+        "comments": [
+            _meta_to_event(*row)
+            for row in _recent_kind_rows(db, sid, ("comment",), 50)
+        ],
         "timeline": _timeline(db, sid),
         "cursors": {"meta": meta_max, "turn": turn_max},
         "memory": _memory_state(),
@@ -861,6 +930,7 @@ VIEW_HTML = """<!doctype html>
   .why{color:#a11;font-size:.9em;margin-left:1.5em;white-space:pre-wrap}
   .replaced{text-decoration:line-through;color:#999}
   li.tag-confirm{background:#e8f5e9}
+  li.tag-comment{background:#e8f1fb}
   li.tag-view,li.tag-view-action{background:#ede7f6}
   li.tag-plan,li.tag-plan-approval,li.tag-plan-progress{background:#e0f2f1}
   #plan-list{list-style:none;margin:0;padding:.4em .6em;border:1px solid #ddd;
@@ -896,6 +966,38 @@ VIEW_HTML = """<!doctype html>
   #aview table{border-collapse:collapse}
   #aview th,#aview td{border:1px solid #bbb;padding:.2em .5em;text-align:left}
   #aview th{background:#eef}
+  #issues{display:flex;flex-direction:column;gap:.5em;margin:.5em 0}
+  .issue{border:1px solid #ddd;border-left:4px solid #c70;border-radius:4px;
+         padding:.4em .7em;background:#fffdf5}
+  .issue.contested{border-left-color:#c33;background:#fff5f5}
+  .issue-head{display:flex;align-items:center;gap:.5em;flex-wrap:wrap}
+  .issue-text{margin:.15em 0 .3em;font-size:.95em}
+  .chip{display:inline-block;font-size:.72em;padding:.05em .55em;border-radius:9px;
+        border:1px solid #bbb;background:#f0f0f0;color:#555;font-family:ui-monospace,monospace}
+  .chip.warn{background:#f8d7da;border-color:#c33;color:#a11}
+  .chip.ok{background:#d4edda;border-color:#2a2;color:#161}
+  .chip.info{background:#cce5ff;border-color:#69c;color:#247}
+  .issue-btns button{font-size:.78em;padding:.1em .8em;border-radius:4px;border:1px solid #999;
+                     background:#eef;cursor:pointer}
+  #thread{list-style:none;margin:0;padding:.4em .6em;border:1px solid #ddd;border-radius:4px;
+          background:#fff;font-size:.88em;max-height:24em;overflow-y:auto}
+  #thread li{margin:.45em 0;padding:.3em .6em;border-radius:6px;background:#f6f6f6;
+             border-left:3px solid #bbb}
+  #thread .author{font-weight:bold;font-size:.85em;margin-right:.6em}
+  #thread .body{white-space:pre-wrap;word-break:break-word;display:block;margin-top:.1em}
+  #thread li.a-human{background:#e8f1fb;border-left-color:#369}
+  #thread li.a-human .author{color:#369}
+  #thread li.a-executor{background:#f3ecf9;border-left-color:#849}
+  #thread li.a-executor .author{color:#849}
+  #thread li.a-judge{background:#e9f6ee;border-left-color:#2a2}
+  #thread li.a-judge .author{color:#181}
+  #thread li.a-system{background:#f4f4f4;border-left-color:#999;color:#666}
+  #comment-form{display:flex;gap:.5em;margin:.5em 0;align-items:flex-start}
+  #comment-form textarea{flex:1;padding:.3em .5em;border:1px solid #999;border-radius:4px;
+                         font-family:inherit;font-size:.9em}
+  #comment-form select{padding:.25em;border:1px solid #999;border-radius:4px;font-size:.85em}
+  #comment-form button{padding:.3em 1.2em;border-radius:4px;border:1px solid #369;
+                       background:#dde9ff;cursor:pointer}
 </style></head><body>
 <h1>lispy view <span class="dot" id="conn"></span></h1>
 <div class="meta">scope: <span id="scope"></span> — session: <span id="sess">…</span></div>
@@ -920,8 +1022,11 @@ VIEW_HTML = """<!doctype html>
   <h2>plan <span class="note" id="plan-meta"></span></h2>
   <ol id="plan-list"></ol>
 </div>
-<div class="panels">
-  <div class="panel"><h2>R</h2><ul id="panel-R"></ul></div>
+<div id="issues-wrap">
+  <h2>R — requirements <span class="note">(委譲 = その R を goal に auto-step を起動)</span></h2>
+  <div id="issues"></div>
+</div>
+<div class="panels" style="grid-template-columns:1fr 1fr">
   <div class="panel"><h2>K</h2><ul id="panel-K"></ul></div>
   <div class="panel"><h2>S</h2><ul id="panel-S"></ul></div>
 </div>
@@ -931,6 +1036,18 @@ VIEW_HTML = """<!doctype html>
        background:#fafafa;border:1px solid #ddd;border-radius:4px;padding:.5em .7em;
        white-space:pre-wrap"></pre>
   <ul id="memory-files" style="font-size:.85em"></ul>
+</div>
+<div id="thread-wrap">
+  <h2>thread <span class="note">(human ↔ executor ↔ judge)</span></h2>
+  <ol id="thread"></ol>
+  <form id="comment-form">
+    <select id="comment-to">
+      <option value="executor">→ executor</option>
+      <option value="judge">→ judge</option>
+    </select>
+    <textarea id="comment-text" rows="2" placeholder="executor 宛は次の round 境界で注入、judge 宛は即応答"></textarea>
+    <button type="submit">送信</button>
+  </form>
 </div>
 <div id="aview-wrap" style="display:none">
   <h2>agent view <span class="note">(show-view による提示)</span></h2>
@@ -1046,17 +1163,8 @@ function renderPanels(st) {
   document.getElementById("sess").textContent =
     st.session_id === null ? "(all)" : (st.session_id || "(none)");
 
-  const R = document.getElementById("panel-R");
-  R.replaceChildren();
-  const active = (st.R || []).filter(r => !r.replaced);
-  const nRep = (st.R || []).length - active.length;
-  if (!active.length) R.append(el("li", "empty", "なし"));
-  for (const r of active.slice(-8)) {
-    const li = el("li");
-    li.append(el("span", "id", "#" + r.id + " "), document.createTextNode(r.head));
-    R.append(li);
-  }
-  if (nRep > 0) R.append(el("li", "empty", "(+" + nRep + " replaced)"));
+  renderIssues(st);
+  renderThread(st.comments || []);
 
   const K = document.getElementById("panel-K");
   K.replaceChildren();
@@ -1088,6 +1196,118 @@ function renderPanels(st) {
   renderAgentView(st.view || null);
   renderMemory(st.memory || null);
 }
+
+// --- R issue カード ---
+function renderIssues(st) {
+  const box = document.getElementById("issues");
+  box.replaceChildren();
+  const all = st.R || [];
+  const active = all.filter(r => !r.replaced);
+  const nRep = all.length - active.length;
+  if (!active.length) {
+    box.append(el("div", "empty", "R なし — (commit-R \\"...\\") で刻まれるとここに出る"));
+    return;
+  }
+  for (const r of active.slice(-12)) {
+    const card = el("div", "issue" + ((r.contested_by || []).length ? " contested" : ""));
+    const head = el("div", "issue-head");
+    head.append(el("span", "id", "#" + r.id));
+    if (r.judge === "b" && r.target) {
+      const c = el("span", "chip info", "refines #" + r.target);
+      if (r.reason) c.title = r.reason;
+      head.append(c);
+    }
+    if (r.judge === "c" && r.target) {
+      const c = el("span", "chip warn", "contradicts #" + r.target);
+      if (r.reason) c.title = r.reason;
+      head.append(c);
+    }
+    if ((r.refined_by || []).length)
+      head.append(el("span", "chip ok", "refined by " + r.refined_by.map(i => "#" + i).join(" ")));
+    if ((r.contested_by || []).length)
+      head.append(el("span", "chip warn", "contested by " + r.contested_by.map(i => "#" + i).join(" ")));
+    head.append(el("span", "ts", fmtTs(r.ts)));
+    const btns = el("span", "issue-btns");
+    const dg = el("button", "", "委譲 → executor");
+    dg.onclick = () => delegateGoal(r.id, r.head, dg);
+    btns.append(dg);
+    head.append(btns);
+    card.append(head, el("div", "issue-text", r.head || ""));
+    box.append(card);
+  }
+  if (nRep > 0) box.append(el("div", "empty", "(+" + nRep + " replaced)"));
+}
+
+async function delegateGoal(id, goal, btn) {
+  if (!confirm("R#" + id + " を goal に auto-step を起動する?\\n\\n" + goal)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch("/view/delegate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ goal: goal }),
+    }).then(x => x.json());
+    if (!r.ok) alert("委譲できない: " + (r.error || "?"));
+  } catch (e) {
+    alert("委譲の送信に失敗: " + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// --- comment thread (human ↔ executor ↔ judge) ---
+const threadSeen = new Set();
+
+function threadLi(ev) {
+  const author = ev.author || "?";
+  const li = el("li", "a-" + author);
+  li.append(el("span", "author", author),
+            el("span", "ts", fmtTs(ev.ts)),
+            el("span", "body", ev.text !== undefined ? ev.text : (ev.head || "")));
+  return li;
+}
+
+function appendThread(ev) {
+  const key = "meta:" + ev.id;
+  if (threadSeen.has(key)) return;
+  threadSeen.add(key);
+  const th = document.getElementById("thread");
+  const emp = th.querySelector(".empty");
+  if (emp) emp.remove();
+  const nearBottom = th.scrollTop + th.clientHeight >= th.scrollHeight - 40;
+  th.append(threadLi(ev));
+  while (th.children.length > 200) th.removeChild(th.firstChild);
+  if (nearBottom) th.scrollTop = th.scrollHeight;
+}
+
+function renderThread(list) {
+  const th = document.getElementById("thread");
+  th.replaceChildren();
+  threadSeen.clear();
+  if (!list.length) th.append(el("li", "empty", "コメントなし — 下のフォームから送る"));
+  for (const ev of list) appendThread(ev);
+  th.scrollTop = th.scrollHeight;
+}
+
+async function sendComment(e) {
+  e.preventDefault();
+  const ta = document.getElementById("comment-text");
+  const to = document.getElementById("comment-to").value;
+  const text = ta.value.trim();
+  if (!text) return;
+  try {
+    const r = await fetch("/view/comment", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: text, to: to }),
+    }).then(x => x.json());
+    if (r.ok) ta.value = "";
+    else alert("送信できない: " + (r.error || "?"));
+  } catch (err) {
+    alert("送信に失敗: " + err);
+  }
+}
+document.getElementById("comment-form").addEventListener("submit", sendComment);
 
 function renderDiffLines(lines, file) {
   const box = el("div", "diff");
@@ -1249,6 +1469,7 @@ function connect(cur) {
     if (ev.type === "session") { if (es) { es.close(); es = null; } init(); return; }
     if (ev.type === "gate" || ev.type === "view") { refreshPanels(); return; }
     appendTimeline(ev);
+    if (ev.src === "meta" && ev.tag === "comment") appendThread(ev);
     // 要約カウンタの即時更新 (真値は refreshPanels の再取得で揃う)
     if (ev.src === "turn" && ev.tag === "assistant") bumpSummary("st-steps");
     if (ev.src === "turn" && ev.tag === "tool") bumpSummary("st-tools");

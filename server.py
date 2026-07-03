@@ -15,6 +15,11 @@ endpoints:
   GET  /view/events     SSE — ledger (meta_events) + turns の追記 + gate/view の変化通知
   POST /view/gate/<id>  pending gate の解決。 body = "approve" | "deny" (先着採用)
   POST /view/action     agent view の button 押下 (action 記号 + inputs) を queue に積む
+  POST /view/comment    thread へのコメント。 body = {"text", "to": "executor"|"judge"} —
+                        executor 宛は queue (auto-step が round 境界で注入)、
+                        judge 宛は judge LLM が ledger を根拠に即応答 (別スレッド)
+  POST /view/delegate   body = {"goal"} — goal を auto-step で自走させる (別スレッド、
+                        評価が実行中なら 409)
   POST /reset           env を作り直す (旧 session を close → 新 session を open)
 
 CLI:
@@ -365,7 +370,9 @@ def _eval_src(env: lispy.Env, src: str) -> dict:
                 "result": _value_text(last) if last is not None else None,
                 "stdout": buf.getvalue(),
             }
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit も捕まえる — host.get_client が LLM 未設定で投げる。
+            # 素通しすると handler / delegate スレッドが応答を返さず死ぬ。
             return {
                 "ok": False,
                 "error": f"{type(e).__name__}: {e}",
@@ -376,6 +383,75 @@ def _eval_src(env: lispy.Env, src: str) -> dict:
             # 残すと以後の /eval が全部即死する (REPL 側の finally と同じ扱い)。
             if env.interrupt is not None:
                 env.interrupt.clear()
+
+
+def _log_comment(sid: str | None, author: str, to: str, text: str) -> None:
+    """thread への 1 コメントを ledger (kind=comment) に刻む。 表示は /view の SSE が拾う。"""
+    view._log_meta_rw("comment", sid, json.dumps(
+        {"author": author, "to": to, "text": text[:4000]}, ensure_ascii=False))
+
+
+JUDGE_REPLY_SYSTEM = (
+    "あなたは lispy ハーネスの検証者 (judge)。人間がブラウザの thread から質問している。"
+    "与えられた R (要件台帳)・計画・直近の作業ログだけを根拠に、日本語で簡潔に (5 行以内で) 答える。"
+    "根拠がログに無いことは「ログに根拠がない」と言う。推測を事実のように書かない。tool は呼ばない。"
+)
+
+
+def _judge_reply(env_box: list, question: str) -> None:
+    """judge 宛コメントへの応答 (人間 ↔ judge の直接チャネル)。 executor の loop を
+    経由しない — _LOCK も取らない。 読みは read-only 接続、 書きは _log_meta_rw。"""
+    sid = env_box[0].record_sid
+    try:
+        db = view.open_ro()
+        try:
+            rows = db.execute(
+                "SELECT role, content FROM turns WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT 40", (sid,)).fetchall()
+            transcript = "\n".join(
+                f"[{role}] {(content or '')[:600]}" for role, content in reversed(rows))
+            actives = [r for r in view._rks(db, sid)["R"] if not r["replaced"]][-15:]
+            r_text = "\n".join(f"R#{r['id']}: {r['head']}" for r in actives) or "(なし)"
+            p = host.plan_latest(db)
+            plan_text = f"{p.get('goal', '?')} ({len(p.get('steps') or [])} steps)" if p else "(なし)"
+        finally:
+            db.close()
+        client = host.get_judge_client()
+        resp = client.chat.completions.create(
+            model=host.judge_model(),
+            messages=[
+                {"role": "system", "content": JUDGE_REPLY_SYSTEM},
+                {"role": "user", "content":
+                    f"R (要件台帳):\n{r_text}\n\n計画: {plan_text}\n\n"
+                    f"直近の作業ログ:\n{transcript}\n\n人間の質問: {question}"},
+            ],
+            max_tokens=host.JUDGE_MAX_TOKENS,
+        )
+        out = (resp.choices[0].message.content or "").strip() or "(空応答)"
+        _log_comment(sid, "judge", "human", out)
+    except (Exception, SystemExit) as e:
+        # host.get_client 系は未設定で SystemExit を投げる — thread を殺さず thread に残す
+        _log_comment(sid, "system", "human", f"(judge 応答失敗: {type(e).__name__}: {e})")
+
+
+def _delegate_run(env_box: list, goal: str) -> None:
+    """/view/delegate の実行体。 _eval_src が _LOCK を取るので他の評価と直列化される。
+    終了 (正常/異常) は必ず system コメントとして thread に残す — 黙って消えない。"""
+    src = f"(auto-step env {json.dumps(goal, ensure_ascii=False)})"
+    try:
+        r = _eval_src(env_box[0], src)
+    except (Exception, SystemExit) as e:
+        r = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    sid = env_box[0].record_sid
+    if r.get("ok"):
+        # 正常終了時の返り値は最終 assistant Turn の repr のことが多い — 中身は既に
+        # post-round-report が thread に流している。 Turn repr はノイズなので落とす。
+        result = r.get("result") or ""
+        if result.startswith("Turn("):
+            result = "(最終報告は上の executor コメントを参照)"
+        _log_comment(sid, "system", "human", f"[委譲 run 終了] {result[:500] or '(結果なし)'}")
+    else:
+        _log_comment(sid, "system", "human", f"[委譲 run 失敗] {str(r.get('error'))[:500]}")
 
 
 def _resume_or_new(sid_arg: str) -> str:
@@ -636,6 +712,53 @@ def make_handler(env_box: list[lispy.Env]):
                 view._log_meta_rw("view-action", env_box[0].record_sid, json.dumps(
                     {"action": action, "inputs": inputs}, ensure_ascii=False))
                 self._send_json(200, {"ok": True})
+                return
+            if path == "/view/comment":
+                # thread へのコメント。 ledger (kind=comment) が真実 — SSE が全タブに配る。
+                # executor 宛は配達 queue にも積む (auto-step の round 境界で注入)。
+                # judge 宛は executor の loop を経由せず judge LLM が別スレッドで応答する。
+                try:
+                    body = json.loads(self._read_body() or "{}")
+                    text = str(body.get("text", "")).strip()
+                    to = str(body.get("to", "executor"))
+                except json.JSONDecodeError as e:
+                    self._send_json(400, {"ok": False, "error": f"bad body: {e}"})
+                    return
+                if not text:
+                    self._send_json(400, {"ok": False, "error": "text required"})
+                    return
+                if to not in ("executor", "judge"):
+                    self._send_json(400, {"ok": False, "error": 'to must be "executor" or "judge"'})
+                    return
+                if to == "executor" and not view.COMMENTS.push(text[:4000]):
+                    self._send_json(429, {"ok": False, "error": "comment queue full"})
+                    return
+                _log_comment(env.record_sid, "human", to, text)
+                if to == "judge":
+                    threading.Thread(target=_judge_reply, args=(env_box, text), daemon=True).start()
+                self._send_json(200, {"ok": True, "to": to})
+                return
+            if path == "/view/delegate":
+                # R カードの「委譲」 — goal を auto-step で自走させる。 実行は別スレッド
+                # (_eval_src が _LOCK で直列化)。 既に評価中なら 409 で断る — queue に
+                # 黙って積むと「押したのに何も起きない」時間が生まれる。
+                try:
+                    body = json.loads(self._read_body() or "{}")
+                    goal = " ".join(str(body.get("goal", "")).split()).strip()
+                except json.JSONDecodeError as e:
+                    self._send_json(400, {"ok": False, "error": f"bad body: {e}"})
+                    return
+                if not goal:
+                    self._send_json(400, {"ok": False, "error": "goal required"})
+                    return
+                if _LOCK.locked():
+                    self._send_json(409, {"ok": False, "error":
+                        "評価が実行中 — 完了を待つか、executor 宛コメントで指示する"})
+                    return
+                _log_comment(env.record_sid, "human", "executor", f"[委譲] auto-step 起動: {goal}")
+                threading.Thread(target=_delegate_run, args=(env_box, goal[:2000]),
+                                 daemon=True).start()
+                self._send_json(200, {"ok": True, "goal": goal[:200]})
                 return
             if path == "/interrupt":
                 # 走行中の agent loop を step 境界で止める。 _LOCK は取らない —
