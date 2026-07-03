@@ -2,7 +2,7 @@
 
 走らせながら評価規則を書き換えられる agent 評価器。 + R/K/S 三層 ledger (= **RDD: Requirement-Don't-Die**)。
 
-詳細・全 primitive・設計理由は [docs/reference.md](docs/reference.md)。 ここは **1 日の動かし方** だけ。
+システム仕様の一望は [SPEC.md](SPEC.md)、 詳細・全 primitive・設計理由は [docs/reference.md](docs/reference.md)。 ここは **1 日の動かし方** だけ。
 
 ## RDD とは
 

@@ -3,6 +3,24 @@
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 風。 バージョン番号は付けず、 直近変更を上、
 段階的な節 (history milestone) を下に並べる。 細かい diff は `git log` が一次資料。
 
+## 2026-07-03 (3) — SPEC.md 新設 + 解決の階梯の明文化
+
+仕様が README / docs/reference.md / CHANGELOG / SYSTEM_PROMPT / docstring に分散して
+全体像を見失いがちだったため、 規範仕様書として一望できる SPEC.md を切り出した。
+あわせて 「skill でできることに自己書き換えを使わない」 という原則を明文化した。
+
+### Added
+- **SPEC.md** — システム仕様の一望 (what / invariants)。 設計原則 / 実行モデル / agent loop /
+  define-gate / skills / R/K/S ledger / 長期記憶 / ハーネス / 設定 / 安全機構の総覧の 10 節。
+  使い方・Recipe・全 primitive は従来どおり docs/reference.md (役割分担)
+- **解決の階梯 (そのまま → skill → 自己書き換え)** — SYSTEM_PROMPT の (3) 節に追記。
+  loop 規則の書き換えは最終手段 — 手順の改善はまず SKILL.md の更新で行い、 skill では
+  実現できない場合 (毎回機械的に効く保証が必要 / 挙動が loop 規則そのもの / 判定基準の変更)
+  に限り define を提案する。 SPEC.md の設計原則 2 にも同じ階梯を記載
+
+### Changed
+- README.md / docs/reference.md 冒頭に SPEC.md へのリンクを追記 (3 文書の役割分担を明示)
+
 ## 2026-07-03 — plan mode の tool_call 化 + stale plan ガード
 
 ds4 (ローカル DeepSeek) での実機テストで発見した 3 件。 小型モデルは (a) S 式を散文に

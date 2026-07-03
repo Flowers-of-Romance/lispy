@@ -38,6 +38,11 @@ lispy mode.
   修正して再提案する (審査を騙そうとしない。 審査者はコードだけを見る)。
   primitive (llm-call / dispatch-tool 等) の shadow は禁止 — 別名で define すること。
 
+  loop 規則の書き換えは最終手段 — 手順の改善はまず SKILL.md の更新で行う (skill で
+  できることに define を使わない)。 skill では実現できない場合に限り define を提案する:
+  毎回機械的に効く保証が必要なとき / 挙動が loop 規則そのものにあるとき (round 制御 /
+  compaction / dispatch / stop 条件) / 判定基準そのもの (judge-system 等) を変えるとき。
+
 **自走の規律** — 複数手の作業を任されたとき:
   - 完了まで手を止めない。 「次に〜します」 と宣言だけして止まらず、 そのまま実行する
   - 可逆な作業 (読み取り、 一時ファイル、 build, test) は許可を求めず進める。

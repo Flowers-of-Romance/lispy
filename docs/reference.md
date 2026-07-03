@@ -4,6 +4,8 @@
 
 設計と実装と評価が同じ層で起きる場所。plan / implement / evaluate の分離がない。
 
+(システム仕様の一望は [../SPEC.md](../SPEC.md)。 ここは全 primitive・使い方・設計理由のリファレンス。)
+
 **agent loop が S 式の binding** 
 
 ```lisp
