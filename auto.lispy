@@ -14,6 +14,33 @@
 ;;   - agent-step / judge-done / auto-renew は (lookup ...) で late-bind —
 ;;     走行中に (define agent-step ...) で書き換えれば auto-step も即それを使う
 ;;   - turns が伸びすぎたら要約して (renew ...) — Claude Code の auto-compaction 相当
+;;   - /view の thread と接続: 人間のコメント (POST /view/comment) は round 境界で
+;;     system-reminder に注入、 executor の round 報告と judge の verdict は
+;;     post-comment で thread に流れる (view.py が無ければ全部 no-op)
+
+;; --- thread (/view の human ↔ executor ↔ judge スレッド) との接続 ---
+;; view.py が無い / server 外で走っている場合は黙って no-op — 自走は止めない。
+(define thread-post
+  (lambda (author text)
+    (try (post-comment author text) (catch (e) #f))))
+
+;; executor の round 報告を thread に流す。 r が turn でない場合も落とさない。
+(define post-round-report
+  (lambda (r)
+    (try (thread-post "executor" (turn-content r)) (catch (e) #f))))
+
+;; ブラウザからの executor 宛コメント (未配達分)。 無ければ ""。
+(define pending-comments
+  (lambda ()
+    (try (view-comments) (catch (e) ""))))
+
+;; round 境界の system-reminder に差し込む形に整形。
+(define comments-reminder
+  (lambda ()
+    (let ((cs (pending-comments)))
+      (if (eq? cs "")
+          ""
+          (string-append "\n人間からの thread コメント (最優先で考慮すること):\n" cs)))))
 
 ;; --- 判定者の persona ---
 ;; 会話履歴 = 作業ログを丸ごと見せて、 goal との照合だけをさせる。
@@ -34,9 +61,12 @@
                    "\nここまでの作業ログ (上の会話履歴) を証拠として、この goal は達成済みか?")))
                  'max-tokens 512)))
         (let ((v (string-trim (turn-content r))))
-          (if (eq? v "")
-              "NEXT: (検証者の応答が空だった。作業を続け、完了したと考えるなら根拠となる tool 実行結果を明示すること)"
-              v))))))
+          (let ((verdict (if (eq? v "")
+                             "NEXT: (検証者の応答が空だった。作業を続け、完了したと考えるなら根拠となる tool 実行結果を明示すること)"
+                             v)))
+            (begin
+              (thread-post "judge" verdict)
+              verdict)))))))
 
 ;; 判定文字列が DONE か。 prefix 一致のみ ("DONE." "**DONE**" は許容)。
 ;; 文中に DONE を含むだけの応答 (「まだ DONE ではない」等) を誤って完了扱いしない —
@@ -124,20 +154,33 @@
                 ;; ちょうど max-rounds 回 (0 始まりだと 1 round 余分に走る off-by-one になる)
                 ((lambda (input n)
                    (let ((r ((lookup "agent-step") env input)))
-                     (if (>= n max-rounds)
-                         r
-                         (let ((verdict ((lookup "judge-done") env goal)))
-                           (if (done-verdict? verdict)
-                               r
-                               (begin
-                                 (if (> (turn-count) renew-at)
-                                     ((lookup "auto-renew") goal)
-                                     #f)
-                                 (recur (string-append
-                                          "<system-reminder>検証者の判定 (round " n "/" max-rounds "): "
-                                          verdict
-                                          "\n未達成。NEXT の指示に従って作業を続けること。完了したと判断したら、根拠となる tool の実行結果を明示すること。</system-reminder>")
-                                        (+ n 1))))))))
+                     (begin
+                       (post-round-report r)
+                       (if (>= n max-rounds)
+                           r
+                           (let ((verdict ((lookup "judge-done") env goal)))
+                             (if (done-verdict? verdict)
+                                 ;; DONE でも人間の未処理コメントが残っていたら閉じない —
+                                 ;; 対応させてから再判定 (未解決コメントは close をブロックする)
+                                 (let ((cs (comments-reminder)))
+                                   (if (eq? cs "")
+                                       r
+                                       (recur (string-append
+                                                "<system-reminder>検証者は DONE と判定したが、人間からの未処理コメントが残っている。内容に対応してから完了すること。"
+                                                cs
+                                                "</system-reminder>")
+                                              (+ n 1))))
+                                 (begin
+                                   (if (> (turn-count) renew-at)
+                                       ((lookup "auto-renew") goal)
+                                       #f)
+                                   (recur (string-append
+                                            "<system-reminder>検証者の判定 (round " n "/" max-rounds "): "
+                                            verdict
+                                            "\n未達成。NEXT の指示に従って作業を続けること。完了したと判断したら、根拠となる tool の実行結果を明示すること。"
+                                            (comments-reminder)
+                                            "</system-reminder>")
+                                          (+ n 1)))))))))
                  (string-append
                    "<system-reminder>計画が承認された。実行フェーズに移る。以下の計画に従うこと。"
                    "ステップを終えるたびに plan_step_done tool (n=ステップ番号) で進捗を刻む。"
