@@ -3750,7 +3750,9 @@ def _propose_plan_tool(args: dict, env: Env) -> str:
     raw = args.get("steps")
     if not isinstance(raw, list):
         return "(propose_plan: steps は {what, why} の配列)"
-    steps = [[st.get("what", ""), st.get("why", "")] for st in raw if isinstance(st, dict)]
+    if not all(isinstance(st, dict) for st in raw):
+        return "(propose_plan: steps の各要素は {what, why} の object — 黙って捨てると計画が縮む)"
+    steps = [[st.get("what", ""), st.get("why", "")] for st in raw]
     return str(fn(str(args.get("goal", "")), steps))
 
 
