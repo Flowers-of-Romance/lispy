@@ -165,7 +165,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
             return _SPEC_HTML_TEMPLATE.format(
                 scope_label="(no session)",
                 header_meta="env.record_sid が無く、 ?session= も未指定",
-                scope_switch=_render_scope_switch("current"),
+                scope_switch=_render_scope_switch(),
                 body='<p class="empty">no session selected</p>',
             )
         rows = db.execute(
@@ -181,7 +181,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
         return _SPEC_HTML_TEMPLATE.format(
             scope_label=scope_label,
             header_meta="no R/K/S/artifact events yet",
-            scope_switch=_render_scope_switch(session_filter),
+            scope_switch=_render_scope_switch(),
             body='<p class="empty">何も積まれてない。 (commit-R ...) (commit-S ...) 等を打って戻る</p>',
         )
 
@@ -324,7 +324,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
     return _SPEC_HTML_TEMPLATE.format(
         scope_label=html.escape(scope_label),
         header_meta=html.escape(header_meta),
-        scope_switch=_render_scope_switch(session_filter),
+        scope_switch=_render_scope_switch(),
         body=body,
     )
 
@@ -348,14 +348,14 @@ def _render_event_table(events: list, kind: str) -> str:
     )
 
 
-def _render_scope_switch(current: str) -> str:
+def _render_scope_switch() -> str:
     """ページ間ナビ (view / spec / sessions) + spec の current/all 切替。
     /spec からも /view に戻れるよう横断リンクを常に出す。"""
     return (
-        f'<a href="/view">view</a>'
-        f'<a href="/sessions">sessions</a>'
-        f'<a href="/spec">spec: current</a>'
-        f'<a href="/spec?session=all">spec: all</a>'
+        '<a href="/view">view</a>'
+        '<a href="/sessions">sessions</a>'
+        '<a href="/spec">spec: current</a>'
+        '<a href="/spec?session=all">spec: all</a>'
     )
 
 
@@ -367,7 +367,7 @@ def _render_sessions_html() -> str:
     except Exception as e:
         return _SPEC_HTML_TEMPLATE.format(
             scope_label="sessions", header_meta=f"db open: {html.escape(str(e))}",
-            scope_switch=_render_scope_switch("sessions"), body="")
+            scope_switch=_render_scope_switch(), body="")
     try:
         rows = view.sessions_list(db)
     finally:
@@ -379,7 +379,7 @@ def _render_sessions_html() -> str:
         if v.get("done"):
             return '<span style="color:#1a7a34">達成 ✅</span>'
         nxt = html.escape(v.get("next") or "")
-        return f'<span style="color:#b26a00">未達 ⏳</span>' + (
+        return '<span style="color:#b26a00">未達 ⏳</span>' + (
             f'<div class="id">NEXT: {nxt}</div>' if nxt else "")
 
     trs = []
@@ -407,7 +407,7 @@ def _render_sessions_html() -> str:
     return _SPEC_HTML_TEMPLATE.format(
         scope_label="sessions",
         header_meta=f"{len(rows)} sessions — 行クリックでそのセッションの view / spec へ",
-        scope_switch=_render_scope_switch("sessions"),
+        scope_switch=_render_scope_switch(),
         body=body,
     )
 

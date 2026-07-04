@@ -837,20 +837,22 @@ def _latest_verdict(db: sqlite3.Connection, sid: str | None) -> dict | None:
     """最新の judge verdict (kind=comment で author=judge)。 達成バッジの真値。
     text が DONE 始まりなら達成、 NEXT: 始まりなら未達 (+次の一手)。 judge 発言が
     無ければ None (未判定)。"""
+    # judge 発言だけを窓に入れる — human/executor コメントが大量に積まれても
+    # 最新 verdict を取りこぼさないよう SQL 側で author=judge に絞る。
     if sid is None:
         rows = db.execute(
             "SELECT payload FROM meta_events WHERE kind = 'comment' "
-            "ORDER BY id DESC LIMIT 50").fetchall()
+            "AND json_extract(payload, '$.author') = 'judge' "
+            "ORDER BY id DESC LIMIT 20").fetchall()
     else:
         rows = db.execute(
             "SELECT payload FROM meta_events WHERE kind = 'comment' AND session_id = ? "
-            "ORDER BY id DESC LIMIT 50", (sid,)).fetchall()
+            "AND json_extract(payload, '$.author') = 'judge' "
+            "ORDER BY id DESC LIMIT 20", (sid,)).fetchall()
     for (payload,) in rows:
         try:
             p = json.loads(payload or "")
         except Exception:
-            continue
-        if str(p.get("author") or "") != "judge":
             continue
         text = str(p.get("text") or "").strip()
         stripped = text.lstrip()
