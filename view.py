@@ -846,19 +846,20 @@ def _classify_verdict(text: Any) -> dict | None:
 
 def _latest_verdict(db: sqlite3.Connection, sid: str | None) -> dict | None:
     """最新の judge verdict (kind=comment で author=judge)。 達成バッジの真値。
-    judge 発言が無ければ None (未判定)。"""
-    # judge 発言だけを窓に入れる — human/executor コメントが大量に積まれても
-    # 最新 verdict を取りこぼさないよう SQL 側で author=judge に絞る。
+    judge 発言が無ければ None (未判定)。 sessions_list の一括版と意味論を揃える —
+    judge 発言だけを新しい順に舐め、 最初に DONE/NEXT へ分類できた行を採る
+    (自由発言が何件積まれても最新 verdict を取りこぼさない。 LIMIT は掛けない —
+    judge 発言は元々少なく、 SQL 側で author=judge に絞ってある)。"""
     if sid is None:
         rows = db.execute(
             "SELECT payload FROM meta_events WHERE kind = 'comment' "
             "AND json_extract(payload, '$.author') = 'judge' "
-            "ORDER BY id DESC LIMIT 20").fetchall()
+            "ORDER BY id DESC").fetchall()
     else:
         rows = db.execute(
             "SELECT payload FROM meta_events WHERE kind = 'comment' AND session_id = ? "
             "AND json_extract(payload, '$.author') = 'judge' "
-            "ORDER BY id DESC LIMIT 20", (sid,)).fetchall()
+            "ORDER BY id DESC", (sid,)).fetchall()
     for (payload,) in rows:
         try:
             p = json.loads(payload or "")
