@@ -165,7 +165,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
             return _SPEC_HTML_TEMPLATE.format(
                 scope_label="(no session)",
                 header_meta="env.record_sid が無く、 ?session= も未指定",
-                scope_switch=_render_scope_switch("current"),
+                scope_switch=_render_scope_switch(),
                 body='<p class="empty">no session selected</p>',
             )
         rows = db.execute(
@@ -181,7 +181,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
         return _SPEC_HTML_TEMPLATE.format(
             scope_label=scope_label,
             header_meta="no R/K/S/artifact events yet",
-            scope_switch=_render_scope_switch(session_filter),
+            scope_switch=_render_scope_switch(),
             body='<p class="empty">何も積まれてない。 (commit-R ...) (commit-S ...) 等を打って戻る</p>',
         )
 
@@ -324,7 +324,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
     return _SPEC_HTML_TEMPLATE.format(
         scope_label=html.escape(scope_label),
         header_meta=html.escape(header_meta),
-        scope_switch=_render_scope_switch(session_filter),
+        scope_switch=_render_scope_switch(),
         body=body,
     )
 
@@ -348,11 +348,67 @@ def _render_event_table(events: list, kind: str) -> str:
     )
 
 
-def _render_scope_switch(current: str) -> str:
-    """scope 切替リンク (current / all)。"""
+def _render_scope_switch() -> str:
+    """ページ間ナビ (view / spec / sessions) + spec の current/all 切替。
+    /spec からも /view に戻れるよう横断リンクを常に出す。"""
     return (
-        f'<a href="/spec">current session</a>'
-        f'<a href="/spec?session=all">all sessions</a>'
+        '<a href="/view">view</a>'
+        '<a href="/sessions">sessions</a>'
+        '<a href="/spec">spec: current</a>'
+        '<a href="/spec?session=all">spec: all</a>'
+    )
+
+
+def _render_sessions_html() -> str:
+    """セッション一覧ページ。 各行から /view?session=<id> / /spec?session=<id> に飛べる。
+    データは view.sessions_list (host.cmd_list の SQL + goal + judge verdict)。"""
+    try:
+        db = view.open_ro()
+    except Exception as e:
+        return _SPEC_HTML_TEMPLATE.format(
+            scope_label="sessions", header_meta=f"db open: {html.escape(str(e))}",
+            scope_switch=_render_scope_switch(), body="")
+    try:
+        rows = view.sessions_list(db)
+    finally:
+        db.close()
+
+    def _badge(v: dict | None) -> str:
+        if v is None:
+            return '<span style="color:#888">—</span>'
+        if v.get("done"):
+            return '<span style="color:#1a7a34">達成 ✅</span>'
+        nxt = html.escape(v.get("next") or "")
+        return '<span style="color:#b26a00">未達 ⏳</span>' + (
+            f'<div class="id">NEXT: {nxt}</div>' if nxt else "")
+
+    trs = []
+    for s in rows:
+        sid = s["id"]
+        when = host.local_from_ts(s["started_at"]).strftime("%Y-%m-%d %H:%M")
+        goal = html.escape(s["goal"] or s["title"] or "")
+        dom = f'[{html.escape(s["domain"])}]' if s["domain"] else ""
+        trs.append(
+            "<tr>"
+            f'<td class="id">{when}</td>'
+            f'<td><a href="/view?session={html.escape(sid)}">{html.escape(sid[:16])}</a>'
+            f' <span class="id">· <a href="/spec?session={html.escape(sid)}">spec</a></span></td>'
+            f"<td>{s['turns']} turns</td>"
+            f"<td>{_badge(s.get('verdict'))}</td>"
+            f"<td>{dom} {goal}</td>"
+            "</tr>"
+        )
+    body = (
+        "<h2>sessions</h2>"
+        '<table><thead><tr><th>開始</th><th>session</th><th>turns</th>'
+        "<th>達成?</th><th>goal / title</th></tr></thead>"
+        f"<tbody>{''.join(trs) or '<tr><td colspan=5 class=empty>なし</td></tr>'}</tbody></table>"
+    )
+    return _SPEC_HTML_TEMPLATE.format(
+        scope_label="sessions",
+        header_meta=f"{len(rows)} sessions — 行クリックでそのセッションの view / spec へ",
+        scope_switch=_render_scope_switch(),
+        body=body,
     )
 
 
@@ -545,6 +601,13 @@ def make_handler(env_box: list[lispy.Env]):
                 return
             if path == "/view":
                 self._send_html(200, view.VIEW_HTML)
+                return
+            if path == "/sessions":
+                try:
+                    self._send_html(200, _render_sessions_html())
+                except Exception as e:
+                    self._send_html(
+                        500, f"<h1>sessions error</h1><pre>{html.escape(str(e))}</pre>")
                 return
             if path == "/view/state":
                 # 読み取り専用接続で ledger を読む。 _LOCK は取らない —
