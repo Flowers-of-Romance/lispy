@@ -549,8 +549,9 @@ def _meta_to_event(rid: int, ts: float, sid: str | None, kind: str, payload: str
         try:
             p = json.loads(payload)
             rep = f" (replaces #{p['replaces']})" if p.get("replaces") else ""
+            rat = f" — 改版理由: {p['rationale']}" if p.get("rationale") else ""
             ev["head"] = _head(
-                f"plan proposed: {p.get('goal', '?')} ({len(p.get('steps') or [])} steps){rep}")
+                f"plan proposed: {p.get('goal', '?')} ({len(p.get('steps') or [])} steps){rep}{rat}")
             return ev
         except Exception:
             pass
@@ -630,7 +631,7 @@ def _recent_kind_rows(db: sqlite3.Connection, sid: str | None,
 
 def _parse_r_annotations(payload: str) -> dict:
     """R payload の @judge= 系注釈行を読む (commit-R の auto-judge が書く形式)。"""
-    out: dict[str, Any] = {"judge": None, "target": None, "reason": None}
+    out: dict[str, Any] = {"judge": None, "target": None, "reason": None, "impact": None}
     for ln in (payload or "").split("\n")[1:]:
         if ln.startswith("@judge="):
             out["judge"] = ln.split("=", 1)[1].strip()[:8]
@@ -641,6 +642,8 @@ def _parse_r_annotations(payload: str) -> dict:
                 pass
         elif ln.startswith("@judge-reason="):
             out["reason"] = ln.split("=", 1)[1].strip()[:200]
+        elif ln.startswith("@judge-impact="):
+            out["impact"] = ln.split("=", 1)[1].strip()[:200]
     return out
 
 
@@ -672,6 +675,7 @@ def _rks(db: sqlite3.Connection, sid: str | None) -> dict:
             "judge": ann_by_id[rid]["judge"],
             "target": ann_by_id[rid]["target"],
             "reason": ann_by_id[rid]["reason"],
+            "impact": ann_by_id[rid]["impact"],
             "contested_by": contested.get(rid, []),
             "refined_by": refined.get(rid, []),
         }
@@ -748,6 +752,7 @@ def plan_state(db: sqlite3.Connection) -> dict | None:
     return {
         "id": plan_id, "goal": _head(p.get("goal", "")),
         "status": status, "source": source, "replaces": p.get("replaces"),
+        "rationale": _head(p.get("rationale") or ""),
         "steps": steps,
         "done": sum(1 for s in steps if s["done"]), "total": len(steps),
     }
@@ -814,6 +819,73 @@ def _memory_state() -> dict | None:
     return {"dir": str(mem_dir), "files": files, "index": index_text}
 
 
+def _latest_intent(db: sqlite3.Connection, sid: str | None) -> str | None:
+    """この session の最新 session-intent (kind=intent の payload)。 goal パネル用。
+    scope=all のときは箱全体の最新 1 件。"""
+    if sid is None:
+        row = db.execute(
+            "SELECT payload FROM meta_events WHERE kind = 'intent' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+    else:
+        row = db.execute(
+            "SELECT payload FROM meta_events WHERE kind = 'intent' AND session_id = ? "
+            "ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+    return (row[0] or "").strip() if row else None
+
+
+def _latest_verdict(db: sqlite3.Connection, sid: str | None) -> dict | None:
+    """最新の judge verdict (kind=comment で author=judge)。 達成バッジの真値。
+    text が DONE 始まりなら達成、 NEXT: 始まりなら未達 (+次の一手)。 judge 発言が
+    無ければ None (未判定)。"""
+    if sid is None:
+        rows = db.execute(
+            "SELECT payload FROM meta_events WHERE kind = 'comment' "
+            "ORDER BY id DESC LIMIT 50").fetchall()
+    else:
+        rows = db.execute(
+            "SELECT payload FROM meta_events WHERE kind = 'comment' AND session_id = ? "
+            "ORDER BY id DESC LIMIT 50", (sid,)).fetchall()
+    for (payload,) in rows:
+        try:
+            p = json.loads(payload or "")
+        except Exception:
+            continue
+        if str(p.get("author") or "") != "judge":
+            continue
+        text = str(p.get("text") or "").strip()
+        stripped = text.lstrip()
+        if stripped.upper().startswith("DONE"):
+            return {"done": True, "next": ""}
+        if stripped.upper().startswith("NEXT:"):
+            return {"done": False, "next": _head(stripped[5:].strip())}
+        # judge の自由発言 (@judge 宛の応答等) は verdict でない — 次を見る
+    return None
+
+
+def sessions_list(db: sqlite3.Connection, limit: int = 200) -> list[dict]:
+    """セッション一覧 (/sessions ページ用)。 host.cmd_list と同じ土台に
+    goal (session-intent) と最新 judge verdict を足す。 開始時刻降順。"""
+    rows = db.execute(
+        """
+        SELECT s.id, s.started_at, s.title, s.domain, COUNT(t.id) AS n
+        FROM sessions s LEFT JOIN turns t ON t.session_id = s.id
+        GROUP BY s.id ORDER BY s.started_at DESC LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    out = []
+    for sid, ts, title, domain, n in rows:
+        intent = _latest_intent(db, sid)
+        verdict = _latest_verdict(db, sid)
+        out.append({
+            "id": sid, "started_at": ts, "title": title or "",
+            "domain": domain or "", "turns": n,
+            "goal": _head(intent or ""),
+            "verdict": verdict,
+        })
+    return out
+
+
 def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
     """初期スナップショット。 cursors は timeline より先に読む — 隙間の行は SSE 側と
     重複して届く可能性があるが、 client が (src, id) で dedupe する (欠落よりまし)。"""
@@ -823,6 +895,8 @@ def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
         "ok": True,
         "scope": scope,
         "session_id": sid,
+        "intent": _latest_intent(db, sid),
+        "verdict": _latest_verdict(db, sid),
         "plan": plan_state(db),
         "gates": [
             _meta_to_event(*row)
@@ -912,10 +986,19 @@ VIEW_HTML = """<!doctype html>
   li.tag-tool .tag{color:#a60}
   li.rejected{background:#f8d7da}
   li.rejected .head{color:#a11;font-weight:bold}
+  #goal-wrap{margin:1em 0;padding:.7em 1em;border:1px solid #ddd;border-radius:8px;
+             background:#fbfbfd}
+  #goal-badge{font-size:1.1em;font-weight:bold;margin-bottom:.2em}
+  #goal-badge.done{color:#1a7a34}
+  #goal-badge.pending{color:#b26a00}
+  #goal-badge.unknown{color:#888}
+  #goal-text{font-size:1.05em;color:#222}
+  #goal-next{margin-top:.25em}
   .stats{display:flex;gap:.8em;margin:1em 0;flex-wrap:wrap}
   .stat{display:flex;flex-direction:column;align-items:center;min-width:7.5em;
         padding:.5em .8em;border:1px solid #ddd;border-radius:6px;background:#fafafa;
-        text-decoration:none;color:#222}
+        text-decoration:none;color:#222;cursor:pointer}
+  .stat.dead{opacity:.5;cursor:default}
   .stat b{font-size:1.6em;line-height:1.2}
   .stat span{font-size:.75em;color:#666}
   .stat.alert{background:#f8d7da;border-color:#c33}
@@ -972,6 +1055,7 @@ VIEW_HTML = """<!doctype html>
   .issue.contested{border-left-color:#c33;background:#fff5f5}
   .issue-head{display:flex;align-items:center;gap:.5em;flex-wrap:wrap}
   .issue-text{margin:.15em 0 .3em;font-size:.95em}
+  .issue-why{color:#777;font-size:.82em;margin:.1em 0 0 .3em}
   .chip{display:inline-block;font-size:.72em;padding:.05em .55em;border-radius:9px;
         border:1px solid #bbb;background:#f0f0f0;color:#555;font-family:ui-monospace,monospace}
   .chip.warn{background:#f8d7da;border-color:#c33;color:#a11}
@@ -1004,7 +1088,13 @@ VIEW_HTML = """<!doctype html>
 <div class="switch">
   <a href="/view">current session</a>
   <a href="/view?session=all">all sessions</a>
+  <a href="/sessions">sessions</a>
   <a href="/spec">spec</a>
+</div>
+<div id="goal-wrap" style="display:none">
+  <div id="goal-badge"></div>
+  <div id="goal-text"></div>
+  <div id="goal-next" class="note"></div>
 </div>
 <div class="stats" id="summary">
   <a class="stat" href="#timeline-wrap"><b id="st-steps">0</b><span>step (24h)</span></a>
@@ -1109,6 +1199,48 @@ function renderSummary(st) {
   document.getElementById("stat-plan").className =
     "stat" + (p && p.status === "rejected" ? " alert"
             : p && p.status === "proposed" ? " attn" : "");
+  // 中身が空/未活性のタイルは薄く (押しても何も無いことを見た目で示す)
+  document.getElementById("stat-pending").classList.toggle("dead", nPending === 0);
+  document.getElementById("stat-plan").classList.toggle("dead", !p);
+}
+
+// goal パネル — session-intent (何を目指すか) と judge verdict (達成したか) を最上部に。
+function renderGoal(st) {
+  const wrap = document.getElementById("goal-wrap");
+  const badge = document.getElementById("goal-badge");
+  const text = document.getElementById("goal-text");
+  const next = document.getElementById("goal-next");
+  const intent = st.intent || "";
+  const v = st.verdict;  // {done, next} | null
+  if (!intent && !v) { wrap.style.display = "none"; return; }
+  wrap.style.display = "";
+  text.textContent = intent ? ("goal: " + intent) : "";
+  if (v && v.done) {
+    badge.className = "done"; badge.textContent = "達成 ✅"; next.textContent = "";
+  } else if (v) {
+    badge.className = "pending"; badge.textContent = "未達 ⏳";
+    next.textContent = v.next ? ("NEXT: " + v.next) : "";
+  } else {
+    badge.className = "unknown"; badge.textContent = "未判定 —"; next.textContent = "";
+  }
+}
+
+// サマリ数字のクリック — アンカー飛びだけだと折りたたみ details や display:none 先で
+// 何も起きないので、 対象を開いて/表示してからスクロールする。
+function wireStatClicks() {
+  for (const a of document.querySelectorAll("#summary .stat")) {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      if (a.classList.contains("dead")) return;
+      const href = a.getAttribute("href") || "";
+      const id = href.startsWith("#") ? href.slice(1) : "";
+      const tgt = id && document.getElementById(id);
+      if (!tgt) return;
+      if (tgt.tagName === "DETAILS") tgt.open = true;
+      if (tgt.style && tgt.style.display === "none") return;  // 中身無し = 飛ばない
+      tgt.scrollIntoView({behavior: "smooth", block: "start"});
+    });
+  }
 }
 
 function renderPlan(p) {
@@ -1119,7 +1251,8 @@ function renderPlan(p) {
   wrap.style.display = "";
   document.getElementById("plan-meta").textContent =
     "#" + p.id + " [" + p.status + (p.source ? " by " + p.source : "") + "]" +
-    (p.replaces ? " (replaces #" + p.replaces + ")" : "") + " — " + (p.goal || "");
+    (p.replaces ? " (replaces #" + p.replaces + ")" : "") + " — " + (p.goal || "") +
+    (p.rationale ? "  ／ 改版理由: " + p.rationale : "");
   for (const s of p.steps || []) {
     const li = el("li", s.done ? "done" : "");
     li.append(el("span", "mark", s.done ? "☑" : "☐"), el("span", "what", s.what || ""));
@@ -1159,6 +1292,7 @@ function bumpSummary(id) {
 }
 
 function renderPanels(st) {
+  renderGoal(st);
   renderSummary(st);
   document.getElementById("sess").textContent =
     st.session_id === null ? "(all)" : (st.session_id || "(none)");
@@ -1233,6 +1367,9 @@ function renderIssues(st) {
     btns.append(dg);
     head.append(btns);
     card.append(head, el("div", "issue-text", r.head || ""));
+    // why — judge の分類理由 (@judge-reason) と影響 (@judge-impact) を可視化
+    if (r.reason) card.append(el("div", "issue-why", "理由: " + r.reason));
+    if (r.impact) card.append(el("div", "issue-why", "影響: " + r.impact));
     box.append(card);
   }
   if (nRep > 0) box.append(el("div", "empty", "(+" + nRep + " replaced)"));
@@ -1469,7 +1606,7 @@ function connect(cur) {
     if (ev.type === "session") { if (es) { es.close(); es = null; } init(); return; }
     if (ev.type === "gate" || ev.type === "view") { refreshPanels(); return; }
     appendTimeline(ev);
-    if (ev.src === "meta" && ev.tag === "comment") appendThread(ev);
+    if (ev.src === "meta" && ev.tag === "comment") { appendThread(ev); refreshPanels(); }
     // 要約カウンタの即時更新 (真値は refreshPanels の再取得で揃う)
     if (ev.src === "turn" && ev.tag === "assistant") bumpSummary("st-steps");
     if (ev.src === "turn" && ev.tag === "tool") bumpSummary("st-tools");
@@ -1502,6 +1639,7 @@ async function init() {
   connect(st.cursors || { meta: 0, turn: 0 });
 }
 
+wireStatClicks();
 init();
 </script>
 </body></html>
