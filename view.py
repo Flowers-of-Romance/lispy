@@ -833,10 +833,20 @@ def _latest_intent(db: sqlite3.Connection, sid: str | None) -> str | None:
     return (row[0] or "").strip() if row else None
 
 
+def _classify_verdict(text: Any) -> dict | None:
+    """judge コメント text を verdict に分類。 DONE 始まり→達成、 NEXT: 始まり→未達
+    (+次の一手)。 それ以外 (@judge 宛の自由発言等) は verdict でない → None。"""
+    stripped = str(text or "").strip().lstrip()
+    if stripped.upper().startswith("DONE"):
+        return {"done": True, "next": ""}
+    if stripped.upper().startswith("NEXT:"):
+        return {"done": False, "next": _head(stripped[5:].strip())}
+    return None
+
+
 def _latest_verdict(db: sqlite3.Connection, sid: str | None) -> dict | None:
     """最新の judge verdict (kind=comment で author=judge)。 達成バッジの真値。
-    text が DONE 始まりなら達成、 NEXT: 始まりなら未達 (+次の一手)。 judge 発言が
-    無ければ None (未判定)。"""
+    judge 発言が無ければ None (未判定)。"""
     # judge 発言だけを窓に入れる — human/executor コメントが大量に積まれても
     # 最新 verdict を取りこぼさないよう SQL 側で author=judge に絞る。
     if sid is None:
@@ -854,19 +864,17 @@ def _latest_verdict(db: sqlite3.Connection, sid: str | None) -> dict | None:
             p = json.loads(payload or "")
         except Exception:
             continue
-        text = str(p.get("text") or "").strip()
-        stripped = text.lstrip()
-        if stripped.upper().startswith("DONE"):
-            return {"done": True, "next": ""}
-        if stripped.upper().startswith("NEXT:"):
-            return {"done": False, "next": _head(stripped[5:].strip())}
-        # judge の自由発言 (@judge 宛の応答等) は verdict でない — 次を見る
+        v = _classify_verdict(p.get("text"))
+        if v is not None:
+            return v
     return None
 
 
 def sessions_list(db: sqlite3.Connection, limit: int = 200) -> list[dict]:
     """セッション一覧 (/sessions ページ用)。 host.cmd_list と同じ土台に
-    goal (session-intent) と最新 judge verdict を足す。 開始時刻降順。"""
+    goal (session-intent) と最新 judge verdict を足す。 開始時刻降順。
+    intent / judge comment は一括で 1 クエリずつ取って session ごとにバケットする
+    (行ごとに _latest_* を呼ぶ N+1 を避ける)。"""
     rows = db.execute(
         """
         SELECT s.id, s.started_at, s.title, s.domain, COUNT(t.id) AS n
@@ -875,17 +883,41 @@ def sessions_list(db: sqlite3.Connection, limit: int = 200) -> list[dict]:
         """,
         (limit,),
     ).fetchall()
-    out = []
-    for sid, ts, title, domain, n in rows:
-        intent = _latest_intent(db, sid)
-        verdict = _latest_verdict(db, sid)
-        out.append({
+    ids = [r[0] for r in rows]
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+
+    # 最新 intent per session — id 昇順で舐めて最後が残る = 最新
+    intents: dict[str, str] = {}
+    for s_id, payload in db.execute(
+        f"SELECT session_id, payload FROM meta_events WHERE kind = 'intent' "
+        f"AND session_id IN ({marks}) ORDER BY id ASC", ids):
+        intents[s_id] = (payload or "").strip()
+
+    # judge verdict per session — 昇順で舐め、 DONE/NEXT に分類できたものだけ残す
+    # (自由発言 = None は上書きしない) → 各 session の最新 verdict が残る。
+    verdicts: dict[str, dict] = {}
+    for s_id, payload in db.execute(
+        f"SELECT session_id, payload FROM meta_events WHERE kind = 'comment' "
+        f"AND json_extract(payload, '$.author') = 'judge' "
+        f"AND session_id IN ({marks}) ORDER BY id ASC", ids):
+        try:
+            v = _classify_verdict(json.loads(payload or "").get("text"))
+        except Exception:
+            v = None
+        if v is not None:
+            verdicts[s_id] = v
+
+    return [
+        {
             "id": sid, "started_at": ts, "title": title or "",
             "domain": domain or "", "turns": n,
-            "goal": _head(intent or ""),
-            "verdict": verdict,
-        })
-    return out
+            "goal": _head(intents.get(sid, "")),
+            "verdict": verdicts.get(sid),
+        }
+        for sid, ts, title, domain, n in rows
+    ]
 
 
 def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
