@@ -1701,7 +1701,13 @@ function appendChatEvent(ev) {
     else if (v === "done") judgeNextStreak = 0;
   }
   timelineEvents.push(ev);
-  if (timelineEvents.length > TIMELINE_MAX) timelineEvents.shift();
+  if (timelineEvents.length > TIMELINE_MAX) {
+    // 退避イベントの dedupe キーも seen から落とす — さもないと長時間開いた
+    // タブで seen が単調増加する。 id は単調増加 + SSE はカーソルで新規行のみ
+    // 送るので、 退避キーを消しても重複再追加の心配は無い。
+    const dropped = timelineEvents.shift();
+    seen.delete(dropped.src + ":" + dropped.id);
+  }
   const tl = document.getElementById("chat-timeline");
   tl.append(renderEventLi(ev));
   while (tl.children.length > TIMELINE_MAX) tl.removeChild(tl.firstChild);
