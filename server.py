@@ -87,7 +87,8 @@ _SPEC_HTML_TEMPLATE = """<!doctype html>
 <script>mermaid.initialize({{startOnLoad:true,theme:'dark',securityLevel:'loose'}});</script>
 <style>
 {shared_css}
-  .page-wrap{{max-width:1400px;margin:0 auto;padding:1em 1.2em 2em}}
+  .page-wrap{{max-width:none;margin:0;padding:1em 1.2em 2em}}
+  table.rows-nowrap td{{white-space:nowrap}}
   h2{{margin-top:2em;border-bottom:1px solid var(--border);padding-bottom:.2em;color:var(--text)}}
   .meta{{color:var(--muted);font-size:.9em}}
   .timeline li{{margin:.3em 0}}
@@ -419,7 +420,7 @@ def _render_sessions_html() -> str:
         )
     body = (
         "<div class='side-block'><h2>sessions</h2>"
-        '<table><thead><tr><th>開始</th><th>session</th><th>turns</th>'
+        '<table class="rows-nowrap"><thead><tr><th>開始</th><th>session</th><th>turns</th>'
         "<th>達成?</th><th>goal / title</th></tr></thead>"
         f"<tbody>{''.join(trs) or '<tr><td colspan=5 class=empty>なし</td></tr>'}</tbody></table></div>"
     )
