@@ -284,11 +284,14 @@ def s_diff(db: sqlite3.Connection, event_id: int) -> dict | None:
     name = p.get("name", "?")
     body = p.get("body", "") or ""
 
+    # LIKE 用に \ % _ をエスケープ — name にワイルドカード文字が含まれると別名にも
+    # 広く一致し、 LIMIT 5 の候補窓から本来の直前 S が落ちて誤って「新規定義」になる。
+    like_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     candidates = db.execute(
         "SELECT id, ts, session_id, payload FROM meta_events "
-        "WHERE kind = 'S' AND id < ? AND payload LIKE ? "
+        "WHERE kind = 'S' AND id < ? AND payload LIKE ? ESCAPE '\\' "
         "ORDER BY id DESC LIMIT 5",
-        (rid, f'%"name": "{name}"%'),
+        (rid, f'%"name": "{like_name}"%'),
     ).fetchall()
     prev = None
     for p_id, p_ts, p_sid, p_payload in candidates:
