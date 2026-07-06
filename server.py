@@ -12,6 +12,7 @@ endpoints:
   GET  /recall?q=&k=&mode=  host の trajectory recall を直接叩く
   GET  /view            ledger ダッシュボード (view.py)
   GET  /view/state      ダッシュボードのスナップショット (JSON、 pending gate / agent view 含む)
+  GET  /view/sdiff?id=  meta_events (kind=S) 1 行と同名の直前スナップショットとの diff (JSON、読み取り専用)
   GET  /view/events     SSE — ledger (meta_events) + turns の追記 + gate/view の変化通知
   POST /view/gate/<id>  pending gate の解決。 body = "approve" | "deny" (先着採用)
   POST /view/action     agent view の button 押下 (action 記号 + inputs) を queue に積む
@@ -83,36 +84,38 @@ _SPEC_HTML_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <title>lispy spec — {scope_label}</title>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script>mermaid.initialize({{startOnLoad:true,theme:'default',securityLevel:'loose'}});</script>
+<script>mermaid.initialize({{startOnLoad:true,theme:'dark',securityLevel:'loose'}});</script>
 <style>
-  body{{font-family:-apple-system,BlinkMacSystemFont,'Hiragino Sans','Yu Gothic',sans-serif;
-       max-width:900px;margin:2em auto;padding:0 1em;color:#222;line-height:1.6}}
-  h1{{border-bottom:2px solid #333;padding-bottom:.3em}}
-  h2{{margin-top:2em;border-bottom:1px solid #ccc;padding-bottom:.2em}}
-  .meta{{color:#666;font-size:.9em}}
-  table{{border-collapse:collapse;width:100%;margin:.5em 0}}
-  th,td{{border:1px solid #ddd;padding:.4em .6em;text-align:left;vertical-align:top}}
-  th{{background:#f6f6f6}}
-  .id{{color:#888;font-family:ui-monospace,monospace;font-size:.85em}}
-  .replaced{{text-decoration:line-through;color:#999}}
-  .kind-R{{background:#fff3cd}}
-  .kind-K{{background:#d4edda}}
-  .kind-S{{background:#cce5ff}}
-  .kind-artifact{{background:#f8d7da}}
-  .kind-intent{{background:#e2e3e5}}
-  .kind-test-S-R,.kind-replay,.kind-restore-S{{background:#f5f5f5}}
-  .empty{{color:#999;font-style:italic}}
-  pre{{background:#f6f6f6;padding:.5em;overflow-x:auto;font-size:.85em}}
+{shared_css}
+  .page-wrap{{max-width:1400px;margin:0 auto;padding:1em 1.2em 2em}}
+  h2{{margin-top:2em;border-bottom:1px solid var(--border);padding-bottom:.2em;color:var(--text)}}
+  .meta{{color:var(--muted);font-size:.9em}}
   .timeline li{{margin:.3em 0}}
-  .switch{{margin:1em 0;font-size:.9em}}
-  .switch a{{margin-right:1em}}
 </style></head><body>
-<h1>lispy spec — {scope_label}</h1>
+<div class="page-header">
+  <h1>lispy spec — {scope_label}</h1>
+  <div class="nav-pills">{scope_switch}</div>
+</div>
+<div class="page-wrap">
 <div class="meta">{header_meta}</div>
-<div class="switch">{scope_switch}</div>
 {body}
+</div>
+<script>{iframe_nav_js}</script>
 </body></html>
 """
+
+
+def _spec_page(**kwargs: Any) -> str:
+    """_SPEC_HTML_TEMPLATE の唯一のレンダリング入口。 view.BASE_CSS を注入し、
+    /view と /spec /sessions の見た目を揃える (view 層が無い場合は空 CSS で fallback)。
+    shared_css は必ず値として渡す — テンプレート文字列自体に事前連結すると CSS の
+    生ブレースで .format() が壊れるので厳禁 (str.format() は渡した値の中身は
+    再パースしない、テンプレート文字列だけを走査するので安全)。"""
+    kwargs.setdefault("shared_css", view.BASE_CSS if view is not None else "")
+    # /view のモーダル iframe 内で開かれたときのリンク調整 JS (view.py 側の定数)。
+    # shared_css と同じく必ず値として渡す (JS のブレースを .format() に晒さない)。
+    kwargs.setdefault("iframe_nav_js", view.IFRAME_NAV_JS if view is not None else "")
+    return _SPEC_HTML_TEMPLATE.format(**kwargs)
 
 
 def _parse_replaces(payload: str) -> int | None:
@@ -139,7 +142,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
     mermaid で R lineage の連鎖を描画、 S/K/artifact を section ごとに table。"""
     db = env.db_conn
     if db is None:
-        return _SPEC_HTML_TEMPLATE.format(
+        return _spec_page(
             scope_label="(no db)",
             header_meta="env.db_conn is None — recording 無し起動?",
             scope_switch="",
@@ -162,7 +165,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
             except SystemExit:
                 sid = session_filter
         if not sid:
-            return _SPEC_HTML_TEMPLATE.format(
+            return _spec_page(
                 scope_label="(no session)",
                 header_meta="env.record_sid が無く、 ?session= も未指定",
                 scope_switch=_render_scope_switch(),
@@ -178,7 +181,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
         scope_label = f"session {sid[:12]}…" if sid else "(no session)"
 
     if not rows:
-        return _SPEC_HTML_TEMPLATE.format(
+        return _spec_page(
             scope_label=scope_label,
             header_meta="no R/K/S/artifact events yet",
             scope_switch=_render_scope_switch(),
@@ -213,15 +216,19 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
             mermaid_lines.append(f'  R{rid}["#{rid}: {head_escaped}"]:::{css}')
         for prev, cur in edges:
             mermaid_lines.append(f"  R{prev} -->|replaces| R{cur}")
-        mermaid_lines.append("  classDef replaced fill:#eee,stroke:#aaa,color:#999")
-        mermaid_lines.append("  classDef active fill:#fff3cd,stroke:#c70")
+        mermaid_lines.append("  classDef replaced fill:#22272e,stroke:#8b96a5,color:#8b96a5")
+        mermaid_lines.append("  classDef active fill:#3a2c05,stroke:#d29922,color:#e6edf3")
         r_section = (
-            "<h2>R lineage</h2>\n"
+            "<div class='side-block'><h2>R lineage</h2>\n"
             f"<div class='mermaid'>\n{chr(10).join(mermaid_lines)}\n</div>\n"
             + _render_event_table(r_events, "R")
+            + "</div>\n"
         )
     else:
-        r_section = '<h2>R lineage</h2>\n<p class="empty">commit-R event なし</p>\n'
+        r_section = (
+            "<div class='side-block'><h2>R lineage</h2>\n"
+            '<p class="empty">commit-R event なし</p></div>\n'
+        )
 
     # S history — name でグループ化、 最新の rationale + body preview
     s_events = by_kind.get("S", [])
@@ -257,30 +264,35 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
                 "</tr>"
             )
         s_section = (
-            "<h2>S (lambda snapshots)</h2>\n"
+            "<div class='side-block'><h2>S (lambda snapshots)</h2>\n"
             "<table><thead><tr><th>name</th><th>kind</th><th>lineage</th>"
             "<th>latest rationale</th><th>body preview</th></tr></thead><tbody>\n"
             + "\n".join(rows_html)
-            + "\n</tbody></table>\n"
+            + "\n</tbody></table></div>\n"
         )
     else:
-        s_section = '<h2>S (lambda snapshots)</h2>\n<p class="empty">commit-S event なし</p>\n'
+        s_section = (
+            "<div class='side-block'><h2>S (lambda snapshots)</h2>\n"
+            '<p class="empty">commit-S event なし</p></div>\n'
+        )
 
     # K list — name + content
+    k_section = "<div class='side-block'><h2>K (knowledge)</h2>\n"
     k_events = by_kind.get("K", [])
-    k_section = "<h2>K (knowledge)</h2>\n"
     if k_events:
         k_section += _render_event_table(k_events, "K")
     else:
         k_section += '<p class="empty">commit-K event なし</p>\n'
+    k_section += "</div>\n"
 
     # artifact list
+    a_section = "<div class='side-block'><h2>artifacts</h2>\n"
     a_events = by_kind.get("artifact", [])
-    a_section = "<h2>artifacts</h2>\n"
     if a_events:
         a_section += _render_event_table(a_events, "artifact")
     else:
         a_section += '<p class="empty">commit-artifact event なし</p>\n'
+    a_section += "</div>\n"
 
     # session-intent
     i_events = by_kind.get("intent", [])
@@ -290,9 +302,9 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
             f"<li><span class='id'>#{rid}</span> {html.escape((p.split(chr(10),1)[0])[:200])}</li>"
             for rid, _ts, _sid, p in i_events
         )
-        intent_section = f"<h2>session-intent</h2>\n<ul>{items}</ul>\n"
+        intent_section = f"<div class='side-block'><h2>session-intent</h2>\n<ul>{items}</ul></div>\n"
 
-    # timeline (全 event の時系列、 末尾 30 件)
+    # timeline (全 event の時系列、 末尾 30 件) — details.fold で折りたたむ (掘る用)
     tail = rows[-30:]
     timeline_items = []
     for rid, ts, sid_, kind, payload in tail:
@@ -311,8 +323,8 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
             f'{html.escape(head)}</li>'
         )
     timeline_section = (
-        "<h2>recent events (timeline, last 30)</h2>\n"
-        f"<ul class='timeline'>{''.join(timeline_items)}</ul>\n"
+        "<details class='fold'><summary>recent events (timeline, last 30)</summary>\n"
+        f"<ul class='timeline'>{''.join(timeline_items)}</ul>\n</details>\n"
     )
 
     body = intent_section + r_section + s_section + k_section + a_section + timeline_section
@@ -321,7 +333,7 @@ def _render_spec_html(env: lispy.Env, session_filter: str) -> str:
         f"R: {len(r_events)}  K: {len(k_events)}  S: {len(s_events)}  "
         f"artifact: {len(a_events)}  intent: {len(i_events)}"
     )
-    return _SPEC_HTML_TEMPLATE.format(
+    return _spec_page(
         scope_label=html.escape(scope_label),
         header_meta=html.escape(header_meta),
         scope_switch=_render_scope_switch(),
@@ -362,10 +374,15 @@ def _render_scope_switch() -> str:
 def _render_sessions_html() -> str:
     """セッション一覧ページ。 各行から /view?session=<id> / /spec?session=<id> に飛べる。
     データは view.sessions_list (host.cmd_list の SQL + goal + judge verdict)。"""
+    if view is None:
+        # /view 系ルートの 503 (view 層なし) と同じ扱い — 生 AttributeError を出さない。
+        return _spec_page(
+            scope_label="sessions", header_meta="view 層なし (view.py が無い)",
+            scope_switch=_render_scope_switch(), body="")
     try:
         db = view.open_ro()
     except Exception as e:
-        return _SPEC_HTML_TEMPLATE.format(
+        return _spec_page(
             scope_label="sessions", header_meta=f"db open: {html.escape(str(e))}",
             scope_switch=_render_scope_switch(), body="")
     try:
@@ -374,12 +391,14 @@ def _render_sessions_html() -> str:
         db.close()
 
     def _badge(v: dict | None) -> str:
+        # ダーク背景での視認性のため BASE_CSS の :root 変数色に寄せる
+        # (インラインスタイル自体は残す — 一覧の各行ごとの色分けなので CSS クラス化はしない)。
         if v is None:
-            return '<span style="color:#888">—</span>'
+            return '<span style="color:var(--muted)">—</span>'
         if v.get("done"):
-            return '<span style="color:#1a7a34">達成 ✅</span>'
+            return '<span style="color:var(--ok)">達成 ✅</span>'
         nxt = html.escape(v.get("next") or "")
-        return '<span style="color:#b26a00">未達 ⏳</span>' + (
+        return '<span style="color:var(--warn)">未達 ⏳</span>' + (
             f'<div class="id">NEXT: {nxt}</div>' if nxt else "")
 
     trs = []
@@ -399,12 +418,12 @@ def _render_sessions_html() -> str:
             "</tr>"
         )
     body = (
-        "<h2>sessions</h2>"
+        "<div class='side-block'><h2>sessions</h2>"
         '<table><thead><tr><th>開始</th><th>session</th><th>turns</th>'
         "<th>達成?</th><th>goal / title</th></tr></thead>"
-        f"<tbody>{''.join(trs) or '<tr><td colspan=5 class=empty>なし</td></tr>'}</tbody></table>"
+        f"<tbody>{''.join(trs) or '<tr><td colspan=5 class=empty>なし</td></tr>'}</tbody></table></div>"
     )
-    return _SPEC_HTML_TEMPLATE.format(
+    return _spec_page(
         scope_label="sessions",
         header_meta=f"{len(rows)} sessions — 行クリックでそのセッションの view / spec へ",
         scope_switch=_render_scope_switch(),
@@ -624,10 +643,44 @@ def make_handler(env_box: list[lispy.Env]):
                     body = view.state_json(db, sid, scope)
                     # 要約 (直近 24h・全 session) — 抜き取り検査の一枚目
                     body["summary"] = view.summary_24h(db)
+                    # actor (executor/judge) の env 由来メタ情報 (モデル名) — 読み取り専用
+                    body["actors"] = view.actors_state()
                     # pending gate と agent view は ledger でなくプロセス内の runtime 状態
                     body["pending"] = view.GATES.pending_list()
                     body["view"] = view.CURRENT_VIEW.get()
+                    # ダッシュボードの agent 俯瞰 (executor カード) 用の読み取り専用フィールド。
+                    # busy = 評価中の eval が _LOCK を握っているか、 watchers = /view を
+                    # 見ている SSE 接続数 (gate の答え手カウントと同じ値)。 新しい書き込みは
+                    # 増やしていない — 既存の runtime 状態を素通しするだけ。
+                    body["busy"] = _LOCK.locked()
+                    body["watchers"] = view.GATES.watchers
                     self._send_json(200, body)
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "error": str(e)})
+                finally:
+                    db.close()
+                return
+            if path == "/view/sdiff":
+                # 読み取り専用 — 書き込み系エンドポイントは追加しない原則を維持。
+                qs = parse_qs(url.query)
+                id_raw = qs.get("id", [""])[0]
+                try:
+                    event_id = int(id_raw)
+                except (TypeError, ValueError):
+                    self._send_json(400, {"ok": False, "error": "id は整数で指定"})
+                    return
+                try:
+                    db = view.open_ro()
+                except Exception as e:
+                    self._send_json(500, {"ok": False, "error": f"db open: {e}"})
+                    return
+                try:
+                    result = view.s_diff(db, event_id)
+                    if result is None:
+                        self._send_json(
+                            404, {"ok": False, "error": f"S event #{event_id} not found"})
+                        return
+                    self._send_json(200, result)
                 except Exception as e:
                     self._send_json(500, {"ok": False, "error": str(e)})
                 finally:
