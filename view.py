@@ -257,6 +257,70 @@ def diff_lines(before: str, after: str, max_lines: int = 400) -> list[dict]:
     return out
 
 
+def s_diff(db: sqlite3.Connection, event_id: int) -> dict | None:
+    """meta_events.id (kind='S') 1 件と、同名の直前 S スナップショットとの diff。
+
+    直前候補の特定は lispy.py の _S_history/_restore_S と同じ二段構え:
+    `payload LIKE '%"name": "<name>"%'` で粗選別 (id < 自分、id 降順 LIMIT 5) →
+    json.loads して name 完全一致で確定。**session を跨いで探す** — S lineage は
+    session 再開後も続く既存の規約に合わせる (同一 session 限定だと再開直後の
+    commit-S が毎回「新規定義」に誤表示される)。
+
+    戻り値のキーは `lambda_kind` — payload 内の `kind` は λ の種別 (lisp/host等) で
+    meta_events.kind の "S" (event 種別) とは別物なので、 混同を避けて改名する。
+    該当行が無い (id 不正 / kind != S) 場合は None — 呼び出し側で 404 に変換する。
+    """
+    row = db.execute(
+        "SELECT id, ts, session_id, payload FROM meta_events WHERE id = ? AND kind = 'S'",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    rid, ts, sid, payload = row
+    try:
+        p = json.loads(payload or "")
+    except Exception:
+        return None
+    name = p.get("name", "?")
+    body = p.get("body", "") or ""
+
+    candidates = db.execute(
+        "SELECT id, ts, session_id, payload FROM meta_events "
+        "WHERE kind = 'S' AND id < ? AND payload LIKE ? "
+        "ORDER BY id DESC LIMIT 5",
+        (rid, f'%"name": "{name}"%'),
+    ).fetchall()
+    prev = None
+    for p_id, p_ts, p_sid, p_payload in candidates:
+        try:
+            pp = json.loads(p_payload or "")
+        except Exception:
+            continue
+        if pp.get("name") == name:
+            prev = (p_id, p_ts, p_sid, pp)
+            break  # id 降順で最初に一致したものが直前
+
+    base = {
+        "id": rid, "ts": ts, "sid": sid, "name": name,
+        "lambda_kind": p.get("kind", "?"),
+        "rationale": p.get("rationale", ""),
+    }
+    if prev is None:
+        base.update({
+            "is_first": True,
+            "prev_id": None, "prev_ts": None, "prev_sid": None,
+            "lines": diff_lines("", body),
+        })
+        return base
+    p_id, p_ts, p_sid, pp = prev
+    base.update({
+        "is_first": False,
+        "prev_id": p_id, "prev_ts": p_ts, "prev_sid": p_sid,
+        "lines": diff_lines(pp.get("body", "") or "", body),
+    })
+    return base
+
+
 # ---------------------------------------------------------------------------
 # フェーズ 3 — レイアウト語彙
 #
@@ -1039,6 +1103,41 @@ BASE_CSS = """
   .kind-artifact{background:#2a1013} .kind-intent{background:#1b202b}
   .kind-test-S-R,.kind-replay,.kind-restore-S{background:var(--panel2)}
   .switch{margin:1em 0;font-size:.9em} .switch a{margin-right:1em}
+
+  /* ---- side-block / panels / 折りたたみ — VIEW_HTML から移設 (/sessions /spec でも使う) ---- */
+  .side-block{margin-bottom:1.3em}
+  .side-block h2{font-size:.78em;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);
+                 border-bottom:1px solid var(--border);padding-bottom:.3em;margin-bottom:.5em}
+
+  .panels{display:flex;gap:1em;margin:.5em 0;flex-wrap:wrap}
+  .panel{flex:1;min-width:12em;border:1px solid var(--border);border-radius:6px;
+         padding:.3em .6em .5em;background:var(--panel2)}
+  .panel ul{margin:0;padding-left:1.1em;font-size:.85em}
+  .panel li{margin:.25em 0}
+
+  details.fold{border:1px solid var(--border);border-radius:6px;background:var(--panel);margin:.6em 0}
+  details.fold>summary{cursor:pointer;padding:.4em .6em;font-size:.85em;color:var(--muted);
+                       background:var(--panel2);border-radius:6px;list-style:none}
+  details.fold>summary::-webkit-details-marker{display:none}
+  details.fold>summary::before{content:"▸ ";}
+  details.fold[open]>summary::before{content:"▾ ";}
+  details.fold[open]>summary{border-bottom:1px solid var(--border);border-radius:6px 6px 0 0}
+  details.fold>div,details.fold>ul,details.fold>ol,details.fold>pre{margin:0;padding:.6em .8em}
+
+  /* ---- ページヘッダ / ナビピル — /sessions /spec の全幅化用 (/view の #topbar と同じトーン) ---- */
+  .page-header{display:flex;align-items:center;justify-content:space-between;gap:1em;
+               flex-wrap:wrap;padding:.6em 1em;background:var(--panel);
+               border-bottom:1px solid var(--border);margin-bottom:1em}
+  .page-header h1{font-size:1.1em;margin:0;border:none;padding:0}
+  .nav-pills{display:flex;gap:.5em;flex-wrap:wrap}
+  .nav-pills a{padding:.25em .9em;border-radius:14px;background:var(--panel2);
+               border:1px solid var(--border);color:var(--muted);font-size:.85em}
+  .nav-pills a:hover{border-color:var(--accent);color:var(--text);text-decoration:none}
+
+  /* ---- S 書き替え diff トグル (S 台帳 / タイムライン共通) ---- */
+  .diff-link{color:var(--accent);cursor:pointer;font-size:.78em;margin-left:.6em;text-decoration:underline}
+  .diff-link:hover{color:var(--text)}
+  .sdiff-box{margin:.3em 0 .6em}
 """
 
 # /spec /sessions が /view のモーダル iframe 内に埋め込まれたときのリンク挙動調整。
@@ -1102,9 +1201,7 @@ VIEW_HTML = """<!doctype html>
           max-height:calc(100vh - 6.5em);overflow-y:auto;position:sticky;top:0}
   #main-pane{padding:.8em 1em 2em;min-width:0;display:flex;flex-direction:column}
 
-  .side-block{margin-bottom:1.3em}
-  .side-block h2{font-size:.78em;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);
-                 border-bottom:1px solid var(--border);padding-bottom:.3em;margin-bottom:.5em}
+  /* .side-block は BASE_CSS へ移設済み (view.py 冒頭参照) */
   .switch{display:flex;flex-direction:column;gap:.3em;font-size:.9em}
 
   /* ---- ページモーダル (/sessions /spec を iframe で重ね表示) ---- */
@@ -1186,15 +1283,7 @@ VIEW_HTML = """<!doctype html>
   #chat-timeline.hide-plan .ev[data-cat="plan"]{display:none}
   #chat-timeline.hide-other .ev[data-cat="other"]{display:none}
 
-  /* ---- 折りたたみ (掘る用) ---- */
-  details.fold{border:1px solid var(--border);border-radius:6px;background:var(--panel);margin:.6em 0}
-  details.fold>summary{cursor:pointer;padding:.4em .6em;font-size:.85em;color:var(--muted);
-                       background:var(--panel2);border-radius:6px;list-style:none}
-  details.fold>summary::-webkit-details-marker{display:none}
-  details.fold>summary::before{content:"▸ ";}
-  details.fold[open]>summary::before{content:"▾ ";}
-  details.fold[open]>summary{border-bottom:1px solid var(--border);border-radius:6px 6px 0 0}
-  details.fold>div,details.fold>ul,details.fold>ol,details.fold>pre{margin:0;padding:.6em .8em}
+  /* details.fold は BASE_CSS へ移設済み */
 
   /* ---- R issue カード ---- */
   #issues{display:flex;flex-direction:column;gap:.5em;margin:.3em 0 .8em}
@@ -1214,11 +1303,7 @@ VIEW_HTML = """<!doctype html>
                      background:var(--panel);color:var(--text);cursor:pointer}
   .issue-btns button:hover{border-color:var(--accent)}
 
-  .panels{display:flex;gap:1em;margin:.5em 0;flex-wrap:wrap}
-  .panel{flex:1;min-width:12em;border:1px solid var(--border);border-radius:6px;
-         padding:.3em .6em .5em;background:var(--panel2)}
-  .panel ul{margin:0;padding-left:1.1em;font-size:.85em}
-  .panel li{margin:.25em 0}
+  /* .panels/.panel は BASE_CSS へ移設済み */
 
   /* ---- plan checklist ---- */
   #plan-list{list-style:none;margin:0;padding:0;font-size:.88em}
@@ -1593,6 +1678,11 @@ function renderEventLi(ev) {
   const bodyText = ev.text !== undefined ? ev.text : (ev.head || "");
   li.append(el("div", "ev-body", bodyText));
   if (ev.why) li.append(el("div", "ev-why", ev.why));
+  if (ev.tag === "S") {
+    const link = el("span", "diff-link", "diff を見る");
+    link.onclick = () => toggleSdiff(ev.id, link);
+    li.append(link);
+  }
   return li;
 }
 
@@ -1984,6 +2074,40 @@ function renderDiffLines(lines, file) {
   return box;
 }
 
+// --- S (lambda snapshot) の書き替え diff トグル ---
+// sdiffCache: meta_events.id -> /view/sdiff レスポンス。 同じ id を二度目に開くときは
+// 再 fetch しない (畳んで開き直しても内容は変わらないため)。
+const sdiffCache = new Map();
+async function toggleSdiff(id, anchorEl) {
+  const next = anchorEl.nextElementSibling;
+  if (next && next.classList.contains("sdiff-box")) {
+    next.remove();  // 二度押しで畳む
+    return;
+  }
+  let data = sdiffCache.get(id);
+  if (!data) {
+    try {
+      const r = await fetch("/view/sdiff?id=" + encodeURIComponent(id));
+      data = await r.json();
+      if (r.ok) sdiffCache.set(id, data);
+    } catch (e) {
+      return;
+    }
+  }
+  const box = el("div", "sdiff-box");
+  if (!data || data.error) {
+    box.append(el("div", "diff-file", "diff 取得エラー: " + ((data && data.error) || "?")));
+  } else {
+    const label = data.is_first
+      ? "新規定義 (全文) — " + data.name
+      : "#" + data.prev_id + " → #" + data.id + " の diff — " + data.name;
+    box.append(el("div", "diff-file", label));
+    if (data.rationale) box.append(el("div", "gate-detail", data.rationale));
+    box.append(renderDiffLines(data.lines || [], ""));
+  }
+  anchorEl.insertAdjacentElement("afterend", box);
+}
+
 function renderPending(list) {
   const wrap = document.getElementById("pending-wrap");
   const P = document.getElementById("pending");
@@ -2124,6 +2248,9 @@ function renderPanels(st) {
     const li = el("li");
     li.append(el("span", "id", "#" + s.id + " "),
               document.createTextNode(s.name + " [" + s.kind + "] " + (s.rationale || "")));
+    const link = el("span", "diff-link", "diff を見る");
+    link.onclick = () => toggleSdiff(s.id, link);
+    li.append(link);
     S.append(li);
   }
 
