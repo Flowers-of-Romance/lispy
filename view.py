@@ -1276,9 +1276,11 @@ VIEW_HTML = """<!doctype html>
   /* ---- actor (誰の発言/動作か) 別インデント。 データ由来の色帯 (data-tag) とは
      別次元として共存させる — 変更しない。 #chat-timeline は既に
      display:flex;flex-direction:column なので align-self がそのまま効く。 */
+  /* executor/system = 主流 (左)、 human/judge = 少し右へオフセットした aside。
+     右端貼り付け (flex-end) はしない — 行きすぎず、話者が分かる程度の字下げに留める。 */
   .ev[data-actor="executor"]{margin-right:1.6em}
-  .ev[data-actor="judge"]{margin-left:.8em;margin-right:1.2em}
-  .ev[data-actor="human"]{margin-left:1.6em}
+  .ev[data-actor="judge"]{margin-left:1.6em;margin-right:1.2em}
+  .ev[data-actor="human"]{margin-left:2.4em}
   .ev[data-actor="system"]{margin-left:1.2em;margin-right:1.2em;opacity:.85;font-style:italic}
   .ev[data-tag="assistant"]{border-left-color:var(--info)}
   .ev[data-tag="tool"]{border-left-color:var(--warn)}
