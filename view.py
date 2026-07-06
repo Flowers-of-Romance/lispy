@@ -1278,7 +1278,7 @@ VIEW_HTML = """<!doctype html>
      display:flex;flex-direction:column なので align-self がそのまま効く。 */
   .ev[data-actor="executor"]{margin-right:1.6em}
   .ev[data-actor="judge"]{margin-left:.8em;margin-right:1.2em}
-  .ev[data-actor="human"]{margin-left:1.6em;align-self:flex-end;max-width:88%}
+  .ev[data-actor="human"]{margin-left:1.6em}
   .ev[data-actor="system"]{margin-left:1.2em;margin-right:1.2em;opacity:.85;font-style:italic}
   .ev[data-tag="assistant"]{border-left-color:var(--info)}
   .ev[data-tag="tool"]{border-left-color:var(--warn)}
