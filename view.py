@@ -1896,7 +1896,7 @@ function latestJudgeTask(events) {
     const v = classifyVerdictText(ev.text);
     if (v === "next") {
       streak += 1;
-      goal = (ev.text || "").replace(/^next:\\s*/i, "").trim();
+      goal = (ev.text || "").trim().replace(/^next:\\s*/i, "").trim();
     } else if (v === "done") {
       streak = 0;
       goal = "";

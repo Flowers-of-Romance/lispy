@@ -361,6 +361,11 @@ def _render_scope_switch() -> str:
 def _render_sessions_html() -> str:
     """セッション一覧ページ。 各行から /view?session=<id> / /spec?session=<id> に飛べる。
     データは view.sessions_list (host.cmd_list の SQL + goal + judge verdict)。"""
+    if view is None:
+        # /view 系ルートの 503 (view 層なし) と同じ扱い — 生 AttributeError を出さない。
+        return _spec_page(
+            scope_label="sessions", header_meta="view 層なし (view.py が無い)",
+            scope_switch=_render_scope_switch(), body="")
     try:
         db = view.open_ro()
     except Exception as e:
