@@ -535,6 +535,7 @@ def _meta_to_event(rid: int, ts: float, sid: str | None, kind: str, payload: str
             ev["head"] = (f"#{p.get('gate_id', '?')} {_head(p.get('title') or '?')} — "
                           f"{'APPROVE' if approved else 'DENY'} ({p.get('source', '?')})")
             ev["rejected"] = not approved
+            ev["source"] = p.get("source") or "?"
             return ev
         except Exception:
             pass
@@ -563,6 +564,7 @@ def _meta_to_event(rid: int, ts: float, sid: str | None, kind: str, payload: str
                           f"{'APPROVE' if approved else 'REJECT'} ({p.get('source', '?')})")
             ev["rejected"] = not approved
             ev["why"] = _head(p.get("why") or "")
+            ev["source"] = p.get("source") or "?"
             return ev
         except Exception:
             pass
@@ -793,6 +795,16 @@ def summary_24h(db: sqlite3.Connection) -> dict:
     return out
 
 
+def actors_state() -> dict:
+    """実行系アクターの env 由来メタ情報 (モデル名等)。読み取り専用 — ハードコード禁止。
+    executor は host.MODEL (.env の LLM_MODEL)、judge は host.judge_model()
+    (JUDGE_MODEL 未設定なら executor に fallback — judge_configured() で見分ける)。"""
+    return {
+        "executor": {"model": host.MODEL},
+        "judge": {"model": host.judge_model(), "configured": host.judge_configured()},
+    }
+
+
 def _memory_state() -> dict | None:
     """蒸留層 (data/memory/) のスナップショット。 dir 解決は brainwash.MEMORY_DIR と同じ規則
     (import はしない — brainwash.py を消しても view は動く)。 dir が無ければ None。"""
@@ -977,223 +989,464 @@ def poll_events(
 
 
 # ---------------------------------------------------------------------------
-# ダッシュボード HTML — 静的 1 枚。 レンダラーは受け取った JSON を textContent で
-# DOM に足すだけ (eval / innerHTML / 外部 fetch なし)。
+# ダッシュボード HTML — 静的 1 枚 (alook 風 3 ペイン・ダークテーマ)。 レンダラーは
+# 受け取った JSON を textContent で DOM に足すだけ (eval / innerHTML / 外部 fetch なし)。
+#
+# 画面構成:
+#   header      — session id / SSE 接続インジケータ / health 概要 (24h 集計)
+#   左サイドバー — executor / judge / auto-step の状態カード + session 切替
+#   中央        — turns + meta_events を ts で 1 本にした chat 風 timeline
+#                 (kind ごとに見た目を分け、 上部の kind フィルタで絞れる)。
+#                 R/K/S 台帳・memory・agent view (show-view)・gate 判定履歴は
+#                 掘る用の折りたたみとして下に並べる (機能は全て従来のまま)。
+#   右サイドバー — gate インボックス (承認/却下) / plan / goal board (delegate の
+#                 実行状況をコメントログから導出) / 入力 (comment・delegate)
+#
+# データは /view/state (初期スナップショット) + /view/events (SSE 追記) のみ —
+# 新しい書き込み系エンドポイントは足していない。 goal board は既存の comment
+# (kind=comment, author=human/system, text="[委譲] ..." / "[委譲 run ...]") を
+# 手がかりに client 側で導出するだけで、 バックエンドは 1 行も増えていない。
 # ---------------------------------------------------------------------------
+
+# /view と /spec /sessions (server.py) が共有するダーク CSS の土台。 view.py 側に
+# 一本化する (フロントは view.py が固定で持つ、という既存原則の延長)。 :root 変数と
+# 基本要素は VIEW_HTML から移設 (コピーでなく移動 — 二重定義を作らない)。
+# table/pre/.kind-*/.switch は view.py 自身は使わないが、/spec /sessions 用に
+# ここへ追加する (置き場を一本化するため)。
+BASE_CSS = """
+  :root{
+    --bg:#0b0d12; --bg2:#0f1218; --panel:#151922; --panel2:#1b202b;
+    --border:#2a3040; --text:#e6edf3; --muted:#8b96a5; --accent:#58a6ff;
+    --ok:#3fb950; --warn:#d29922; --danger:#f85149; --info:#a371f7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Hiragino Sans','Yu Gothic',sans-serif;
+       background:var(--bg);color:var(--text);line-height:1.5;font-size:14px}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  h1,h2,h3{margin:.2em 0;font-weight:600}
+  h3{font-size:.95em;color:var(--muted)}
+  .note{color:var(--muted);font-size:.82em}
+  .id{color:var(--muted);font-family:ui-monospace,monospace;font-size:.85em}
+  .empty{color:var(--muted);font-style:italic;list-style:none;margin-left:-1.1em}
+  table{border-collapse:collapse;width:100%;margin:.5em 0}
+  th,td{border:1px solid var(--border);padding:.4em .6em;text-align:left;vertical-align:top;color:var(--text)}
+  th{background:var(--panel2)}
+  pre{background:#0d1016;padding:.5em;overflow-x:auto;font-size:.85em;color:var(--text);
+      border:1px solid var(--border);border-radius:4px}
+  .replaced{text-decoration:line-through;color:var(--muted)}
+  .kind-R{background:#241b06} .kind-K{background:#0f2a17} .kind-S{background:#0d1b33}
+  .kind-artifact{background:#2a1013} .kind-intent{background:#1b202b}
+  .kind-test-S-R,.kind-replay,.kind-restore-S{background:var(--panel2)}
+  .switch{margin:1em 0;font-size:.9em} .switch a{margin-right:1em}
+"""
+
+# /spec /sessions が /view のモーダル iframe 内に埋め込まれたときのリンク挙動調整。
+# iframe 内で /view 系リンクを踏むと iframe の中に /view が入れ子で開いてしまうため、
+# top ウィンドウ遷移 (target=_top) に切り替える。/sessions ↔ /spec の相互リンクは
+# iframe 内遷移のままで良いので触らない。フロント資産は view 層が固定で持つ原則に
+# 従いここに置き、server.py の _spec_page が shared_css と同様に値渡しで埋め込む
+# (テンプレートへ直書きすると JS のブレースで .format() が壊れる)。
+IFRAME_NAV_JS = """
+if (window.self !== window.top) {
+  var links = document.querySelectorAll('a[href^="/view"]');
+  for (var i = 0; i < links.length; i++) links[i].target = "_top";
+}
+"""
 
 VIEW_HTML = """<!doctype html>
 <html lang="ja"><head>
 <meta charset="utf-8">
 <title>lispy view</title>
-<style>
-  body{font-family:-apple-system,BlinkMacSystemFont,'Hiragino Sans','Yu Gothic',sans-serif;
-       max-width:1000px;margin:1.5em auto;padding:0 1em;color:#222;line-height:1.5}
-  h1{border-bottom:2px solid #333;padding-bottom:.3em;font-size:1.4em}
-  h2{margin:1em 0 .4em;font-size:1em;border-bottom:1px solid #ccc;padding-bottom:.2em}
-  .meta{color:#666;font-size:.85em}
-  .dot{display:inline-block;width:.6em;height:.6em;border-radius:50%;background:#bbb;margin-left:.4em}
-  .dot.on{background:#2a2}
-  .dot.off{background:#c33}
-  .switch{margin:.6em 0;font-size:.9em}
-  .switch a{margin-right:1em}
-  .panels{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1em;margin:1em 0}
-  .panel{border:1px solid #ddd;border-radius:4px;padding:.4em .7em .6em;background:#fafafa;min-height:6em}
-  .panel h2{margin:.2em 0 .4em;border-bottom:1px solid #ddd}
-  .panel ul{margin:0;padding-left:1.1em;font-size:.85em}
-  .panel li{margin:.25em 0}
-  .id{color:#888;font-family:ui-monospace,monospace;font-size:.85em}
-  .empty{color:#999;font-style:italic;list-style:none;margin-left:-1.1em}
-  .note{color:#999;font-size:.8em}
-  #timeline,#gates{list-style:none;margin:0;padding:.3em .5em;border:1px solid #ddd;
-                   border-radius:4px;font-size:.85em;background:#fff}
-  #timeline{max-height:28em;overflow-y:auto}
-  #timeline li,#gates li{margin:.15em 0;padding:.1em .3em;border-radius:3px}
-  .ts{color:#999;font-family:ui-monospace,monospace;font-size:.85em;margin-right:.5em}
-  .tag{font-family:ui-monospace,monospace;font-size:.85em;margin-right:.5em}
-  li.tag-R{background:#fff3cd}
-  li.tag-K{background:#d4edda}
-  li.tag-S{background:#cce5ff}
-  li.tag-artifact{background:#f8d7da}
-  li.tag-intent{background:#e2e3e5}
-  li.tag-gate,li.tag-skill{background:#e8f5e9}
-  li.tag-user .tag{color:#369}
-  li.tag-assistant .tag{color:#636}
-  li.tag-tool .tag{color:#a60}
-  li.rejected{background:#f8d7da}
-  li.rejected .head{color:#a11;font-weight:bold}
-  #goal-wrap{margin:1em 0;padding:.7em 1em;border:1px solid #ddd;border-radius:8px;
-             background:#fbfbfd}
-  #goal-badge{font-size:1.1em;font-weight:bold;margin-bottom:.2em}
-  #goal-badge.done{color:#1a7a34}
-  #goal-badge.pending{color:#b26a00}
-  #goal-badge.unknown{color:#888}
-  #goal-text{font-size:1.05em;color:#222}
-  #goal-next{margin-top:.25em}
-  .stats{display:flex;gap:.8em;margin:1em 0;flex-wrap:wrap}
-  .stat{display:flex;flex-direction:column;align-items:center;min-width:7.5em;
-        padding:.5em .8em;border:1px solid #ddd;border-radius:6px;background:#fafafa;
-        text-decoration:none;color:#222;cursor:pointer}
-  .stat.dead{opacity:.5;cursor:default}
-  .stat b{font-size:1.6em;line-height:1.2}
-  .stat span{font-size:.75em;color:#666}
-  .stat.alert{background:#f8d7da;border-color:#c33}
-  .stat.alert b{color:#a11}
-  .stat.attn{background:#fff8e6;border-color:#c70}
-  .stat.attn b{color:#c70}
-  details.fold{border:1px solid #ddd;border-radius:4px;background:#fff;margin:.4em 0}
-  details.fold>summary{cursor:pointer;padding:.4em .6em;font-size:.9em;color:#444;
-                       background:#f6f6f6;border-radius:4px}
-  details.fold[open]>summary{border-bottom:1px solid #ddd;border-radius:4px 4px 0 0}
-  details.fold>#timeline{border:none;border-radius:0}
-  .why{color:#a11;font-size:.9em;margin-left:1.5em;white-space:pre-wrap}
-  .replaced{text-decoration:line-through;color:#999}
-  li.tag-confirm{background:#e8f5e9}
-  li.tag-comment{background:#e8f1fb}
-  li.tag-view,li.tag-view-action{background:#ede7f6}
-  li.tag-plan,li.tag-plan-approval,li.tag-plan-progress{background:#e0f2f1}
-  #plan-list{list-style:none;margin:0;padding:.4em .6em;border:1px solid #ddd;
-             border-radius:4px;background:#fff;font-size:.9em}
-  #plan-list li{margin:.25em 0}
-  #plan-list li.done .what{color:#2a2}
-  #plan-list .mark{font-family:ui-monospace,monospace;margin-right:.3em}
-  .plan-why{color:#888;font-size:.85em;margin-left:1.7em}
-  .gate{border:2px solid #c70;border-radius:4px;padding:.5em .7em;margin:.5em 0;background:#fff8e6}
-  .gate-head{font-weight:bold}
-  .gate-detail{font-size:.85em;color:#555;margin:.3em 0;white-space:pre-wrap}
-  .gate-btns{margin-top:.5em}
-  .gate-btns button{margin-right:.7em;padding:.25em 1.2em;border-radius:4px;border:1px solid #999;
-                    cursor:pointer;font-size:.9em}
-  .gate-btns button.approve{background:#d4edda;border-color:#2a2}
-  .gate-btns button.deny{background:#f8d7da;border-color:#c33}
-  .diff{font-family:ui-monospace,monospace;font-size:.8em;background:#f6f6f6;border:1px solid #ddd;
-        border-radius:3px;padding:.3em .5em;margin:.3em 0;max-height:20em;overflow:auto;white-space:pre}
-  .diff-file{color:#666;font-weight:bold;margin-bottom:.2em}
-  .d-add{background:#d4edda;color:#0a3}
-  .d-del{background:#f8d7da;color:#a11}
-  .d-meta{color:#888}
-  .d-ctx{color:#444}
-  #aview{border:1px solid #99c;border-radius:4px;padding:.6em .8em;background:#f6f8ff;font-size:.9em}
-  .v-row{display:flex;gap:1em;flex-wrap:wrap}
-  .v-col,.v-form{display:flex;flex-direction:column;gap:.4em}
-  .v-form{border:1px dashed #aac;border-radius:4px;padding:.4em .6em}
-  .v-text{white-space:pre-wrap}
-  .v-input input{margin-left:.4em;padding:.15em .4em;border:1px solid #999;border-radius:3px}
-  .v-button{align-self:flex-start;padding:.25em 1.2em;border-radius:4px;border:1px solid #669;
-            background:#dde5ff;cursor:pointer;font-size:.9em}
-  .v-err{color:#a11;font-style:italic}
-  #aview table{border-collapse:collapse}
-  #aview th,#aview td{border:1px solid #bbb;padding:.2em .5em;text-align:left}
-  #aview th{background:#eef}
-  #issues{display:flex;flex-direction:column;gap:.5em;margin:.5em 0}
-  .issue{border:1px solid #ddd;border-left:4px solid #c70;border-radius:4px;
-         padding:.4em .7em;background:#fffdf5}
-  .issue.contested{border-left-color:#c33;background:#fff5f5}
+<style>""" + BASE_CSS + """
+  /* ---- header ---- */
+  #topbar{display:flex;align-items:center;gap:1.2em;flex-wrap:wrap;
+          padding:.5em 1em;background:var(--panel);border-bottom:1px solid var(--border)}
+  .topbar-left{display:flex;align-items:center;gap:.5em}
+  .topbar-left h1{font-size:1.1em}
+  .topbar-mid{display:flex;gap:.6em;flex-wrap:wrap;flex:1}
+  .topbar-right{display:flex;gap:.5em;align-items:center;margin-left:auto}
+  .dot{display:inline-block;width:.65em;height:.65em;border-radius:50%;background:var(--muted)}
+  .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .dot.off{background:var(--danger)}
+  .pill{font-size:.78em;padding:.2em .7em;border-radius:10px;background:var(--panel2);
+        color:var(--muted);border:1px solid var(--border)}
+  .pill#pill-busy{background:#3a2c05;color:var(--warn);border-color:var(--warn)}
+
+  .stat{display:flex;flex-direction:column;align-items:center;min-width:6.5em;
+        padding:.3em .7em;border:1px solid var(--border);border-radius:6px;background:var(--panel2);
+        cursor:pointer;color:var(--text)}
+  .stat:hover{border-color:var(--accent)}
+  .stat.dead{opacity:.4;cursor:default}
+  .stat.dead:hover{border-color:var(--border)}
+  .stat b{font-size:1.3em;line-height:1.2}
+  .stat span{font-size:.7em;color:var(--muted)}
+  .stat.alert{background:#3b1418;border-color:var(--danger)}
+  .stat.alert b{color:var(--danger)}
+  .stat.attn{background:#3a2c05;border-color:var(--warn)}
+  .stat.attn b{color:var(--warn)}
+
+  /* ---- goal banner ---- */
+  #goal-wrap{margin:.7em 1em;padding:.6em 1em;border:1px solid var(--border);border-radius:8px;
+             background:var(--panel)}
+  #goal-badge{font-size:1.05em;font-weight:bold;margin-bottom:.2em}
+  #goal-badge.done{color:var(--ok)}
+  #goal-badge.pending{color:var(--warn)}
+  #goal-badge.unknown{color:var(--muted)}
+  #goal-text{font-size:1em}
+
+  /* ---- 3 ペインレイアウト ---- */
+  .layout{display:grid;grid-template-columns:220px minmax(0,1fr) 320px;gap:0;
+          align-items:start}
+  #sidebar-left,#sidebar-right{background:var(--bg2);padding:.8em;
+          max-height:calc(100vh - 6.5em);overflow-y:auto;position:sticky;top:0}
+  #main-pane{padding:.8em 1em 2em;min-width:0;display:flex;flex-direction:column}
+
+  .side-block{margin-bottom:1.3em}
+  .side-block h2{font-size:.78em;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);
+                 border-bottom:1px solid var(--border);padding-bottom:.3em;margin-bottom:.5em}
+  .switch{display:flex;flex-direction:column;gap:.3em;font-size:.9em}
+
+  /* ---- ページモーダル (/sessions /spec を iframe で重ね表示) ---- */
+  #page-modal{position:fixed;inset:0;display:none;z-index:1000;
+              background:rgba(0,0,0,.6);align-items:center;justify-content:center}
+  #page-modal.open{display:flex}
+  #page-modal-box{width:92%;height:90%;background:var(--bg);border:1px solid var(--border);
+                  border-radius:10px;display:flex;flex-direction:column;overflow:hidden}
+  #page-modal-head{display:flex;align-items:center;gap:.6em;padding:.4em .8em;
+                   background:var(--panel);border-bottom:1px solid var(--border)}
+  #page-modal-title{font-size:.9em;color:var(--muted)}
+  #page-modal-close{margin-left:auto;background:none;border:1px solid var(--border);
+                    border-radius:6px;color:var(--text);cursor:pointer;font-size:1em;
+                    padding:.1em .6em;line-height:1.4}
+  #page-modal-close:hover{border-color:var(--accent)}
+  #page-modal-frame{flex:1;border:0;width:100%;background:var(--bg)}
+
+  /* ---- agent カード ---- */
+  .agent-card{background:var(--panel);border:1px solid var(--border);border-radius:6px;
+              padding:.5em .7em;margin-bottom:.5em}
+  .agent-card-head{display:flex;align-items:center;gap:.45em;font-weight:600}
+  .agent-dot{width:.6em;height:.6em;border-radius:50%;background:var(--muted);flex:none}
+  .agent-dot.busy{background:var(--accent);box-shadow:0 0 6px var(--accent)}
+  .agent-dot.idle{background:var(--muted)}
+  .agent-dot.ok{background:var(--ok)}
+  .agent-dot.attn{background:var(--warn)}
+  .agent-dot.danger{background:var(--danger);box-shadow:0 0 6px var(--danger)}
+  .agent-status{font-size:.82em;color:var(--muted);margin-top:.25em;white-space:pre-wrap}
+
+  /* ---- kind フィルタ ---- */
+  .filter-bar{display:flex;gap:.4em;flex-wrap:wrap;margin-bottom:.6em}
+  .filt{background:var(--panel2);border:1px solid var(--border);color:var(--muted);
+        border-radius:12px;padding:.2em .8em;font-size:.8em;cursor:pointer}
+  .filt.active{background:var(--accent);color:#04101f;border-color:var(--accent);font-weight:600}
+
+  /* ---- chat 風 timeline ---- */
+  #chat-timeline{list-style:none;margin:0 0 1em;padding:.6em;flex:0 0 auto;
+                 display:flex;flex-direction:column;gap:.4em;overflow-y:auto;
+                 border:1px solid var(--border);border-radius:8px;background:var(--panel);
+                 min-height:16em;max-height:60vh}
+  .ev{border-radius:6px;padding:.35em .6em;font-size:.87em;border-left:3px solid var(--border);
+      background:var(--panel2)}
+  .ev-head{display:flex;gap:.5em;align-items:baseline;flex-wrap:wrap}
+  .ev-ts{color:var(--muted);font-family:ui-monospace,monospace;font-size:.8em}
+  .ev-badge{font-family:ui-monospace,monospace;font-size:.76em;padding:.05em .55em;
+            border-radius:8px;background:#22272e;color:var(--muted)}
+  .ev-body{white-space:pre-wrap;word-break:break-word;margin-top:.15em}
+  .ev-why{color:var(--danger);font-size:.85em;margin-top:.25em;white-space:pre-wrap}
+  .ev.rejected{background:#3b1418;border-left-color:var(--danger)}
+  .ev.rejected .ev-body{color:#ff9a95;font-weight:600}
+  .ev.verdict-done{outline:1px solid var(--ok)}
+  .ev.verdict-next{outline:1px solid var(--warn)}
+  .ev.verdict-stuck{outline:2px solid var(--danger)}
+  .ev.verdict-stuck .ev-body{color:#ff9a95;font-weight:600}
+  /* ---- actor (誰の発言/動作か) 別インデント。 データ由来の色帯 (data-tag) とは
+     別次元として共存させる — 変更しない。 #chat-timeline は既に
+     display:flex;flex-direction:column なので align-self がそのまま効く。 */
+  .ev[data-actor="executor"]{margin-right:4em}
+  .ev[data-actor="judge"]{margin-left:1.6em;margin-right:2.4em}
+  .ev[data-actor="human"]{margin-left:4em;align-self:flex-end;max-width:80%}
+  .ev[data-actor="system"]{margin-left:2.4em;margin-right:2.4em;opacity:.85;font-style:italic}
+  .ev[data-tag="assistant"]{border-left-color:var(--info)}
+  .ev[data-tag="tool"]{border-left-color:var(--warn)}
+  .ev[data-tag="user"]{border-left-color:var(--muted)}
+  .ev[data-tag="R"]{border-left-color:#d2b13a}
+  .ev[data-tag="K"]{border-left-color:var(--ok)}
+  .ev[data-tag="S"]{border-left-color:var(--accent)}
+  .ev[data-cat="gate"]{border-left-color:var(--ok)}
+  .ev[data-cat="plan"]{border-left-color:#2dd4bf}
+  .ev[data-cat="comment"]{border-left-color:#7ee787}
+  .ev-badge.author-human{background:#123a5e;color:#79c0ff}
+  .ev-badge.author-executor{background:#2f1e57;color:#d2a8ff}
+  .ev-badge.author-judge{background:#123d1f;color:#7ee787}
+  .ev-badge.author-system{background:#22272e;color:var(--muted)}
+  #chat-timeline.hide-turn .ev[data-cat="turn"]{display:none}
+  #chat-timeline.hide-gate .ev[data-cat="gate"]{display:none}
+  #chat-timeline.hide-comment .ev[data-cat="comment"]{display:none}
+  #chat-timeline.hide-spec .ev[data-cat="spec"]{display:none}
+  #chat-timeline.hide-plan .ev[data-cat="plan"]{display:none}
+  #chat-timeline.hide-other .ev[data-cat="other"]{display:none}
+
+  /* ---- 折りたたみ (掘る用) ---- */
+  details.fold{border:1px solid var(--border);border-radius:6px;background:var(--panel);margin:.6em 0}
+  details.fold>summary{cursor:pointer;padding:.4em .6em;font-size:.85em;color:var(--muted);
+                       background:var(--panel2);border-radius:6px;list-style:none}
+  details.fold>summary::-webkit-details-marker{display:none}
+  details.fold>summary::before{content:"▸ ";}
+  details.fold[open]>summary::before{content:"▾ ";}
+  details.fold[open]>summary{border-bottom:1px solid var(--border);border-radius:6px 6px 0 0}
+  details.fold>div,details.fold>ul,details.fold>ol,details.fold>pre{margin:0;padding:.6em .8em}
+
+  /* ---- R issue カード ---- */
+  #issues{display:flex;flex-direction:column;gap:.5em;margin:.3em 0 .8em}
+  .issue{border:1px solid var(--border);border-left:4px solid var(--warn);border-radius:6px;
+         padding:.4em .7em;background:var(--panel2)}
+  .issue.contested{border-left-color:var(--danger)}
   .issue-head{display:flex;align-items:center;gap:.5em;flex-wrap:wrap}
   .issue-text{margin:.15em 0 .3em;font-size:.95em}
-  .issue-why{color:#777;font-size:.82em;margin:.1em 0 0 .3em}
+  .issue-why{color:var(--muted);font-size:.82em;margin:.1em 0 0 .3em}
   .chip{display:inline-block;font-size:.72em;padding:.05em .55em;border-radius:9px;
-        border:1px solid #bbb;background:#f0f0f0;color:#555;font-family:ui-monospace,monospace}
-  .chip.warn{background:#f8d7da;border-color:#c33;color:#a11}
-  .chip.ok{background:#d4edda;border-color:#2a2;color:#161}
-  .chip.info{background:#cce5ff;border-color:#69c;color:#247}
-  .issue-btns button{font-size:.78em;padding:.1em .8em;border-radius:4px;border:1px solid #999;
-                     background:#eef;cursor:pointer}
-  #thread{list-style:none;margin:0;padding:.4em .6em;border:1px solid #ddd;border-radius:4px;
-          background:#fff;font-size:.88em;max-height:24em;overflow-y:auto}
-  #thread li{margin:.45em 0;padding:.3em .6em;border-radius:6px;background:#f6f6f6;
-             border-left:3px solid #bbb}
-  #thread .author{font-weight:bold;font-size:.85em;margin-right:.6em}
-  #thread .body{white-space:pre-wrap;word-break:break-word;display:block;margin-top:.1em}
-  #thread li.a-human{background:#e8f1fb;border-left-color:#369}
-  #thread li.a-human .author{color:#369}
-  #thread li.a-executor{background:#f3ecf9;border-left-color:#849}
-  #thread li.a-executor .author{color:#849}
-  #thread li.a-judge{background:#e9f6ee;border-left-color:#2a2}
-  #thread li.a-judge .author{color:#181}
-  #thread li.a-system{background:#f4f4f4;border-left-color:#999;color:#666}
-  #comment-form{display:flex;gap:.5em;margin:.5em 0;align-items:flex-start}
-  #comment-form textarea{flex:1;padding:.3em .5em;border:1px solid #999;border-radius:4px;
-                         font-family:inherit;font-size:.9em}
-  #comment-form select{padding:.25em;border:1px solid #999;border-radius:4px;font-size:.85em}
-  #comment-form button{padding:.3em 1.2em;border-radius:4px;border:1px solid #369;
-                       background:#dde9ff;cursor:pointer}
+        border:1px solid var(--border);background:var(--panel);color:var(--muted);
+        font-family:ui-monospace,monospace}
+  .chip.warn{background:#3b1418;border-color:var(--danger);color:#ff9a95}
+  .chip.ok{background:#123d1f;border-color:var(--ok);color:#7ee787}
+  .chip.info{background:#123a5e;border-color:var(--accent);color:#79c0ff}
+  .issue-btns button{font-size:.78em;padding:.1em .8em;border-radius:4px;border:1px solid var(--border);
+                     background:var(--panel);color:var(--text);cursor:pointer}
+  .issue-btns button:hover{border-color:var(--accent)}
+
+  .panels{display:flex;gap:1em;margin:.5em 0;flex-wrap:wrap}
+  .panel{flex:1;min-width:12em;border:1px solid var(--border);border-radius:6px;
+         padding:.3em .6em .5em;background:var(--panel2)}
+  .panel ul{margin:0;padding-left:1.1em;font-size:.85em}
+  .panel li{margin:.25em 0}
+
+  /* ---- plan checklist ---- */
+  #plan-list{list-style:none;margin:0;padding:0;font-size:.88em}
+  #plan-list li{margin:.3em 0;padding:.2em 0}
+  #plan-list li.done .what{color:var(--ok)}
+  #plan-list .mark{font-family:ui-monospace,monospace;margin-right:.3em}
+  .plan-why{color:var(--muted);font-size:.85em;margin-left:1.4em}
+
+  /* ---- gate インボックス ---- */
+  .gate{border:1px solid var(--warn);border-radius:6px;padding:.5em .7em;margin:.5em 0;
+        background:#241b06}
+  .gate-head{font-weight:bold}
+  .gate-detail{font-size:.85em;color:var(--muted);margin:.3em 0;white-space:pre-wrap}
+  .gate-btns{margin-top:.5em;display:flex;gap:.6em}
+  .gate-btns button{padding:.25em 1.1em;border-radius:4px;border:1px solid var(--border);
+                    cursor:pointer;font-size:.88em;background:var(--panel2);color:var(--text)}
+  .gate-btns button.approve{background:#123d1f;border-color:var(--ok);color:#7ee787}
+  .gate-btns button.deny{background:#3b1418;border-color:var(--danger);color:#ff9a95}
+
+  .diff{font-family:ui-monospace,monospace;font-size:.8em;background:#0d1016;
+        border:1px solid var(--border);border-radius:4px;padding:.3em .5em;margin:.3em 0;
+        max-height:20em;overflow:auto;white-space:pre}
+  .diff-file{color:var(--muted);font-weight:bold;margin-bottom:.2em}
+  .d-add{background:#0f2a17;color:#7ee787}
+  .d-del{background:#3b1418;color:#ff9a95}
+  .d-meta{color:var(--muted)}
+  .d-ctx{color:var(--text)}
+
+  /* ---- agent view (show-view) ---- */
+  #aview{border:1px solid var(--info);border-radius:6px;padding:.6em .8em;background:#171227;font-size:.9em}
+  .v-row{display:flex;gap:1em;flex-wrap:wrap}
+  .v-col,.v-form{display:flex;flex-direction:column;gap:.4em}
+  .v-form{border:1px dashed var(--info);border-radius:4px;padding:.4em .6em}
+  .v-text{white-space:pre-wrap}
+  .v-input input{margin-left:.4em;padding:.15em .4em;border:1px solid var(--border);
+                 border-radius:3px;background:var(--bg2);color:var(--text)}
+  .v-button{align-self:flex-start;padding:.25em 1.2em;border-radius:4px;border:1px solid var(--info);
+            background:#241a3d;color:var(--text);cursor:pointer}
+  .v-err{color:var(--danger);font-style:italic}
+  #aview table{border-collapse:collapse}
+  #aview th,#aview td{border:1px solid var(--border);padding:.2em .5em;text-align:left}
+  #aview th{background:var(--panel2)}
+
+  /* ---- memory ---- */
+  #memory-index{max-height:14em;overflow-y:auto;font-size:.85em;background:#0d1016;
+                border:1px solid var(--border);border-radius:4px;padding:.5em .7em;
+                white-space:pre-wrap;color:var(--text)}
+  #memory-files{font-size:.85em}
+
+  /* ---- goal board ---- */
+  #goalboard{list-style:none;margin:0;padding:0;font-size:.86em;display:flex;
+             flex-direction:column;gap:.4em}
+  .goal-item{border:1px solid var(--border);border-radius:6px;padding:.4em .6em;background:var(--panel2)}
+  .goal-badge{display:inline-block;font-size:.72em;padding:.05em .6em;border-radius:9px;
+              margin-bottom:.2em;font-family:ui-monospace,monospace}
+  .status-running .goal-badge{background:#123a5e;color:#79c0ff}
+  .status-done .goal-badge{background:#123d1f;color:#7ee787}
+  .status-failed .goal-badge{background:#3b1418;color:#ff9a95}
+  .goal-item.judge-task{border-left:4px solid var(--info)}
+  .status-judge-task .goal-badge{background:#241a3d;color:#d2a8ff}
+  .goal-text{white-space:pre-wrap;word-break:break-word}
+  .goal-result{color:var(--muted);font-size:.85em;margin-top:.2em;white-space:pre-wrap}
+
+  /* ---- 入力フォーム ---- */
+  .stack-form{display:flex;flex-direction:column;gap:.4em;margin-bottom:.8em}
+  .stack-form select,.stack-form textarea{padding:.3em .5em;border:1px solid var(--border);
+      border-radius:4px;background:var(--bg2);color:var(--text);font-family:inherit;font-size:.88em}
+  .stack-form button{padding:.35em 1em;border-radius:4px;border:1px solid var(--accent);
+      background:#123a5e;color:#cfe6ff;cursor:pointer;font-size:.88em}
+  .stack-form button:hover{background:#1a4a75}
+
+  /* ---- レスポンシブ (最低限) ---- */
+  @media (max-width: 980px){
+    .layout{display:block}
+    #sidebar-left,#sidebar-right{max-height:none;position:static;overflow-y:visible}
+    #chat-timeline{max-height:40vh}
+  }
 </style></head><body>
-<h1>lispy view <span class="dot" id="conn"></span></h1>
-<div class="meta">scope: <span id="scope"></span> — session: <span id="sess">…</span></div>
-<div class="switch">
-  <a href="/view">current session</a>
-  <a href="/view?session=all">all sessions</a>
-  <a href="/sessions">sessions</a>
-  <a href="/spec">spec</a>
-</div>
+<header id="topbar">
+  <div class="topbar-left">
+    <h1>lispy view</h1>
+    <span class="dot" id="conn"></span>
+  </div>
+  <div class="topbar-mid" id="summary">
+    <a class="stat" href="#chat-timeline"><b id="st-steps">0</b><span>step (24h)</span></a>
+    <a class="stat" href="#chat-timeline"><b id="st-tools">0</b><span>tool (24h)</span></a>
+    <a class="stat" id="stat-rejects" href="#gates-wrap"><b id="st-rejects">0</b><span>REJECT (24h)</span></a>
+    <a class="stat" id="stat-skill" href="#gates-wrap"><b id="st-skill">0</b><span>SKILL.md 書換 (24h)</span></a>
+    <a class="stat" id="stat-pending" href="#pending-wrap"><b id="st-pending">0</b><span>承認待ち</span></a>
+    <a class="stat" id="stat-plan" href="#plan-wrap"><b id="st-plan">—</b><span>plan</span></a>
+  </div>
+  <div class="topbar-right">
+    <span class="pill" id="pill-busy" style="display:none">評価実行中</span>
+    <span class="pill" id="pill-watchers">閲覧中 0</span>
+  </div>
+</header>
 <div id="goal-wrap" style="display:none">
   <div id="goal-badge"></div>
   <div id="goal-text"></div>
   <div id="goal-next" class="note"></div>
 </div>
-<div class="stats" id="summary">
-  <a class="stat" href="#timeline-wrap"><b id="st-steps">0</b><span>step (24h)</span></a>
-  <a class="stat" href="#timeline-wrap"><b id="st-tools">0</b><span>tool (24h)</span></a>
-  <a class="stat" id="stat-rejects" href="#gates-wrap"><b id="st-rejects">0</b><span>REJECT (24h)</span></a>
-  <a class="stat" id="stat-skill" href="#gates-wrap"><b id="st-skill">0</b><span>SKILL.md 書換 (24h)</span></a>
-  <a class="stat" id="stat-pending" href="#pending-wrap"><b id="st-pending">0</b><span>承認待ち</span></a>
-  <a class="stat" id="stat-plan" href="#plan-wrap"><b id="st-plan">—</b><span>plan</span></a>
+<div class="layout">
+  <aside id="sidebar-left">
+    <div class="side-block">
+      <h2>エージェント</h2>
+      <div class="agent-card" id="agent-executor">
+        <div class="agent-card-head"><span class="agent-dot" id="dot-executor"></span><span>executor</span></div>
+        <div class="agent-status" id="status-executor">-</div>
+      </div>
+      <div class="agent-card" id="agent-judge">
+        <div class="agent-card-head"><span class="agent-dot" id="dot-judge"></span><span>judge</span></div>
+        <div class="agent-status" id="status-judge">-</div>
+      </div>
+      <div class="agent-card" id="agent-autostep">
+        <div class="agent-card-head"><span class="agent-dot" id="dot-autostep"></span><span>auto-step</span></div>
+        <div class="agent-status" id="status-autostep">-</div>
+      </div>
+    </div>
+    <div class="side-block">
+      <h2>セッション</h2>
+      <div class="note">scope: <span id="scope"></span></div>
+      <div class="note" style="margin-bottom:.6em">session: <span id="sess">…</span></div>
+      <nav class="switch">
+        <a href="/view">現在の session</a>
+        <a href="/view?session=all">全 session</a>
+        <a href="/sessions" data-modal="sessions">session 一覧</a>
+        <a href="/spec" data-modal="spec">spec</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main id="main-pane">
+    <div class="filter-bar" id="kind-filters">
+      <button class="filt active" data-cat="turn" type="button">step</button>
+      <button class="filt active" data-cat="gate" type="button">gate</button>
+      <button class="filt active" data-cat="comment" type="button">comment</button>
+      <button class="filt active" data-cat="spec" type="button">R/K/S</button>
+      <button class="filt active" data-cat="plan" type="button">plan</button>
+      <button class="filt active" data-cat="other" type="button">other</button>
+    </div>
+    <ol id="chat-timeline"></ol>
+
+    <details class="fold" id="aview-wrap" style="display:none">
+      <summary>agent view <span class="note">(show-view による提示)</span></summary>
+      <div id="aview"></div>
+    </details>
+
+    <details class="fold" id="ledger-wrap" open>
+      <summary>R / K / S 台帳</summary>
+      <div id="issues-wrap">
+        <h3>R — requirements <span class="note">(委譲 = その R を goal に auto-step を起動)</span></h3>
+        <div id="issues"></div>
+      </div>
+      <div class="panels">
+        <div class="panel"><h3>K</h3><ul id="panel-K"></ul></div>
+        <div class="panel"><h3>S</h3><ul id="panel-S"></ul></div>
+      </div>
+    </details>
+
+    <details class="fold" id="memory-wrap" style="display:none">
+      <summary>memory <span class="note" id="memory-meta"></span></summary>
+      <pre id="memory-index"></pre>
+      <ul id="memory-files"></ul>
+    </details>
+
+    <details class="fold" id="gates-wrap">
+      <summary>gate / confirm 判定履歴 <span class="note">(直近 20 件)</span></summary>
+      <ul id="gates"></ul>
+    </details>
+  </main>
+
+  <aside id="sidebar-right">
+    <div class="side-block" id="pending-wrap" style="display:none">
+      <h2>gate インボックス</h2>
+      <div id="pending"></div>
+    </div>
+    <div class="side-block" id="plan-wrap" style="display:none">
+      <h2>plan <span class="note" id="plan-meta"></span></h2>
+      <ol id="plan-list"></ol>
+    </div>
+    <div class="side-block" id="goalboard-wrap">
+      <h2>goal board <span class="note">(delegate 実行状況、 ログから導出)</span></h2>
+      <ul id="goalboard"></ul>
+    </div>
+    <div class="side-block" id="input-wrap">
+      <h2>入力</h2>
+      <form id="comment-form" class="stack-form">
+        <select id="comment-to">
+          <option value="executor">→ executor</option>
+          <option value="judge">→ judge</option>
+        </select>
+        <textarea id="comment-text" rows="2"
+                  placeholder="executor 宛は次の round 境界で注入、judge 宛は即応答"></textarea>
+        <button type="submit">送信</button>
+      </form>
+      <form id="delegate-form" class="stack-form">
+        <textarea id="delegate-text" rows="2" placeholder="goal を入力して auto-step を起動 (委譲)"></textarea>
+        <button type="submit">委譲 (auto-step 起動)</button>
+      </form>
+    </div>
+  </aside>
 </div>
-<div id="pending-wrap" style="display:none">
-  <h2>承認待ち gate</h2>
-  <div id="pending"></div>
-</div>
-<div id="plan-wrap" style="display:none">
-  <h2>plan <span class="note" id="plan-meta"></span></h2>
-  <ol id="plan-list"></ol>
-</div>
-<div id="issues-wrap">
-  <h2>R — requirements <span class="note">(委譲 = その R を goal に auto-step を起動)</span></h2>
-  <div id="issues"></div>
-</div>
-<div class="panels" style="grid-template-columns:1fr 1fr">
-  <div class="panel"><h2>K</h2><ul id="panel-K"></ul></div>
-  <div class="panel"><h2>S</h2><ul id="panel-S"></ul></div>
-</div>
-<div id="memory-wrap" style="display:none">
-  <h2>memory <span class="note" id="memory-meta"></span></h2>
-  <pre id="memory-index" style="max-height:14em;overflow-y:auto;font-size:.85em;
-       background:#fafafa;border:1px solid #ddd;border-radius:4px;padding:.5em .7em;
-       white-space:pre-wrap"></pre>
-  <ul id="memory-files" style="font-size:.85em"></ul>
-</div>
-<div id="thread-wrap">
-  <h2>thread <span class="note">(human ↔ executor ↔ judge)</span></h2>
-  <ol id="thread"></ol>
-  <form id="comment-form">
-    <select id="comment-to">
-      <option value="executor">→ executor</option>
-      <option value="judge">→ judge</option>
-    </select>
-    <textarea id="comment-text" rows="2" placeholder="executor 宛は次の round 境界で注入、judge 宛は即応答"></textarea>
-    <button type="submit">送信</button>
-  </form>
-</div>
-<div id="aview-wrap" style="display:none">
-  <h2>agent view <span class="note">(show-view による提示)</span></h2>
-  <div id="aview"></div>
-</div>
-<details class="fold" id="timeline-wrap">
-  <summary>timeline — 掘る用 <span class="note">(turns + ledger、 直近 100 件)</span></summary>
-  <ol id="timeline"></ol>
-</details>
-<div id="gates-wrap">
-  <h2>gate / confirm 判定履歴 <span class="note">(直近 20 件)</span></h2>
-  <ul id="gates"></ul>
+
+<!-- /sessions /spec をページ遷移せず重ねて見るためのモーダル (中身は同一オリジン iframe。
+     /spec の mermaid CDN 読込は iframe 内に閉じるので /view 本体の自己完結原則は保たれる) -->
+<div id="page-modal">
+  <div id="page-modal-box">
+    <div id="page-modal-head">
+      <span id="page-modal-title"></span>
+      <button id="page-modal-close" type="button" title="閉じる (ESC)">×</button>
+    </div>
+    <iframe id="page-modal-frame" src="about:blank" title="埋め込みページ"></iframe>
+  </div>
 </div>
 <script>
 "use strict";
 const params = new URLSearchParams(location.search);
 const scope = params.get("session") || "current";
 document.getElementById("scope").textContent = scope;
-const seen = new Set();
+
 let es = null;
 let retryTimer = null;
+let pinned = true;              // chat-timeline を最新に追随させるか (上にスクロール中は止める)
+const seen = new Set();         // dedupe key: "<src>:<id>"
+let timelineEvents = [];        // 表示中の event (goal board 導出にも使う)
+const TIMELINE_MAX = 300;
+let memTail = "";               // memory dir 検出用 (renderMemory が設定)
+let aviewVersion = -1;
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -1204,16 +1457,193 @@ function el(tag, cls, text) {
 function fmtTs(ts) {
   return new Date(ts * 1000).toLocaleTimeString("ja-JP", { hour12: false });
 }
-function evLi(ev) {
-  const li = el("li", "tag-" + ev.tag + (ev.rejected ? " rejected" : ""));
-  li.append(el("span", "ts", fmtTs(ev.ts)),
-            el("span", "tag", "[" + ev.tag + "]"),
-            el("span", "head", ev.head || ""));
-  if (ev.why) li.append(el("div", "why", ev.why));
-  return li;
-}
 function setStatus(on) {
   document.getElementById("conn").className = "dot " + (on ? "on" : "off");
+}
+function bumpSummary(id) {
+  const b = document.getElementById(id);
+  b.textContent = (parseInt(b.textContent, 10) || 0) + 1;
+}
+
+// --- kind 分類 (フィルタ / 見た目の両方で使う) ---
+function evCategory(ev) {
+  if (ev.src === "turn") return "turn";
+  switch (ev.tag) {
+    case "gate": case "skill": case "confirm": return "gate";
+    case "comment": return "comment";
+    case "R": case "K": case "S": return "spec";
+    case "plan": case "plan-approval": case "plan-progress": return "plan";
+    default: return "other";
+  }
+}
+
+// --- actor (誰の発言/動作か) の導出 ---
+// turns は全部 executor 側 trajectory (judge の応答は append-turn されず DB 非記録 —
+// auto.lispy の judge-call / lispy.py _prim_judge_call 参照)。 comment は author を
+// そのまま使う (未知値は system にフォールバック)。 confirm / plan-approval は
+// source (view.py _meta_to_event が新規透過するフィールド)。 gate は why 文字列の
+// プレフィックスによるヒューリスティック (lispy.py の文言が変わると judge に
+// フォールバックするだけで壊れない)。 skill は judge 固定 (_gate_judge_skill)。
+// view-action はブラウザ操作なので human。 それ以外 (R/K/S/intent/plan/
+// plan-progress/replay/test-S-R/restore-S 等の ledger 記帳イベント) は簡略化して
+// executor 扱い (会話の主役ではないため actor インデントは主に効かせない)。
+//
+// | イベント             | 条件                                          | actor    |
+// |----------------------|-----------------------------------------------|----------|
+// | src=turn              | 常に                                           | executor |
+// | tag=comment           | author (既知集合外は system)                   | author   |
+// | tag=confirm           | source が browser/terminal                     | human    |
+// | 〃                    | source が no-answerer/timeout/answerer-lost    | system   |
+// | tag=plan-approval     | source が human                                | human    |
+// | 〃                    | source が judge                                | judge    |
+// | tag=gate              | why が "human-approved" で始まる               | human    |
+// | 〃                    | why が "python primitive"/"structural check:"  | system   |
+// | 〃 (既定)             | 上記以外 (_gate_call_judge)                    | judge    |
+// | tag=skill             | 常に (_gate_judge_skill は judge 固定)          | judge    |
+// | tag=view-action       | 常に (ボタン押下)                              | human    |
+// | それ以外 (既定)       | R/K/S/intent/plan/plan-progress/replay 等       | executor |
+const CANON_ACTORS = new Set(["executor", "judge", "human", "system"]);
+function evActor(ev) {
+  if (ev.src === "turn") return "executor";
+  switch (ev.tag) {
+    case "comment": {
+      const a = ev.author || "";
+      return CANON_ACTORS.has(a) ? a : "system";
+    }
+    case "confirm":
+      if (ev.source === "browser" || ev.source === "terminal") return "human";
+      return "system"; // no-answerer/timeout/answerer-lost、および未知値は fail-closed で system
+    case "plan-approval":
+      if (ev.source === "human") return "human";
+      if (ev.source === "judge") return "judge";
+      return "system"; // 未知値は fail-closed で system
+    case "gate": {
+      const why = ev.why || "";
+      if (why.startsWith("human-approved")) return "human";
+      if (why.startsWith("python primitive") || why.startsWith("structural check:")) return "system";
+      return "judge"; // _gate_call_judge による判定の既定
+    }
+    case "skill": return "judge";
+    case "view-action": return "human";
+    default: return "executor"; // R/K/S/intent/plan/plan-progress/replay 等の記帳イベント
+  }
+}
+
+// 生タグ → 日本語ラベル (要件 3)。 comment は actorLabel() を別途使うので含めない。
+const TAG_LABELS = {
+  tool: "ツール実行", assistant: "ステップ", user: "入力",
+  plan: "計画提案", "plan-approval": "計画承認", "plan-progress": "計画進捗",
+  gate: "ゲート判定", confirm: "承認/却下", skill: "スキル更新",
+  R: "要件 (R)", K: "知識 (K)", S: "実装 (S)", intent: "意図宣言",
+  "view-action": "画面操作",
+};
+
+// executor/judge の actor バッジにモデル名を添える (要件 2)。 ACTORS は st.actors
+// (view.actors_state() — env 由来、ハードコード禁止) を renderPanels() で反映する。
+let ACTORS = {};
+function actorLabel(actor) {
+  if (actor === "executor")
+    return "executor" + (ACTORS.executor && ACTORS.executor.model ? " · " + ACTORS.executor.model : "");
+  if (actor === "judge") {
+    const j = ACTORS.judge || {};
+    const suffix = j.model ? " · " + j.model + (j.configured === false ? " (executor fallback)" : "") : "";
+    return "judge" + suffix;
+  }
+  if (actor === "human") return "human";
+  return "system";
+}
+
+// judge の comment を DONE/NEXT で分類 (host 側 _classify_verdict と同じ規則)。
+// 見た目のバッジ付け専用 — 真値 (goal 達成/未達) は st.verdict (サーバ側導出) を使う。
+function classifyVerdictText(text) {
+  const s = (text || "").trim();
+  if (/^done/i.test(s)) return "done";
+  if (/^next:/i.test(s)) return "next";
+  return null;
+}
+
+// judge NEXT: 連発の検出 (要件 5)。 stuck 相当のイベントに verdict-stuck class を
+// 付けて強調する。 init() の再初期化で 0 にリセットする (下記 init() 参照)。
+const JUDGE_STUCK_STREAK = 3; // この回数以上 NEXT が連続したら「詰まっている」とみなす
+let judgeNextStreak = 0;
+
+// --- chat 風 timeline (turns + meta_events を 1 本にした merge の描画) ---
+// li.dataset.tag は既存 CSS (.ev[data-tag="..."] の色帯) が依存するのでそのまま残す —
+// 表示文字列だけ TAG_LABELS / actorLabel() で日本語化・モデル名付与する。
+function renderEventLi(ev) {
+  const cat = evCategory(ev);
+  const actor = evActor(ev);
+  const li = el("li", "ev" + (ev.rejected ? " rejected" : ""));
+  li.dataset.cat = cat;
+  li.dataset.tag = ev.tag;
+  li.dataset.actor = actor;
+  const head = el("div", "ev-head");
+  head.append(el("span", "ev-ts", fmtTs(ev.ts)));
+  if (cat === "comment") {
+    // ev.to (宛先) は _meta_to_event が持たない (payload には入っているが未使用の
+    // 既存フィールドを増やすと SSE プロトコルに触れるため見送り) — actor だけ出す。
+    head.append(el("span", "ev-badge author-" + actor, actorLabel(actor)));
+    const v = classifyVerdictText(ev.text);
+    if (v === "next") li.classList.add(judgeNextStreak >= JUDGE_STUCK_STREAK ? "verdict-stuck" : "verdict-next");
+    else if (v) li.classList.add("verdict-" + v);
+  } else {
+    head.append(el("span", "ev-badge author-" + actor, TAG_LABELS[ev.tag] || ev.tag));
+  }
+  li.append(head);
+  const bodyText = ev.text !== undefined ? ev.text : (ev.head || "");
+  li.append(el("div", "ev-body", bodyText));
+  if (ev.why) li.append(el("div", "ev-why", ev.why));
+  return li;
+}
+
+function appendChatEvent(ev) {
+  const key = ev.src + ":" + ev.id;
+  if (seen.has(key)) return;
+  seen.add(key);
+  // judge の verdict streak を先に更新してから描画する — renderEventLi が
+  // judgeNextStreak を見て verdict-stuck を付けるかどうかを決めるため。
+  if (ev.tag === "comment" && ev.author === "judge") {
+    const v = classifyVerdictText(ev.text);
+    if (v === "next") judgeNextStreak += 1;
+    else if (v === "done") judgeNextStreak = 0;
+  }
+  timelineEvents.push(ev);
+  if (timelineEvents.length > TIMELINE_MAX) timelineEvents.shift();
+  const tl = document.getElementById("chat-timeline");
+  tl.append(renderEventLi(ev));
+  while (tl.children.length > TIMELINE_MAX) tl.removeChild(tl.firstChild);
+  if (pinned) tl.scrollTop = tl.scrollHeight;
+}
+
+document.getElementById("chat-timeline").addEventListener("scroll", () => {
+  const tl = document.getElementById("chat-timeline");
+  pinned = tl.scrollTop + tl.clientHeight >= tl.scrollHeight - 40;
+});
+
+// 初期スナップショットは st.timeline (turns+meta 直近 100) と st.comments (直近 50、
+// comment だけの深掘り) を id で dedupe して 1 本にする。 SSE は逐次 appendChatEvent。
+function mergeInitial(st) {
+  const map = new Map();
+  for (const ev of (st.timeline || [])) map.set(ev.src + ":" + ev.id, ev);
+  for (const ev of (st.comments || [])) map.set(ev.src + ":" + ev.id, ev);
+  return Array.from(map.values()).sort((a, b) => (a.ts - b.ts) || (a.id - b.id));
+}
+
+// --- kind フィルタ ---
+function wireFilters() {
+  for (const btn of document.querySelectorAll("#kind-filters .filt")) {
+    btn.addEventListener("click", () => {
+      btn.classList.toggle("active");
+      document.getElementById("chat-timeline").classList.toggle(
+        "hide-" + btn.dataset.cat, !btn.classList.contains("active"));
+    });
+  }
+}
+
+// --- header / health ---
+function renderHealth(st) {
+  document.getElementById("pill-busy").style.display = st.busy ? "" : "none";
+  document.getElementById("pill-watchers").textContent = "閲覧中 " + (st.watchers || 0);
 }
 
 function renderSummary(st) {
@@ -1234,9 +1664,25 @@ function renderSummary(st) {
   document.getElementById("stat-plan").className =
     "stat" + (p && p.status === "rejected" ? " alert"
             : p && p.status === "proposed" ? " attn" : "");
-  // 中身が空/未活性のタイルは薄く (押しても何も無いことを見た目で示す)
   document.getElementById("stat-pending").classList.toggle("dead", nPending === 0);
   document.getElementById("stat-plan").classList.toggle("dead", !p);
+}
+
+// サマリ数字のクリック — 折りたたみ details や display:none 先を開いてからスクロール。
+function wireStatClicks() {
+  for (const a of document.querySelectorAll("#summary .stat")) {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      if (a.classList.contains("dead")) return;
+      const href = a.getAttribute("href") || "";
+      const id = href.startsWith("#") ? href.slice(1) : "";
+      const tgt = id && document.getElementById(id);
+      if (!tgt) return;
+      if (tgt.tagName === "DETAILS") tgt.open = true;
+      if (tgt.style && tgt.style.display === "none") return;  // 中身無し = 飛ばない
+      tgt.scrollIntoView({behavior: "smooth", block: "start"});
+    });
+  }
 }
 
 // goal パネル — session-intent (何を目指すか) と judge verdict (達成したか) を最上部に。
@@ -1260,110 +1706,45 @@ function renderGoal(st) {
   }
 }
 
-// サマリ数字のクリック — アンカー飛びだけだと折りたたみ details や display:none 先で
-// 何も起きないので、 対象を開いて/表示してからスクロールする。
-function wireStatClicks() {
-  for (const a of document.querySelectorAll("#summary .stat")) {
-    a.addEventListener("click", (e) => {
-      e.preventDefault();
-      if (a.classList.contains("dead")) return;
-      const href = a.getAttribute("href") || "";
-      const id = href.startsWith("#") ? href.slice(1) : "";
-      const tgt = id && document.getElementById(id);
-      if (!tgt) return;
-      if (tgt.tagName === "DETAILS") tgt.open = true;
-      if (tgt.style && tgt.style.display === "none") return;  // 中身無し = 飛ばない
-      tgt.scrollIntoView({behavior: "smooth", block: "start"});
-    });
-  }
+// --- 左サイドバー: エージェント俯瞰 ---
+// executor は server.py 側で足した st.busy (_LOCK.locked()) から。 judge / auto-step は
+// ledger から導出した既存フィールド (verdict / plan) の言い換え — 新しい状態は持たない。
+function setAgentCard(key, label, state) {
+  document.getElementById("status-" + key).textContent = label;
+  document.getElementById("dot-" + key).className = "agent-dot " + state;
 }
 
-function renderPlan(p) {
-  const wrap = document.getElementById("plan-wrap");
-  const list = document.getElementById("plan-list");
-  list.replaceChildren();
-  if (!p) { wrap.style.display = "none"; return; }
-  wrap.style.display = "";
-  document.getElementById("plan-meta").textContent =
-    "#" + p.id + " [" + p.status + (p.source ? " by " + p.source : "") + "]" +
-    (p.replaces ? " (replaces #" + p.replaces + ")" : "") + " — " + (p.goal || "") +
-    (p.rationale ? "  ／ 改版理由: " + p.rationale : "");
-  for (const s of p.steps || []) {
-    const li = el("li", s.done ? "done" : "");
-    li.append(el("span", "mark", s.done ? "☑" : "☐"), el("span", "what", s.what || ""));
-    if (s.why) li.append(el("div", "plan-why", s.why));
-    list.append(li);
-  }
-}
+// 「直近」の定義はヒューリスティックなので定数化して根拠をここに置く —
+// 30 件は #chat-timeline の初期表示件数感覚に合わせた目安 (仕様として厳密ではない)。
+const RECENT_WINDOW = 30;
 
-// memory 書き込み turn の検出用 (SSE trigger)。 tool result のパスは絶対とも相対とも
-// 限らないので、 dir 末尾 2 セグメント (例 "data/memory") で照合する。
-// 誤発火は refreshPanels 1 回分 (冪等・軽量) なので広めに取る。
-let memTail = "";
+function renderAgentCards(st) {
+  // executor: 直近 RECENT_WINDOW 件以内に gate/confirm/plan-approval の却下
+  // (ev.rejected === true) があれば警告表示に切り替える。
+  const recentRejected = timelineEvents.slice(-RECENT_WINDOW).some(e => e.rejected === true);
+  setAgentCard("executor",
+    (st.busy ? "稼働中 — 評価が進行中" : "待機中") + (recentRejected ? "\\n⚠ 直近で却下あり" : ""),
+    recentRejected ? "danger" : (st.busy ? "busy" : "idle"));
 
-function renderMemory(m) {
-  const wrap = document.getElementById("memory-wrap");
-  if (!m) { wrap.style.display = "none"; memTail = ""; return; }
-  wrap.style.display = "";
-  memTail = (m.dir || "").split("/").filter(Boolean).slice(-2).join("/");
-  document.getElementById("memory-meta").textContent =
-    m.dir + " — " + (m.files || []).length + " files";
-  document.getElementById("memory-index").textContent =
-    m.index || "(index.md なし)";
-  const ul = document.getElementById("memory-files");
-  ul.replaceChildren();
-  const byNew = (m.files || []).slice().sort((a, b) => b.mtime - a.mtime);
-  for (const f of byNew.slice(0, 12)) {
-    const li = el("li");
-    li.append(document.createTextNode(
-      f.path + " (" + f.size + "B, " + new Date(f.mtime * 1000).toLocaleString() + ")"));
-    ul.append(li);
-  }
-}
-
-function bumpSummary(id) {
-  const b = document.getElementById(id);
-  b.textContent = (parseInt(b.textContent, 10) || 0) + 1;
-}
-
-function renderPanels(st) {
-  renderGoal(st);
-  renderSummary(st);
-  document.getElementById("sess").textContent =
-    st.session_id === null ? "(all)" : (st.session_id || "(none)");
-
-  renderIssues(st);
-  renderThread(st.comments || []);
-
-  const K = document.getElementById("panel-K");
-  K.replaceChildren();
-  if (!(st.K || []).length) K.append(el("li", "empty", "なし"));
-  for (const k of (st.K || []).slice(-8)) {
-    const li = el("li");
-    li.append(el("span", "id", "#" + k.id + " "),
-              document.createTextNode(k.name + ": " + k.text));
-    K.append(li);
+  const v = st.verdict;
+  if (!v) setAgentCard("judge", "未判定 (verdict なし)", "idle");
+  else if (v.done) setAgentCard("judge", "達成と判定", "ok");
+  else {
+    // judgeNextStreak (NEXT 連発カウンタ) を「未達」表示に反映、 JUDGE_STUCK_STREAK
+    // 以上で dot を attn → danger に格上げ (詰まっていることの視覚強調)。
+    const streakNote = judgeNextStreak >= 2 ? " (" + judgeNextStreak + " 回連続)" : "";
+    setAgentCard("judge", "未達" + streakNote + (v.next ? "\\nNEXT: " + v.next : ""),
+      judgeNextStreak >= JUDGE_STUCK_STREAK ? "danger" : "attn");
   }
 
-  const S = document.getElementById("panel-S");
-  S.replaceChildren();
-  if (!(st.S || []).length) S.append(el("li", "empty", "なし"));
-  for (const s of (st.S || []).slice(-8)) {
-    const li = el("li");
-    li.append(el("span", "id", "#" + s.id + " "),
-              document.createTextNode(s.name + " [" + s.kind + "] " + (s.rationale || "")));
-    S.append(li);
-  }
-
-  const G = document.getElementById("gates");
-  G.replaceChildren();
-  if (!(st.gates || []).length) G.append(el("li", "empty", "gate 判定なし"));
-  for (const g of (st.gates || [])) G.append(evLi(g));
-
-  renderPending(st.pending || []);
-  renderPlan(st.plan || null);
-  renderAgentView(st.view || null);
-  renderMemory(st.memory || null);
+  const p = st.plan;
+  const board = computeGoalBoard(timelineEvents);
+  const autostepFailed = board.length > 0 && board[0].status === "失敗";
+  if (!p) setAgentCard("autostep", "plan なし", "idle");
+  else if (p.status === "approved")
+    setAgentCard("autostep", "#" + p.id + " " + p.done + "/" + p.total + " step 完了", autostepFailed ? "danger" : "ok");
+  else if (p.status === "rejected") setAgentCard("autostep", "#" + p.id + " 却下", autostepFailed ? "danger" : "attn");
+  else setAgentCard("autostep", "#" + p.id + " 承認待ち", autostepFailed ? "danger" : "attn");
 }
 
 // --- R issue カード ---
@@ -1395,14 +1776,13 @@ function renderIssues(st) {
       head.append(el("span", "chip ok", "refined by " + r.refined_by.map(i => "#" + i).join(" ")));
     if ((r.contested_by || []).length)
       head.append(el("span", "chip warn", "contested by " + r.contested_by.map(i => "#" + i).join(" ")));
-    head.append(el("span", "ts", fmtTs(r.ts)));
+    head.append(el("span", "ev-ts", fmtTs(r.ts)));
     const btns = el("span", "issue-btns");
     const dg = el("button", "", "委譲 → executor");
-    dg.onclick = () => delegateGoal(r.id, r.head, dg);
+    dg.onclick = () => delegateGoal(r.head, dg, r.id);
     btns.append(dg);
     head.append(btns);
     card.append(head, el("div", "issue-text", r.head || ""));
-    // why — judge の分類理由 (@judge-reason) と影響 (@judge-impact) を可視化
     if (r.reason) card.append(el("div", "issue-why", "理由: " + r.reason));
     if (r.impact) card.append(el("div", "issue-why", "影響: " + r.impact));
     box.append(card);
@@ -1410,9 +1790,10 @@ function renderIssues(st) {
   if (nRep > 0) box.append(el("div", "empty", "(+" + nRep + " replaced)"));
 }
 
-async function delegateGoal(id, goal, btn) {
-  if (!confirm("R#" + id + " を goal に auto-step を起動する?\\n\\n" + goal)) return;
-  btn.disabled = true;
+async function delegateGoal(goal, btn, rid) {
+  const label = rid ? ("R#" + rid) : "goal";
+  if (!confirm(label + " を goal に auto-step を起動する?\\n\\n" + goal)) return;
+  if (btn) btn.disabled = true;
   try {
     const r = await fetch("/view/delegate", {
       method: "POST",
@@ -1423,44 +1804,11 @@ async function delegateGoal(id, goal, btn) {
   } catch (e) {
     alert("委譲の送信に失敗: " + e);
   } finally {
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
 }
 
-// --- comment thread (human ↔ executor ↔ judge) ---
-const threadSeen = new Set();
-
-function threadLi(ev) {
-  const author = ev.author || "?";
-  const li = el("li", "a-" + author);
-  li.append(el("span", "author", author),
-            el("span", "ts", fmtTs(ev.ts)),
-            el("span", "body", ev.text !== undefined ? ev.text : (ev.head || "")));
-  return li;
-}
-
-function appendThread(ev) {
-  const key = "meta:" + ev.id;
-  if (threadSeen.has(key)) return;
-  threadSeen.add(key);
-  const th = document.getElementById("thread");
-  const emp = th.querySelector(".empty");
-  if (emp) emp.remove();
-  const nearBottom = th.scrollTop + th.clientHeight >= th.scrollHeight - 40;
-  th.append(threadLi(ev));
-  while (th.children.length > 200) th.removeChild(th.firstChild);
-  if (nearBottom) th.scrollTop = th.scrollHeight;
-}
-
-function renderThread(list) {
-  const th = document.getElementById("thread");
-  th.replaceChildren();
-  threadSeen.clear();
-  if (!list.length) th.append(el("li", "empty", "コメントなし — 下のフォームから送る"));
-  for (const ev of list) appendThread(ev);
-  th.scrollTop = th.scrollHeight;
-}
-
+// --- 右サイドバー: 入力 (comment / delegate) ---
 async function sendComment(e) {
   e.preventDefault();
   const ta = document.getElementById("comment-text");
@@ -1479,7 +1827,151 @@ async function sendComment(e) {
     alert("送信に失敗: " + err);
   }
 }
-document.getElementById("comment-form").addEventListener("submit", sendComment);
+
+async function sendDelegate(e) {
+  e.preventDefault();
+  const ta = document.getElementById("delegate-text");
+  const goal = ta.value.trim();
+  if (!goal) return;
+  try {
+    const r = await fetch("/view/delegate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ goal: goal }),
+    }).then(x => x.json());
+    if (r.ok) ta.value = "";
+    else alert("委譲できない: " + (r.error || "?"));
+  } catch (err) {
+    alert("委譲の送信に失敗: " + err);
+  }
+}
+
+// --- 右サイドバー: goal board (delegate の実行状況をコメントログから導出) ---
+// [委譲] auto-step 起動: <goal>  →  [委譲 run 終了] <result> / [委譲 run 失敗] <error>
+// (server.py の _delegate_run / POST /view/delegate が刻む固定文言、 新しい書き込みは
+// 増やさず既存 kind=comment の中身をパターンマッチで読むだけ)。 実行は _LOCK で直列化
+// されるので FIFO キューとして対応させれば足りる。
+function computeGoalBoard(events) {
+  const startRe = /^\\[委譲\\] auto-step 起動: ([\\s\\S]*)$/;
+  const endRe = /^\\[委譲 run 終了\\] ([\\s\\S]*)$/;
+  const failRe = /^\\[委譲 run 失敗\\] ([\\s\\S]*)$/;
+  const comments = events.filter(e => e.tag === "comment")
+    .slice().sort((a, b) => (a.ts - b.ts) || (a.id - b.id));
+  const board = [];
+  const inFlight = [];
+  for (const ev of comments) {
+    const text = ev.text !== undefined ? ev.text : "";
+    let m;
+    if ((m = startRe.exec(text))) {
+      const item = { goal: m[1], status: "実行中", result: "" };
+      board.push(item);
+      inFlight.push(item);
+    } else if ((m = endRe.exec(text))) {
+      const item = inFlight.shift();
+      if (item) { item.status = "完了"; item.result = m[1]; }
+    } else if ((m = failRe.exec(text))) {
+      const item = inFlight.shift();
+      if (item) { item.status = "失敗"; item.result = m[1]; }
+    }
+  }
+  return board.slice(-20).reverse();
+}
+
+// judge が NEXT: と判定した内容も goal board にタスクとして出す (要件 4)。
+// クライアント側導出のみ (ledger 書き込み無し)。
+function judgeVerdictComments(events) {
+  return events.filter(e => e.tag === "comment" && e.author === "judge")
+    .slice().sort((a, b) => (a.ts - b.ts) || (a.id - b.id));
+}
+
+// 最後に確定した verdict が NEXT: のときだけ 1 件返す (streak = 末尾から連続する
+// NEXT の回数、間に DONE が挟まれば streak はリセット)。 最後が DONE (または judge
+// 発言なし) なら null — 「NEXT が複数回出ても最新 1 件しか出ない (重複しない)」
+// 「後続の DONE で自動的に消える」の両方をこれで満たす。 過去の NEXT を履歴として
+// 積み上げる仕様ではない (設計判断 — 変えたくなったらここを再設計すること)。
+function latestJudgeTask(events) {
+  let streak = 0;
+  let goal = "";
+  for (const ev of judgeVerdictComments(events)) {
+    const v = classifyVerdictText(ev.text);
+    if (v === "next") {
+      streak += 1;
+      goal = (ev.text || "").replace(/^next:\\s*/i, "").trim();
+    } else if (v === "done") {
+      streak = 0;
+      goal = "";
+    }
+  }
+  return streak > 0 ? { goal, streak } : null;
+}
+
+function renderGoalBoard(events) {
+  const ul = document.getElementById("goalboard");
+  ul.replaceChildren();
+  const board = computeGoalBoard(events);
+  const judgeTask = latestJudgeTask(events);
+  if (!board.length && !judgeTask) { ul.append(el("li", "empty", "delegate 実行なし")); return; }
+  if (judgeTask) {
+    const li = el("li", "goal-item judge-task status-judge-task");
+    const badge = judgeTask.streak >= JUDGE_STUCK_STREAK
+      ? "judge 提案 (NEXT × " + judgeTask.streak + " 連続)" : "judge 提案 (NEXT)";
+    li.append(el("span", "goal-badge", badge));
+    li.append(el("div", "goal-text", judgeTask.goal));
+    const btns = el("div", "issue-btns");
+    const dg = el("button", "", "委譲 → executor");
+    dg.onclick = () => delegateGoal(judgeTask.goal, dg);
+    btns.append(dg);
+    li.append(btns);
+    ul.append(li);
+  }
+  for (const item of board) {
+    const cls = item.status === "実行中" ? "running" : item.status === "完了" ? "done" : "failed";
+    const li = el("li", "goal-item status-" + cls);
+    li.append(el("span", "goal-badge", item.status));
+    li.append(el("div", "goal-text", item.goal));
+    if (item.result) li.append(el("div", "goal-result", item.result));
+    ul.append(li);
+  }
+}
+
+// --- K / S パネル、 gate/confirm 判定履歴、 memory、 plan、 pending gate、 agent view ---
+function renderPlan(p) {
+  const wrap = document.getElementById("plan-wrap");
+  const list = document.getElementById("plan-list");
+  list.replaceChildren();
+  if (!p) { wrap.style.display = "none"; return; }
+  wrap.style.display = "";
+  document.getElementById("plan-meta").textContent =
+    "#" + p.id + " [" + p.status + (p.source ? " by " + p.source : "") + "]" +
+    (p.replaces ? " (replaces #" + p.replaces + ")" : "") + " — " + (p.goal || "") +
+    (p.rationale ? "  ／ 改版理由: " + p.rationale : "");
+  for (const s of p.steps || []) {
+    const li = el("li", s.done ? "done" : "");
+    li.append(el("span", "mark", s.done ? "☑" : "☐"), el("span", "what", s.what || ""));
+    if (s.why) li.append(el("div", "plan-why", s.why));
+    list.append(li);
+  }
+}
+
+function renderMemory(m) {
+  const wrap = document.getElementById("memory-wrap");
+  if (!m) { wrap.style.display = "none"; memTail = ""; return; }
+  wrap.style.display = "";
+  memTail = (m.dir || "").split("/").filter(Boolean).slice(-2).join("/");
+  document.getElementById("memory-meta").textContent =
+    m.dir + " — " + (m.files || []).length + " files";
+  document.getElementById("memory-index").textContent =
+    m.index || "(index.md なし)";
+  const ul = document.getElementById("memory-files");
+  ul.replaceChildren();
+  const byNew = (m.files || []).slice().sort((a, b) => b.mtime - a.mtime);
+  for (const f of byNew.slice(0, 12)) {
+    const li = el("li");
+    li.append(document.createTextNode(
+      f.path + " (" + f.size + "B, " + new Date(f.mtime * 1000).toLocaleString() + ")"));
+    ul.append(li);
+  }
+}
 
 function renderDiffLines(lines, file) {
   const box = el("div", "diff");
@@ -1501,8 +1993,8 @@ function renderPending(list) {
     const box = el("div", "gate");
     const head = el("div", "gate-head");
     head.append(el("span", "id", "#" + g.id + " "),
-                el("span", "tag", "[" + g.kind + "] "),
-                el("span", "head", g.title));
+                el("span", "ev-badge", g.kind + " "),
+                el("span", "", g.title));
     box.append(head);
     if (g.detail) box.append(el("div", "gate-detail", g.detail));
     if (g.diff && g.diff.length) box.append(renderDiffLines(g.diff, ""));
@@ -1523,8 +2015,6 @@ async function decideGate(id, decision) {
   } catch (e) { /* refresh で実状態に揃う */ }
   refreshPanels();
 }
-
-let aviewVersion = -1;
 
 function renderAgentView(v) {
   const wrap = document.getElementById("aview-wrap");
@@ -1605,15 +2095,48 @@ async function sendAction(action, btn) {
   } catch (e) { /* 失敗はサーバー側 ledger に残らないだけ */ }
 }
 
-function appendTimeline(ev) {
-  const key = ev.src + ":" + ev.id;
-  if (seen.has(key)) return;
-  seen.add(key);
-  const tl = document.getElementById("timeline");
-  const nearBottom = tl.scrollTop + tl.clientHeight >= tl.scrollHeight - 40;
-  tl.append(evLi(ev));
-  while (tl.children.length > 300) tl.removeChild(tl.firstChild);
-  if (nearBottom) tl.scrollTop = tl.scrollHeight;
+// --- パネル一括再描画 ---
+function renderPanels(st) {
+  ACTORS = st.actors || {}; // executor/judge のモデル名 (env 由来、actorLabel() が参照)
+  renderGoal(st);
+  renderSummary(st);
+  renderHealth(st);
+  renderAgentCards(st);
+  document.getElementById("sess").textContent =
+    st.session_id === null ? "(all)" : (st.session_id || "(none)");
+
+  renderIssues(st);
+
+  const K = document.getElementById("panel-K");
+  K.replaceChildren();
+  if (!(st.K || []).length) K.append(el("li", "empty", "なし"));
+  for (const k of (st.K || []).slice(-8)) {
+    const li = el("li");
+    li.append(el("span", "id", "#" + k.id + " "),
+              document.createTextNode(k.name + ": " + k.text));
+    K.append(li);
+  }
+
+  const S = document.getElementById("panel-S");
+  S.replaceChildren();
+  if (!(st.S || []).length) S.append(el("li", "empty", "なし"));
+  for (const s of (st.S || []).slice(-8)) {
+    const li = el("li");
+    li.append(el("span", "id", "#" + s.id + " "),
+              document.createTextNode(s.name + " [" + s.kind + "] " + (s.rationale || "")));
+    S.append(li);
+  }
+
+  const G = document.getElementById("gates");
+  G.replaceChildren();
+  if (!(st.gates || []).length) G.append(el("li", "empty", "gate 判定なし"));
+  for (const g of (st.gates || [])) G.append(renderEventLi(g));
+
+  renderPending(st.pending || []);
+  renderPlan(st.plan || null);
+  renderAgentView(st.view || null);
+  renderMemory(st.memory || null);
+  renderGoalBoard(timelineEvents);
 }
 
 async function refreshPanels() {
@@ -1640,12 +2163,11 @@ function connect(cur) {
     try { ev = JSON.parse(m.data); } catch (e) { return; }
     if (ev.type === "session") { if (es) { es.close(); es = null; } init(); return; }
     if (ev.type === "gate" || ev.type === "view") { refreshPanels(); return; }
-    appendTimeline(ev);
-    if (ev.src === "meta" && ev.tag === "comment") { appendThread(ev); refreshPanels(); }
+    appendChatEvent(ev);
     // 要約カウンタの即時更新 (真値は refreshPanels の再取得で揃う)
     if (ev.src === "turn" && ev.tag === "assistant") bumpSummary("st-steps");
     if (ev.src === "turn" && ev.tag === "tool") bumpSummary("st-tools");
-    if (["R", "K", "S", "gate", "skill", "confirm", "intent",
+    if (["R", "K", "S", "gate", "skill", "confirm", "intent", "comment",
          "plan", "plan-approval", "plan-progress", "brainwash"].includes(ev.tag)) refreshPanels();
     // memory dir へのファイル書き込み (write_file 等の tool result) でも memory panel を更新
     if (ev.src === "turn" && ev.tag === "tool" && memTail &&
@@ -1665,16 +2187,60 @@ async function init() {
   // 再接続 = server が再起動している可能性 — version 番号は process ごとに 1 から
   // 振り直されるため、 前 process の番号と衝突して stale view を掴まないようリセット
   aviewVersion = -1;
-  renderPanels(st);
   seen.clear();
-  document.getElementById("timeline").replaceChildren();
-  for (const ev of st.timeline || []) appendTimeline(ev);
-  const tl = document.getElementById("timeline");
-  tl.scrollTop = tl.scrollHeight;
+  timelineEvents = [];
+  judgeNextStreak = 0;
+  const tl = document.getElementById("chat-timeline");
+  tl.replaceChildren();
+  pinned = true;
+  for (const ev of mergeInitial(st)) appendChatEvent(ev);
+  renderPanels(st);
   connect(st.cursors || { meta: 0, turn: 0 });
 }
 
+// ---- ページモーダル: /sessions /spec を iframe で重ねて表示 ----
+// 開くたびに src をセットし、閉じたら about:blank に戻して iframe 内のリソースを止める。
+// spec は現在の scope を ?session= で引き継ぐ (/spec ハンドラのパラメータ形式に合わせる)。
+const pageModal = document.getElementById("page-modal");
+const pageModalFrame = document.getElementById("page-modal-frame");
+
+function openPageModal(kind) {
+  let url, title;
+  if (kind === "sessions") {
+    url = "/sessions";
+    title = "session 一覧";
+  } else {
+    url = "/spec?session=" + encodeURIComponent(scope);
+    title = "spec (scope: " + scope + ")";
+  }
+  document.getElementById("page-modal-title").textContent = title;
+  pageModalFrame.src = url;
+  pageModal.classList.add("open");
+}
+
+function closePageModal() {
+  pageModal.classList.remove("open");
+  pageModalFrame.src = "about:blank";
+}
+
+for (const a of document.querySelectorAll('.switch a[data-modal]')) {
+  // href は残す (新規タブで開く・直接 URL アクセスは従来どおり) — 通常クリックだけモーダルに
+  a.addEventListener("click", (e) => {
+    if (e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
+    e.preventDefault();
+    openPageModal(a.dataset.modal);
+  });
+}
+document.getElementById("page-modal-close").addEventListener("click", closePageModal);
+pageModal.addEventListener("click", (e) => { if (e.target === pageModal) closePageModal(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && pageModal.classList.contains("open")) closePageModal();
+});
+
 wireStatClicks();
+wireFilters();
+document.getElementById("comment-form").addEventListener("submit", sendComment);
+document.getElementById("delegate-form").addEventListener("submit", sendDelegate);
 init();
 </script>
 </body></html>
