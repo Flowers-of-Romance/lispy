@@ -866,9 +866,18 @@ def actors_state() -> dict:
     """実行系アクターの env 由来メタ情報 (モデル名等)。読み取り専用 — ハードコード禁止。
     executor は host.MODEL (.env の LLM_MODEL)、judge は host.judge_model()
     (JUDGE_MODEL 未設定なら executor に fallback — judge_configured() で見分ける)。"""
+    configured = host.judge_configured()
+    # API_KEY は秘匿 — 決して返さない。 base_url は endpoint 判別 (provider) 用に出す。
     return {
-        "executor": {"model": host.MODEL},
-        "judge": {"model": host.judge_model(), "configured": host.judge_configured()},
+        "executor": {
+            "model": host.MODEL, "base_url": host.BASE_URL,
+            "max_tokens": host.MAX_TOKENS, "think": host.THINK,
+        },
+        "judge": {
+            "model": host.judge_model(), "configured": configured,
+            "base_url": host.JUDGE_BASE_URL if configured else host.BASE_URL,
+            "max_tokens": host.JUDGE_MAX_TOKENS if configured else host.MAX_TOKENS,
+        },
     }
 
 
@@ -1023,6 +1032,7 @@ def state_json(db: sqlite3.Connection, sid: str | None, scope: str) -> dict:
         "timeline": _timeline(db, sid),
         "cursors": {"meta": meta_max, "turn": turn_max},
         "memory": _memory_state(),
+        "actors": actors_state(),
     }
     body.update(_rks(db, sid))
     return body
@@ -1166,7 +1176,7 @@ VIEW_HTML = """<!doctype html>
           padding:.5em 1em;background:var(--panel);border-bottom:1px solid var(--border)}
   .topbar-left{display:flex;align-items:center;gap:.5em}
   .topbar-left h1{font-size:1.1em}
-  .topbar-mid{display:flex;gap:.6em;flex-wrap:wrap;flex:1}
+  .topbar-mid{display:flex;gap:.6em;flex-wrap:wrap;justify-content:flex-start}
   .topbar-right{display:flex;gap:.5em;align-items:center;margin-left:auto}
   .dot{display:inline-block;width:.65em;height:.65em;border-radius:50%;background:var(--muted)}
   .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
@@ -1177,8 +1187,8 @@ VIEW_HTML = """<!doctype html>
 
   .stat{display:flex;flex-direction:column;align-items:center;min-width:6.5em;
         padding:.3em .7em;border:1px solid var(--border);border-radius:6px;background:var(--panel2);
-        cursor:pointer;color:var(--text)}
-  .stat:hover{border-color:var(--accent)}
+        cursor:pointer;color:var(--text);text-decoration:none}
+  .stat:hover{border-color:var(--accent);text-decoration:none}
   .stat.dead{opacity:.4;cursor:default}
   .stat.dead:hover{border-color:var(--border)}
   .stat b{font-size:1.3em;line-height:1.2}
@@ -1233,6 +1243,10 @@ VIEW_HTML = """<!doctype html>
   .agent-dot.attn{background:var(--warn)}
   .agent-dot.danger{background:var(--danger);box-shadow:0 0 6px var(--danger)}
   .agent-status{font-size:.82em;color:var(--muted);margin-top:.25em;white-space:pre-wrap}
+  .agent-config{font-size:.76em;color:var(--text);margin-top:.3em;font-family:ui-monospace,monospace;
+                white-space:pre-wrap;word-break:break-all;opacity:.9}
+  .agent-config .cfg-k{color:var(--muted)}
+  .agent-config .cfg-fallback{color:var(--warn)}
 
   /* ---- kind フィルタ ---- */
   .filter-bar{display:flex;gap:.4em;flex-wrap:wrap;margin-bottom:.6em}
@@ -1262,10 +1276,12 @@ VIEW_HTML = """<!doctype html>
   /* ---- actor (誰の発言/動作か) 別インデント。 データ由来の色帯 (data-tag) とは
      別次元として共存させる — 変更しない。 #chat-timeline は既に
      display:flex;flex-direction:column なので align-self がそのまま効く。 */
-  .ev[data-actor="executor"]{margin-right:4em}
-  .ev[data-actor="judge"]{margin-left:1.6em;margin-right:2.4em}
-  .ev[data-actor="human"]{margin-left:4em;align-self:flex-end;max-width:80%}
-  .ev[data-actor="system"]{margin-left:2.4em;margin-right:2.4em;opacity:.85;font-style:italic}
+  /* executor/system = 主流 (左)、 human/judge = 少し右へオフセットした aside。
+     右端貼り付け (flex-end) はしない — 行きすぎず、話者が分かる程度の字下げに留める。 */
+  .ev[data-actor="executor"]{margin-right:1.6em}
+  .ev[data-actor="judge"]{margin-left:1.6em;margin-right:1.2em}
+  .ev[data-actor="human"]{margin-left:2.4em}
+  .ev[data-actor="system"]{margin-left:1.2em;margin-right:1.2em;opacity:.85;font-style:italic}
   .ev[data-tag="assistant"]{border-left-color:var(--info)}
   .ev[data-tag="tool"]{border-left-color:var(--warn)}
   .ev[data-tag="user"]{border-left-color:var(--muted)}
@@ -1377,6 +1393,9 @@ VIEW_HTML = """<!doctype html>
   .stack-form button{padding:.35em 1em;border-radius:4px;border:1px solid var(--accent);
       background:#123a5e;color:#cfe6ff;cursor:pointer;font-size:.88em}
   .stack-form button:hover{background:#1a4a75}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .stack-form button:disabled,.stack-form button:disabled:hover{opacity:.5;cursor:not-allowed;
+      background:var(--panel2);border-color:var(--border);color:var(--muted)}
 
   /* ---- レスポンシブ (最低限) ---- */
   @media (max-width: 980px){
@@ -1415,10 +1434,12 @@ VIEW_HTML = """<!doctype html>
       <div class="agent-card" id="agent-executor">
         <div class="agent-card-head"><span class="agent-dot" id="dot-executor"></span><span>executor</span></div>
         <div class="agent-status" id="status-executor">-</div>
+        <div class="agent-config" id="cfg-executor"></div>
       </div>
       <div class="agent-card" id="agent-judge">
         <div class="agent-card-head"><span class="agent-dot" id="dot-judge"></span><span>judge</span></div>
         <div class="agent-status" id="status-judge">-</div>
+        <div class="agent-config" id="cfg-judge"></div>
       </div>
       <div class="agent-card" id="agent-autostep">
         <div class="agent-card-head"><span class="agent-dot" id="dot-autostep"></span><span>auto-step</span></div>
@@ -1617,12 +1638,13 @@ function evActor(ev) {
   }
 }
 
-// 生タグ → 日本語ラベル (要件 3)。 comment は actorLabel() を別途使うので含めない。
+// 生タグ → ラベル。 lispy 本来の語彙 (R/K/S/intent/plan 系) は英語のまま、
+// 会話・操作系だけ日本語にする (comment は actorLabel() を別途使うので含めない)。
 const TAG_LABELS = {
   tool: "ツール実行", assistant: "ステップ", user: "入力",
-  plan: "計画提案", "plan-approval": "計画承認", "plan-progress": "計画進捗",
-  gate: "ゲート判定", confirm: "承認/却下", skill: "スキル更新",
-  R: "要件 (R)", K: "知識 (K)", S: "実装 (S)", intent: "意図宣言",
+  plan: "plan", "plan-approval": "plan-approval", "plan-progress": "plan-progress",
+  gate: "gate", confirm: "confirm", skill: "skill",
+  R: "R", K: "K", S: "S", intent: "intent",
   "view-action": "画面操作",
 };
 
@@ -1817,7 +1839,32 @@ function setAgentCard(key, label, state) {
 // 30 件は #chat-timeline の初期表示件数感覚に合わせた目安 (仕様として厳密ではない)。
 const RECENT_WINDOW = 30;
 
+// base_url から host:port だけ抜く (endpoint = provider の判別材料。 URL 全体は冗長)。
+function shortHost(u) {
+  try { return new URL(u).host || u; } catch (e) { return u; }
+}
+
+// 左サイドバー: executor / judge に「今 env で何が設定されているか」を常時表示する。
+// 値は st.actors (view.actors_state() — env 由来、API_KEY は含めない)。
+function fillActorConfig(actors) {
+  const A = actors || {};
+  if (!A.executor && !A.judge) return; // 部分 state のときは前回表示を据え置く
+  const put = (id, c) => {
+    const box = document.getElementById(id);
+    if (!box) return;
+    box.textContent = "";
+    box.append(el("span", "cfg-k", "model "), document.createTextNode(c.model || "(未設定)"));
+    if (c.base_url) box.append(el("span", "cfg-k", " @ "), document.createTextNode(shortHost(c.base_url)));
+    if (c.max_tokens) box.append(el("span", "cfg-k", " · max "), document.createTextNode(String(c.max_tokens)));
+    if (c.think) box.append(el("span", "cfg-k", " · "), document.createTextNode("think"));
+    if (c.configured === false) box.append(el("span", "cfg-fallback", " ← executor と同一 (JUDGE_* 未設定)"));
+  };
+  put("cfg-executor", A.executor || {});
+  put("cfg-judge", A.judge || {});
+}
+
 function renderAgentCards(st) {
+  fillActorConfig(st.actors);
   // executor: 直近 RECENT_WINDOW 件以内に gate/confirm/plan-approval の却下
   // (ev.rejected === true) があれば警告表示に切り替える。
   const recentRejected = timelineEvents.slice(-RECENT_WINDOW).some(e => e.rejected === true);
@@ -1914,6 +1961,8 @@ async function sendComment(e) {
   const to = document.getElementById("comment-to").value;
   const text = ta.value.trim();
   if (!text) return;
+  const btn = e.submitter || e.target.querySelector('button[type="submit"]');
+  if (btn) btn.disabled = true;
   try {
     const r = await fetch("/view/comment", {
       method: "POST",
@@ -1924,6 +1973,8 @@ async function sendComment(e) {
     else alert("送信できない: " + (r.error || "?"));
   } catch (err) {
     alert("送信に失敗: " + err);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -1932,6 +1983,8 @@ async function sendDelegate(e) {
   const ta = document.getElementById("delegate-text");
   const goal = ta.value.trim();
   if (!goal) return;
+  const btn = e.submitter || e.target.querySelector('button[type="submit"]');
+  if (btn) btn.disabled = true;
   try {
     const r = await fetch("/view/delegate", {
       method: "POST",
@@ -1942,6 +1995,8 @@ async function sendDelegate(e) {
     else alert("委譲できない: " + (r.error || "?"));
   } catch (err) {
     alert("委譲の送信に失敗: " + err);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
