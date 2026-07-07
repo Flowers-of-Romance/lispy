@@ -1176,7 +1176,7 @@ VIEW_HTML = """<!doctype html>
           padding:.5em 1em;background:var(--panel);border-bottom:1px solid var(--border)}
   .topbar-left{display:flex;align-items:center;gap:.5em}
   .topbar-left h1{font-size:1.1em}
-  .topbar-mid{display:flex;gap:.6em;flex-wrap:wrap;flex:1;justify-content:space-between}
+  .topbar-mid{display:flex;gap:.6em;flex-wrap:wrap;justify-content:flex-start}
   .topbar-right{display:flex;gap:.5em;align-items:center;margin-left:auto}
   .dot{display:inline-block;width:.65em;height:.65em;border-radius:50%;background:var(--muted)}
   .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
