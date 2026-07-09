@@ -27,15 +27,17 @@ description: ユーザーに質問・確認・許可を求めたくなったと�
 |---|---|
 | 仕様が曖昧、どちらか聞きたい | 最も妥当な解釈を選んで進む。選んだ仮定を (commit-R "...") で刻み、報告にも明記する |
 | 「〜してもいいですか?」と確認したい | 不変条項に該当しなければ、聞かずに実行する。可逆な操作 (ファイル編集、ローカル git、build、test、一時ファイル) は全部これ |
-| 次に何をすべきか分からない | (current-plan) と task_list を見る。それでも不明なら goal から逆算して最短の一手を自分で決める |
-| 同じ手が 2 回失敗した | 同じ手を 3 回目はやらない。別アプローチに切り替えるか、spawn_agent で独立調査させる |
-| 完了した気がする | 宣言する前に検証する (下の節)。judge-done は自己申告を信用しない |
+| 次に何をすべきか分からない | (current-plan) と task_list を見る。それでも不明なら goal から逆算して最短の一手を自分で決める。承認済み計画がある場合は plan_step_done (n=ステップ番号) で進捗を刻む。計画が現実と食い違ったら (revise-plan (quote ((手順 根拠) ...)) 改版理由) で改版を提案する (judge 審査) |
+| 同じ手が 2 回失敗した | 同じ手を 3 回目はやらない。別アプローチに切り替えるか、spawn_agent で独立調査させる。承認済み計画があれば revise-plan で計画を改版してから進む |
+| 完了した気がする | 宣言する前に検証する (下の節)。judge-done は fork-env した検証専用 env (judge-system) が判定を下す。done-verdict? は判定文字列の先頭が "DONE" または "**DONE" の場合のみ #t を返す。文中に "DONE" を含むだけ (「まだ DONE ではない」等) は完了扱いしない |
+| stop-hook に差し戻された (平文で終わろうとしたら user turn が返ってきた) | その内容 (未達の停止条件) に対応してから終わる。agent-step は stop-hook の返り値が空文字列なら turn を終了させ (通過)、非空ならその文字列を user turn として積んで作業を継続させる (init.lispy) |
 
 ## 完了宣言の前に必ずやること
 
 - 「書いた」なら read_file で読み返す。「直った」なら test や実行で確かめる
 - サーバー系は起動して curl で叩く。スクリプトは実際に走らせて出力を見る
 - 報告には根拠となる tool の実行結果を添える。検証していないことを完了と言わない
+- judge-done の判定は fork-env した検証専用 env (judge-system) が行う。判定文字列の先頭が "DONE" または "**DONE" の場合のみ完了とみなす (done-verdict?)。文中に "DONE" を含むだけ (「まだ DONE ではない」等) は完了扱いしない
 - 検証が失敗したら、報告せず まず自分で直す (別アプローチ込みで 3 回まで)。それでも駄目なら失敗内容と試行の記録を添えて NEXT に委ねる
 
 ## 自己改善 — この skill と loop 規則を書き換えろ
@@ -45,11 +47,16 @@ description: ユーザーに質問・確認・許可を求めたくなったと�
 - 聞かなくてよかった質問をした、この表に無い理由で止まった、手順が現実とずれていた —
   そう気付いたら、この SKILL.md を edit_file で更新してから作業を続ける。
   更新は installer の審査を通る。却下されたら理由を読んで修正して再提案する (審査を騙そうとしない)
-- loop 規則そのもの (agent-step / judge-done 等) が詰まりの原因なら、
+- loop 規則そのもの (agent-step / judge-done / auto-step 等) が詰まりの原因なら、
   (define ...) で改善版を提案してよい。これも gate 審査つきなので遠慮しない
+- 計画の進捗は plan_step_done (n=ステップ番号) で刻む。計画が現実と食い違ったら revise-plan で改版を提案する (judge 審査)。plan-phase! / approve-plan / plan-id / plan-status も loop 規則の一部である
+- auto-step の計画フェーズは plan-request システムリマインダーを使って行われる。max 3 試行 (試行 1/3〜3/3)。各試行で propose_plan → approve-plan (judge 審査) → plan-phase! の遷移を経る。plan-phase! が 'approved にならない限り実行フェーズに進まない
 - 学んだ制約は (commit-R "...")、binding について学んだ事実は (commit-K 'name "...") で刻む
 - 更新したら下の Changelog に 1 行追記する。不変条項の節だけは対象外 — 触らない
 
 ## Changelog
 
 - 2026-07-03: 初版
+- 2026-07-07: 代替行動表に plan_step_done / revise-plan / done-verdict? / stop-hook の行を追加。完了検証節に done-verdict? prefix ルールを追記。自己改善節に revise-plan と plan-phase! 関連の言及を追加
+- 2026-07-07: done-verdict? の説明を judge-done 行と完了検証節で統一。stop-hook の挙動を記述 (空文字列で継続、非空で停止)。計画フェーズの試行フロー (max 3, plan-request システムリマインダー) を自己改善節に追加
+- 2026-07-07: stop-hook 行を実装準拠に修正 + Changelog の幻覚日付 (07-28/29→07-07) を訂正 (human 直編集 — judge が実装と逆の記述を誤承認し、正しい修正を誤却下したため)
