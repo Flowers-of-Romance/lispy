@@ -174,7 +174,9 @@ primitive の shadow は一律 deny。 人間の REPL 入力は gate 対象外 (
 judge は `.env` の `JUDGE_MODEL / JUDGE_BASE_URL / JUDGE_API_KEY` で executor と別モデルに
 できる (例: executor = ローカル DeepSeek、 judge = Claude)。 未設定なら executor に fallback。
 `LISPY_GATE=off` で gate ごと無効化 (開発用)。 judge-done (auto-step の round 判定) も同じ
-judge client を使う。
+judge client を使うが、 model だけ `JUDGE_MODEL_DONE` で安いモデルに分離できる
+(証拠確認は gate / plan 審査より要求能力が低く、 誤判定も NEXT 側に倒れるため。
+未設定なら `JUDGE_MODEL`)。
 
 ## ハーネス機能
 

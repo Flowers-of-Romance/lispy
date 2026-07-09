@@ -75,6 +75,10 @@ JUDGE_MODEL    = os.environ.get("JUDGE_MODEL", "")
 JUDGE_BASE_URL = os.environ.get("JUDGE_BASE_URL", "")
 JUDGE_API_KEY  = os.environ.get("JUDGE_API_KEY", "")
 JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "2048"))
+## round 毎の証拠確認 (judge-done) 専用の model。 判定基準が prompt 側でチェックリスト化
+## されているぶん要求能力が低く、 誤判定も NEXT 側 (= 1 round 余計) に倒れるので、
+## gate / plan 審査より安いモデルでよい。 未設定なら JUDGE_MODEL に fallback。
+JUDGE_MODEL_DONE = os.environ.get("JUDGE_MODEL_DONE", "")
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +324,15 @@ def get_judge_client():
 def judge_model() -> str:
     """審査に使う model 名。 JUDGE_MODEL が無ければ executor の MODEL。"""
     return JUDGE_MODEL if judge_configured() else MODEL
+
+
+def judge_model_done() -> str:
+    """round 毎の証拠確認 (judge-call → judge-done) に使う model 名。
+
+    JUDGE_MODEL_DONE 未設定なら judge_model() に fallback。 gate / plan 審査
+    (騙された場合の被害が 1 round で済まない判定) は judge_model() のまま。
+    """
+    return JUDGE_MODEL_DONE if (JUDGE_MODEL_DONE and judge_configured()) else judge_model()
 
 
 # ---------------------------------------------------------------------------

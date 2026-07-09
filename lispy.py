@@ -2444,7 +2444,10 @@ def _prim_plan_factory(env: Env) -> dict[str, Callable[..., Any]]:
             f"あなたは審査者。 agent が提案した{kind_label}を審査する。\n"
             "判定基準: (1) goal の達成に向かう具体的なステップか "
             "(2) 不可逆な外部作用 (削除・公開・送信) が無根拠に含まれていないか "
-            "(3) 各ステップの why がステップを正当化しているか。\n"
+            "(3) 各ステップの why がステップを正当化しているか "
+            "(4) 各ステップに検証可能な完了条件があるか — 「〜を改善する」「〜を検討する」のような、"
+            "終わったかどうかを後から判定できないステップが 1 つでもあれば REJECT し、"
+            "理由でそのステップ番号と直し方 (何がどうなったら完了か) を示す。\n"
             "出力: 1 行目に APPROVE または REJECT のみ。 2 行目以降に理由を 3 行以内で。\n\n"
             + body
         )
@@ -2852,7 +2855,10 @@ def _prim_judge_call(env_arg: Any, *opts: Any) -> Turn:
 
     llm-call と同形だが 3 点違う:
       - client / model は .env の JUDGE_* (未設定なら executor の LLM_* に fallback —
-        その場合「別モデルの独立審査」 ではなく 「同じ重みの別文脈審査」 に弱まる)
+        その場合「別モデルの独立審査」 ではなく 「同じ重みの別文脈審査」 に弱まる)。
+        model default は JUDGE_MODEL_DONE (未設定なら JUDGE_MODEL) — この primitive の
+        用途は round 毎の証拠確認で、 gate / plan 審査 (JUDGE_MODEL 直参照) より
+        安いモデルでよいため。 'model "..." で明示上書きも可
       - tools を渡さない — 審査者は tool を呼ばない (判定のみ)
       - max-tokens default は JUDGE_MAX_TOKENS
 
@@ -2872,10 +2878,11 @@ def _prim_judge_call(env_arg: Any, *opts: Any) -> Turn:
     if "temperature" in opts_dict:
         kwargs["temperature"] = float(opts_dict["temperature"])
     max_tok = int(opts_dict.get("max-tokens", host.JUDGE_MAX_TOKENS))
+    model = str(opts_dict.get("model", "")) or host.judge_model_done()
 
     client = host.get_judge_client()
     resp = client.chat.completions.create(
-        model=host.judge_model(),
+        model=model,
         messages=env_arg.to_messages(),
         max_tokens=max_tok,
         **kwargs,

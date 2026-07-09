@@ -80,6 +80,8 @@ cp .env.example .env             # provider を選んで API key / model / base 
 - `JUDGE_MODEL` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` / `JUDGE_MAX_TOKENS` — 審査者 LLM。
   define-gate の install 審査・auto.lispy の judge-done・洗脳 (brainwash) が使う。
   未設定なら executor に fallback
+- `JUDGE_MODEL_DONE` — judge-done (round 毎の証拠確認) 専用の model。 gate / plan 審査より
+  安いモデルでよい判定だけを分離する。 未設定なら `JUDGE_MODEL` に fallback
 - `LISPY_GATE` — `off` で define-gate を無効化 (default on。 gate は agent 由来の評価にだけ効く)
 - `LISPY_MEMORY_DIR` / `BRAINWASH_MAX_TOKENS` / `BRAINWASH_MAX_SESSIONS` / `BRAINWASH_INDEX_MAX_LINES`
   — 洗脳の蒸留層と各上限 (default: `data/memory/` / 8192 / 10 / 100)

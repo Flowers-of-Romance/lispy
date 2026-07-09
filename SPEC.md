@@ -42,7 +42,7 @@ lispy 自体の規範仕様書 (what / invariants)。 「仕様がわからな�
 
 - **OpenAI 互換 SDK のみ** (`from openai import OpenAI`、 anthropic SDK の直接 import は無い)。 base_url 差し替えで任意 provider に接続
 - executor: `host.get_client()` (host.py:288)。 `LLM_MODEL` / `LLM_BASE_URL` / `LLM_API_KEY` は default 無し — 未設定なら初回呼び出しで明示エラー (provider 選択は config の責務)
-- judge: `host.get_judge_client()` (host.py:308)。 `JUDGE_MODEL` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` の **3 つ揃い** で executor と別モデルに。 未設定なら executor に fallback (= 同じ重みの別文脈審査という弱い独立性)
+- judge: `host.get_judge_client()` (host.py:308)。 `JUDGE_MODEL` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` の **3 つ揃い** で executor と別モデルに。 未設定なら executor に fallback (= 同じ重みの別文脈審査という弱い独立性)。 judge-done (round 毎の証拠確認) だけは `JUDGE_MODEL_DONE` が優先 (未設定なら `JUDGE_MODEL`) — gate / plan 審査より安いモデルに分離できる
 - 基本呼び出しは `apply_` (lispy.py:375): env が λ の閉包、 モデルが λ の body の評価器、 というメタファー。 `extra_body={"think": host.THINK}` を常に付与 (未対応 provider は無視)
 
 ### system prompt の合成 (lispy.py:4158)
@@ -191,6 +191,7 @@ server endpoints: `POST /eval /load /reset /interrupt`、 `GET / /bindings /reca
 | executor | `LLM_MODEL` / `LLM_BASE_URL` / `LLM_API_KEY` | **無し** (未設定は明示エラー) |
 | | `LLM_MAX_TOKENS` / `LLM_THINK` | 4096 / off |
 | judge | `JUDGE_MODEL` / `JUDGE_BASE_URL` / `JUDGE_API_KEY` (3 つ揃いで有効) / `JUDGE_MAX_TOKENS` | executor に fallback / 2048 |
+| | `JUDGE_MODEL_DONE` (judge-done 専用 model) | `JUDGE_MODEL` に fallback |
 | gate | `LISPY_GATE` | on |
 | opt-in | `LISPY_HOOKS` / `LISPY_CHECK_CMD` / `LISPY_CHECK_FILE` / `LISPY_MCP` / `LISPY_MCP_TIMEOUT` | 全て off (opt-in) |
 | context | `LISPY_CTX_WINDOW` | 200000 |

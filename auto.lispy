@@ -50,7 +50,9 @@
 
 ;; --- (judge-done env goal) → "DONE" | "NEXT: ..." ---
 ;; judge-call に投げる: .env の JUDGE_* が設定されていれば executor と別のモデルが判定する
-;; (訓練も盲点も違うモデルによる独立採点)。 未設定なら executor に fallback
+;; (訓練も盲点も違うモデルによる独立採点)。 model は JUDGE_MODEL_DONE 優先 (証拠確認は
+;; 安いモデルで足りる — 判定基準は judge-system 側でチェックリスト化済み、 誤判定は
+;; NEXT 側に倒れる)。 未設定なら JUDGE_MODEL → executor の順に fallback
 ;; (= fork-env による別文脈・同重みの弱い独立性)。 tools は渡らない (審査者は判定のみ)。
 (define judge-done
   (lambda (env goal)
