@@ -945,7 +945,7 @@ verbosity vector (= succinct - verbose) なら `+1` で verbose 寄り、 `-1` �
 counterfactual」** が組める。 lispy が固有に持つ位置付け (steering を first-class 値として
 扱える唯一の LLM client)。
 
-ds4 fork (上記の per-request scale patch) は: https://github.com/Flowers-of-Romance/ds4
+ds4 fork (上記の per-request scale patch) は: https://github.com/0x006a6d/ds4
 
 ### 使い方の典型 (Cookbook)
 
